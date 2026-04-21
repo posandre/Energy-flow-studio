@@ -1,0 +1,823 @@
+from __future__ import annotations
+
+import re
+from typing import Any
+
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, Qt
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QGroupBox,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QTabWidget,
+    QWidget,
+)
+
+from app.services.app_settings import DEFAULT_UI_LANGUAGE, load_ui_language, save_ui_language
+from app.services.logging_utils import get_logger
+
+_TRANSLATIONS: dict[str, dict[str, str]] = {
+    "uk": {
+        "EnergyFlow Studio": "EnergyFlow Studio",
+        "Open an Excel file or connect to DessMonitor to begin.": "Відкрийте Excel-файл або підключіться до DessMonitor, щоб почати.",
+        "Choose an active device profile to start.": "Оберіть активний профіль пристрою, щоб почати.",
+        "Waiting for a live snapshot.": "Очікування снапшоту в реальному часі.",
+        "live": "наживо",
+        "cached": "кеш",
+        "failed": "помилка",
+        "unknown": "невідомо",
+        "Connection": "Підключення",
+        "Location": "Локація",
+        "Sync": "Синхронізація",
+        "Tuya": "Tuya",
+        "Battery": "Батарея",
+        "Tariff": "Тариф",
+        "Language": "Мова",
+        "Profile name": "Назва профілю",
+        "Username": "Ім'я користувача",
+        "Password": "Пароль",
+        "Company key": "Ключ компанії",
+        "Platform": "Платформа",
+        "Energy storage": "Накопичувач енергії",
+        "Photovoltaic": "Фотовольтаїка",
+        "Check connection": "Перевірити підключення",
+        "Checking...": "Перевірка...",
+        "Verified": "Перевірено",
+        "Try again": "Спробувати знову",
+        "Save": "Зберегти",
+        "Cancel": "Скасувати",
+        "Open": "Відкрити",
+        "Choose": "Обрати",
+        "Add": "Додати",
+        "Edit": "Редагувати",
+        "Delete": "Видалити",
+        "Choose Device": "Вибір пристрою",
+        "Select the device profile to use in this session.": "Оберіть профіль пристрою для цієї сесії.",
+        "Unnamed profile": "Профіль без назви",
+        "Edit Device Profile": "Редагувати профіль пристрою",
+        "Add Profile": "Додати профіль",
+        "Step 1. Fill in the credentials and run Check.": "Крок 1. Заповніть облікові дані та натисніть Перевірити.",
+        "Step 2. Choose device": "Крок 2. Оберіть пристрій",
+        "Connection verified. You can review the device and save.": "Підключення перевірено. Перевірте пристрій і збережіть.",
+        "Connection verified. Review the device and save.": "Підключення перевірено. Перегляньте пристрій і збережіть.",
+        "Edit inverter fields": "Редагувати поля інвертора",
+        "Run every 12 minutes": "Запускати кожні 12 хв",
+        "Enable Tuya": "Увімкнути Tuya",
+        "Enter Tuya client ID": "Введіть Tuya client ID",
+        "Enter Tuya client secret": "Введіть Tuya client secret",
+        "Automatic background sync": "Автоматична фонова синхронізація",
+        "EnergyFlow refresh interval": "Інтервал оновлення EnergyFlow",
+        "Tuya polling interval (seconds)": "Інтервал опитування Tuya (сек)",
+        "Tuya integration": "Інтеграція Tuya",
+        "Tuya client ID": "Tuya client ID",
+        "Tuya client secret": "Tuya client secret",
+        "Tuya API endpoint": "Tuya API endpoint",
+        "Battery capability (Ah)": "Ємність батареї (А*год)",
+        "Day zone (7-23), UAH/kWh": "Денна зона (7-23), грн/кВт*год",
+        "Night zone (23-7), UAH/kWh": "Нічна зона (23-7), грн/кВт*год",
+        "Set electricity tariffs used for day and night cost calculations.": "Вкажіть тариф на електроенергію для денної та нічної зон.",
+        "Location source": "Джерело локації",
+        "Auto from DessMonitor": "Авто з DessMonitor",
+        "Set manually": "Встановити вручну",
+        "Inverter location *": "Локація інвертора *",
+        "Choose on map": "Обрати на мапі",
+        "Use detected": "Використати визначену",
+        "Language preference": "Мова інтерфейсу",
+        "Interface language": "Мова інтерфейсу",
+        "English": "Англійська",
+        "Українська": "Українська",
+        "Select app interface language for this profile.": "Оберіть мову інтерфейсу застосунку для цього профілю.",
+        "Verify first": "Спочатку перевірка",
+        "Verify the API connection before saving the profile.": "Перед збереженням профілю перевірте підключення до API.",
+        "Missing fields": "Відсутні поля",
+        "Field loading failed": "Не вдалося завантажити поля",
+        "Location required": "Потрібна локація",
+        "Tuya settings incomplete": "Неповні налаштування Tuya",
+        "No import fields": "Немає полів імпорту",
+        "No inverter fields": "Немає полів інвертора",
+        "Run Check first to read the inverter control fields from DessMonitor.": "Спочатку виконайте Перевірку, щоб зчитати поля керування інвертором із DessMonitor.",
+        "DessMonitor did not return any inverter fields for this profile.": "DessMonitor не повернув жодного поля інвертора для цього профілю.",
+        "Main tabs": "Головні вкладки",
+        "PN": "PN",
+        "Address": "Адреса",
+        "Protocol code": "Код протоколу",
+        "Protocol code: -": "Код протоколу: -",
+        "EnergyFlow": "EnergyFlow",
+        "Forecast": "Прогноз",
+        "Inverter": "Інвертор",
+        "PV": "PV",
+        "Grid": "Мережа",
+        "Home": "Дім",
+        "Saved Data": "Дані",
+        "Data": "Дані",
+        "Browse the saved dataset, inspect its structure, preview rows, and reopen or export it.": "Переглядайте збережений датасет, перевіряйте структуру, попередній перегляд рядків і повторно відкривайте або експортуйте його.",
+        "Current saved dataset: not loaded": "Поточний збережений датасет: не завантажено",
+        "Current saved dataset": "Поточний збережений датасет",
+        "Dataset": "Датасет",
+        "Refresh list": "Оновити список",
+        "Clear database": "Очистити базу даних",
+        "Delete all saved datasets from the local database?": "Видалити всі збережені датасети з локальної бази даних?",
+        "Update from API": "Оновити з API",
+        "Rows per page": "Рядків на сторінці",
+        "Page": "Сторінка",
+        "Rows": "Рядки",
+        "of": "з",
+        "rows": "рядків",
+        "Page 0 of 0": "Сторінка 0 з 0",
+        "First": "Перша",
+        "Last": "Остання",
+        "History": "Історія",
+        "Weather": "Погода",
+        "Excel": "Excel",
+        "Inverter": "Інвертор",
+        "Device": "Пристрій",
+        "Unnamed device": "Пристрій без назви",
+        "Change Profile": "Обрати",
+        "Edit Profile": "Редагувати",
+        "Refresh": "Оновити",
+        "Refreshing": "Оновлення",
+        "Loading": "Завантаження",
+        "PV Forecast": "Прогноз PV",
+        "Short-term solar generation forecast calibrated by local DessMonitor history and weather inputs.": "Короткостроковий прогноз сонячної генерації, калібрований локальною історією DessMonitor і погодними даними.",
+        "Overview": "Огляд",
+        "Hourly": "Погодинно",
+        "Accuracy": "Точність",
+        "All": "Усі",
+        "Online": "Онлайн",
+        "Offline": "Офлайн",
+        "Gates": "Ворота",
+        "Check": "Перевірити",
+        "Custom range": "Довільний період",
+        "All data": "Усі дані",
+        "Today": "Сьогодні",
+        "Last 24h": "Останні 24 год",
+        "Day": "День",
+        "Month": "Місяць",
+        "Year": "Рік",
+        "Total": "Всього",
+        "Previous": "Попередній",
+        "Next": "Наступний",
+        "Power": "Потужність",
+        "Parameter": "Параметр",
+        "Value": "Значення",
+        "Unit": "Одиниця",
+        "Voltage": "Напруга",
+        "Frequency": "Частота",
+        "Status": "Статус",
+        "Energy": "Енергія",
+        "Current": "Струм",
+        "charge": "заряд",
+        "discharge": "розряд",
+        "idle": "простій",
+        "Time": "Час",
+        "Device name": "Назва пристрою",
+        "ID": "ID",
+        "Last update": "Останнє оновлення",
+        "Measurements": "Показники",
+        "No measurements": "Немає показників",
+        "Gate status": "Статус воріт",
+        "Last change": "Остання зміна",
+        "Opened": "Відкрито",
+        "Closed": "Закрито",
+        "Unknown": "Невідомо",
+        "Unknown Tuya error": "Невідома помилка Tuya",
+        "Enable Tuya in Settings to load devices.": "Увімкніть Tuya в налаштуваннях, щоб завантажити пристрої.",
+        "Forecast to now": "Прогноз до зараз",
+        "Actual today": "Факт сьогодні",
+        "Delta": "Різниця",
+        "Today forecast": "Прогноз на сьогодні",
+        "Tomorrow forecast": "Прогноз на завтра",
+        "Peak window": "Пікове вікно",
+        "Confidence": "Впевненість",
+        "Solar radiation": "Сонячна радіація",
+        "Cloud cover": "Хмарність",
+        "Temperature": "Температура",
+        "Precipitation": "Опади",
+        "Wind speed": "Швидкість вітру",
+        "Wind": "Вітер",
+        "Min": "Мін",
+        "Max": "Макс",
+        "Average {metric_label}": "Середнє значення {metric_label}",
+        "{series_label} for {date}{context_suffix}": "{series_label} за {date}{context_suffix}",
+        "{series_label} trend for {period_label}": "Тренд {series_label} за {period_label}",
+        "{series_label} across {range_label}": "{series_label} за період {range_label}",
+        "No {series_label} samples for the selected day.": "Немає значень {series_label} за вибраний день.",
+        "No {series_label} forecast for the selected future day.": "Немає прогнозу {series_label} на вибраний майбутній день.",
+        "No {series_label} samples for the selected month.": "Немає значень {series_label} за вибраний місяць.",
+        "No {series_label} samples for the selected year.": "Немає значень {series_label} за вибраний рік.",
+        "No {series_label} history available.": "Історія {series_label} недоступна.",
+        " (Forecast)": " (Прогноз)",
+        "Temp": "Темп.",
+        "Cloud": "Хмари",
+        "Rain": "Дощ",
+        "Sun": "Сонце",
+        "ETA": "ETA",
+        "Idle": "Простій",
+        "To full": "До повної",
+        "To empty": "До розряду",
+        "Next refresh": "Наступне оновлення",
+        "NEXT REFRESH": "НАСТУПНЕ ОНОВЛЕННЯ",
+        "Forecast model is waiting for data.": "Модель прогнозу очікує дані.",
+        "Hourly prediction for the next 48 hours.": "Погодинний прогноз на найближчі 48 годин.",
+        "Open the Forecast tab to build the first prediction.": "Відкрийте вкладку Прогноз, щоб побудувати перший прогноз.",
+        "Choose an active profile and sync DessMonitor data to generate a forecast.": "Оберіть активний профіль і синхронізуйте дані DessMonitor для побудови прогнозу.",
+        "Building forecast...": "Побудова прогнозу...",
+        "Refresh": "Оновити",
+        "Refreshing": "Оновлення",
+        "Close": "Закрити",
+        "PV power (kW)": "Потужність PV (кВт)",
+        "Total generation": "Загальна генерація",
+        "Measured generation so far today.": "Виміряна генерація станом на зараз за сьогодні.",
+        "Forecast integrated up to the latest actual hour.": "Прогноз інтегрований до останньої години з фактичними даними.",
+        "Actual minus forecast-to-now.": "Факт мінус прогноз до поточного часу.",
+        "Expected output for the current day.": "Очікувана генерація за поточну добу.",
+        "Forecasted daily energy for tomorrow.": "Прогнозована добова генерація на завтра.",
+        "No daylight peak detected": "Пік денного виробітку не виявлено",
+        "Cloud attenuation": "Послаблення через хмарність",
+        "Module heat loss proxy": "Оцінка теплових втрат модуля",
+        "Cooling effect": "Ефект охолодження",
+        "Next forecast hour": "Наступна прогнозна година",
+        "Forecast for": "Прогноз на",
+        "Progress vs forecast": "Виконання проти прогнозу",
+        "Reliability": "Надійність",
+        "Reliability: High": "Надійність: Висока",
+        "Reliability: Medium": "Надійність: Середня",
+        "Reliability: Low": "Надійність: Низька",
+        "Reliability: Unknown": "Надійність: Невідома",
+        "High": "Висока",
+        "Medium": "Середня",
+        "Low": "Низька",
+        "Unknown": "Невідома",
+        "P10": "P10",
+        "P50": "P50",
+        "P90": "P90",
+        "Forecast": "Прогноз",
+        "Actual": "Факт",
+        "Choose a device profile and refresh to load current energy flow.": "Оберіть профіль пристрою й натисніть Оновити, щоб завантажити поточний EnergyFlow.",
+        "Settings": "Налаштування",
+        "Configure how DessMonitor imports work. By default the app imports all available parameter keys for the selected device.": "Налаштуйте імпорт із DessMonitor. За замовчуванням застосунок імпортує всі доступні ключі параметрів для вибраного пристрою.",
+        "Import all available DessMonitor parameter keys": "Імпортувати всі доступні ключі параметрів DessMonitor",
+        "Enter one parameter key per line, for example:\nPV_OUTPUT_POWER\nGRID_ACTIVE_POWER": "Введіть по одному ключу параметра в рядок, наприклад:\nPV_OUTPUT_POWER\nGRID_ACTIVE_POWER",
+        "These custom keys are used only when 'Import all available...' is turned off.": "Ці власні ключі використовуються лише коли вимкнено 'Імпортувати всі доступні...'.",
+        "Select series to display": "Оберіть серії для відображення",
+        "0 selected": "Вибрано 0",
+        "Connect to DessMonitor": "Підключення до DessMonitor",
+        "Open calendar": "Відкрити календар",
+        "Optional if your account allows auth without it": "Необов'язково, якщо ваш акаунт дозволяє авторизацію без цього",
+        "Sign in to fetch devices automatically.": "Увійдіть, щоб автоматично завантажити пристрої.",
+        "Load Devices": "Завантажити пристрої",
+        "To": "До",
+        "Authentication log will appear here.": "Тут з'явиться журнал автентифікації.",
+        "Sync now": "Синхронізувати зараз",
+        "Pull fresh telemetry from DessMonitor": "Отримати свіжу телеметрію з DessMonitor",
+        "Choose how much history to sync. Shorter periods finish faster.": "Оберіть, який обсяг історії синхронізувати. Коротші періоди завершуються швидше.",
+        "Choose a sync period. Larger periods may take longer to import.": "Оберіть період синхронізації. Більші періоди можуть імпортуватися довше.",
+        "Sync period": "Період синхронізації",
+        "Datasets": "Датасети",
+        "Selected dates": "Вибрані дати",
+        "DessMonitor": "DessMonitor",
+        "Weather History": "Історія погоди",
+        "Sync data from your saved profile": "Синхронізація даних із збереженого профілю",
+        "Choose how much history to sync, then pull the newest telemetry.": "Оберіть обсяг історії для синхронізації, потім завантажте найновішу телеметрію.",
+        "Weather History will become available after saving inverter coordinates in the profile.": "Історія погоди стане доступною після збереження координат інвертора у профілі.",
+        "Could not load devices. Check credentials and company key.": "Не вдалося завантажити пристрої. Перевірте облікові дані та ключ компанії.",
+        "Choose Location": "Вибір локації",
+        "Search for a place or click directly on the map to set the inverter location.": "Знайдіть місце або натисніть прямо на мапі, щоб вказати локацію інвертора.",
+        "Map view is unavailable in this environment. Please enter location manually.": "Перегляд мапи недоступний у цьому середовищі. Будь ласка, введіть локацію вручну.",
+        "Tip: click a point on the map or search by city, village, or full address.": "Порада: натисніть точку на мапі або шукайте за містом, селом чи повною адресою.",
+        "Use location": "Використати локацію",
+        "City, region or coordinates": "Місто, регіон або координати",
+        "Required for weather-based generation forecast.": "Потрібно для прогнозу генерації на основі погоди.",
+        "All available import fields will be imported automatically.": "Усі доступні поля імпорту буде додано автоматично.",
+        "Run Check to load the device list. All available import fields are added automatically.": "Натисніть Перевірити, щоб завантажити список пристроїв. Усі доступні поля імпорту додаються автоматично.",
+        "Manual location from map": "Ручна локація з мапи",
+        "Manual location": "Ручна локація",
+        "Required for weather-based generation forecast. You can type a place or choose it on the map.": "Потрібно для прогнозу генерації на основі погоди. Ви можете ввести місце або вибрати його на мапі.",
+        "Latitude, longitude": "Широта, довгота",
+        "Required for weather-based generation forecast. You can type coordinates manually or choose a point on the map.": "Потрібно для прогнозу генерації на основі погоди. Ви можете ввести координати вручну або вибрати точку на мапі.",
+        "Run Check to load location from DessMonitor": "Натисніть Перевірити, щоб завантажити локацію з DessMonitor",
+        "Loaded from DessMonitor": "Завантажено з DessMonitor",
+        "Location loaded automatically from DessMonitor.": "Локацію автоматично завантажено з DessMonitor.",
+        "Waiting for auto location": "Очікування авто-локації",
+        "Required. If DessMonitor does not return it, switch to manual mode.": "Обов'язково. Якщо DessMonitor не поверне значення, перемкніться на ручний режим.",
+        "Inverter Fields": "Поля інвертора",
+        "Import Excel": "Імпортувати Excel",
+        "Export Excel": "Експортувати Excel",
+        "Apply": "Застосувати",
+        "Inverter Analysis - ": "Аналіз інвертора - ",
+        "Enable at least one power series to inspect inverter behavior.": "Увімкніть щонайменше одну серію потужності, щоб проаналізувати поведінку інвертора.",
+        "No power data for the selected period.": "Немає даних потужності за вибраний період.",
+        "Enable at least one energy series to compare daily totals.": "Увімкніть щонайменше одну серію енергії, щоб порівняти добові підсумки.",
+        "Not enough saved history was found to calculate energy totals for this period.": "Недостатньо збереженої історії для розрахунку підсумкової енергії за цей період.",
+        "Enable battery power or SOC to explore storage behavior.": "Увімкніть потужність батареї або SOC, щоб дослідити поведінку накопичувача.",
+        "No battery data for the selected period.": "Немає даних батареї за вибраний період.",
+        "Inverter Settings": "Налаштування інвертора",
+        "Basic setting": "Базові налаштування",
+        "System setting": "Системні налаштування",
+        "Battery setting": "Налаштування батареї",
+        "Pending load": "Очікує завантаження",
+        "Not available": "Недоступно",
+        "Output priority": "Пріоритет виходу",
+        "Output Frequency": "Вихідна частота",
+        "Settings Load": "Завантаження налаштувань",
+        "Expand all": "Розгорнути все",
+        "Collapse all": "Згорнути все",
+        "Choose an active DessMonitor profile to load inverter settings.": "Оберіть активний профіль DessMonitor, щоб завантажити налаштування інвертора.",
+        "Ready to load.": "Готово до завантаження.",
+        "Search by parameter name, value, or category": "Пошук за назвою параметра, значенням або категорією",
+        "Edit parameter": "Редагувати параметр",
+        "Edit: {display_name}": "Редагувати: {display_name}",
+        "Enter value": "Введіть значення",
+        "Saving is temporarily disabled at this stage.": "Збереження тимчасово вимкнено на цьому етапі.",
+        "Value will be saved to the local cache.": "Значення буде збережено в локальний кеш.",
+        "Parameter Sync": "Синхронізація параметра",
+        "Starting parameter sync": "Початок синхронізації параметра",
+        "Preparing API sync for {setting_name}": "Підготовка синхронізації API для {setting_name}",
+        "Parameter: {setting_name}": "Параметр: {setting_name}",
+        "Action: Synchronizing the latest value from API": "Дія: Синхронізація останнього значення з API",
+        "Sync requested for parameter: {setting_name}": "Запит синхронізації для параметра: {setting_name}",
+        "Sync completed": "Синхронізацію завершено",
+        "Sync completed with warning": "Синхронізацію завершено з попередженням",
+        "Sync completed successfully.": "Синхронізацію успішно завершено.",
+        "Sync failed: {error_text}": "Помилка синхронізації: {error_text}",
+        "Active Profile": "Активний профіль",
+        "Profile": "Профіль",
+        "Step 1 of 5": "Крок 1 з 5",
+        "Preparing import": "Підготовка імпорту",
+        "Connecting to the selected source.": "Підключення до вибраного джерела.",
+        "View log": "Показати журнал",
+        "Import stopped": "Імпорт зупинено",
+        "Import failed": "Імпорт не вдався",
+        "Hide log": "Сховати журнал",
+        "Stopping background requests before closing...": "Зупинка фонових запитів перед закриттям...",
+        "Tuya Devices": "Пристрої Tuya",
+        "PV forecast updated.": "Прогноз PV оновлено.",
+        "PV forecast loaded from cache (live API unavailable).": "Прогноз PV завантажено з кешу (live API недоступний).",
+        "PV forecast unavailable.": "Прогноз PV недоступний.",
+        "EnergyFlow refresh is already in progress.": "Оновлення EnergyFlow вже виконується.",
+        "Refreshing current EnergyFlow snapshot...": "Оновлення поточного снапшоту EnergyFlow...",
+        "Live snapshot unavailable.": "Live-снапшот недоступний.",
+        "Updating today actual PV values for forecast...": "Оновлення фактичних значень PV за сьогодні для прогнозу...",
+        "Auto-sync skipped while another import is running.": "Автосинхронізацію пропущено, поки виконується інший імпорт.",
+        "Auto-sync failed.": "Автосинхронізація не вдалася.",
+        "Failed to load data.": "Не вдалося завантажити дані.",
+        "The local saved-data database was cleared.": "Локальну базу збережених даних очищено.",
+        "Select at least one series to display the chart.": "Оберіть щонайменше одну серію для відображення графіка.",
+        "No rows match the selected date range.": "Немає рядків, що відповідають вибраному діапазону дат.",
+        "Select year": "Виберіть рік",
+        "Forecast is unavailable for this future day.": "Прогноз недоступний для цього майбутнього дня.",
+        "Forecast source is unavailable for this future day.": "Джерело прогнозу недоступне для цього майбутнього дня.",
+        "Import Progress": "Прогрес імпорту",
+        "Loading profile": "Завантаження профілю",
+        "Starting import": "Початок імпорту",
+        "Applying saved profile": "Застосування збереженого профілю",
+        "Import complete": "Імпорт завершено",
+        "Preparing forecast": "Підготовка прогнозу",
+        "Updating charts": "Оновлення графіків",
+        "Preparing imported data": "Підготовка імпортованих даних",
+        "Downloading telemetry": "Завантаження телеметрії",
+        "Checking access": "Перевірка доступу",
+        "Loading parameter structure": "Завантаження структури параметрів",
+        "Starting settings load": "Початок завантаження налаштувань",
+        "Settings loaded": "Налаштування завантажено",
+        "Finishing settings list": "Завершення списку налаштувань",
+        "Reading parameter values": "Зчитування значень параметрів",
+        "Step 1 of 4": "Крок 1 з 4",
+        "Step 2 of 4": "Крок 2 з 4",
+        "Step 3 of 4": "Крок 3 з 4",
+        "Step 4 of 4": "Крок 4 з 4",
+        "Step 2 of 5": "Крок 2 з 5",
+        "Step 3 of 5": "Крок 3 з 5",
+        "Step 4 of 5": "Крок 4 з 5",
+        "Step 5 of 5": "Крок 5 з 5",
+        "Load devices after sign in": "Завантажте пристрої після входу",
+        "DessMonitor Sync": "Синхронізація DessMonitor",
+        "Today only": "Лише сьогодні",
+        "From last saved record": "Від останнього збереженого запису",
+        "This week": "Цей тиждень",
+        "This month": "Цей місяць",
+        "This year": "Цей рік",
+        "No saved history for this profile yet.": "Для цього профілю ще немає збереженої історії.",
+        "Loading Tuya devices...": "Завантаження пристроїв Tuya...",
+        "Tuya refresh timed out. Try Refresh again.": "Оновлення Tuya завершилося за таймаутом. Спробуйте ще раз.",
+        "No Tuya devices found in the linked project/account.": "У підключеному проєкті/акаунті не знайдено пристроїв Tuya.",
+        "No active profile selected.": "Активний профіль не вибрано.",
+        "Ready to load inverter settings.": "Готово до завантаження налаштувань інвертора.",
+        "Loading inverter settings from DessMonitor...": "Завантаження налаштувань інвертора з DessMonitor...",
+        "No inverter settings loaded yet.": "Налаштування інвертора ще не завантажені.",
+        "Total energy": "Загальна енергія",
+        "Power (kW)": "Потужність (кВт)",
+        "Energy (kWh)": "Енергія (кВт*год)",
+        "Inverter Power Flow": "Потоки потужності інвертора",
+        "KPIs": "KPI",
+        "Generated": "Згенеровано",
+        "Consumed": "Спожито",
+        "Grid import": "Імпорт із мережі",
+        "Grid export": "Експорт у мережу",
+        "Consumption cost": "Вартість споживання",
+        "Grid import cost": "Вартість імпорту з мережі",
+        "Battery charge": "Заряд батареї",
+        "Battery discharge": "Розряд батареї",
+        "PV generation": "Генерація PV",
+        "Home load": "Домашнє навантаження",
+        "Battery power": "Потужність батареї",
+        "Battery SOC": "SOC батареї",
+        "SOC (%)": "SOC (%)",
+        "PV generated": "PV згенеровано",
+        "Home consumed": "Спожито вдома",
+        "PV direct": "PV напряму",
+        "Self-consumption": "Самоспоживання",
+        "Self-sufficiency": "Самозабезпечення",
+        "Battery support": "Підтримка батареєю",
+        "Night": "Ніч",
+        "W": "Вт",
+        "kW": "кВт",
+        "V": "В",
+        "A": "А",
+        "Ah": "А*год",
+        "kWh": "кВт*год",
+        "Wh": "Вт*год",
+        "Hz": "Гц",
+        "mm": "мм",
+        "m/s": "м/с",
+        "C": "°C",
+        "h": "год",
+        "m": "хв",
+        "s": "с",
+        "W/m2": "Вт/м²",
+        "1 min": "1 хв",
+        "3 min": "3 хв",
+        "5 min": "5 хв",
+        "10 min": "10 хв",
+        "Selected": "Вибрано",
+        "Selected coordinates": "Вибрані координати",
+        "Location not found. Try another query.": "Локацію не знайдено. Спробуйте інший запит.",
+        "Total consumed": "Усього спожито",
+        "Total grid import": "Усього імпорту з мережі",
+        "Jan": "Січ",
+        "Feb": "Лют",
+        "Mar": "Бер",
+        "Apr": "Кві",
+        "May": "Тра",
+        "Jun": "Чер",
+        "Jul": "Лип",
+        "Aug": "Сер",
+        "Sep": "Вер",
+        "Oct": "Жов",
+        "Nov": "Лис",
+        "Dec": "Гру",
+        "Authenticating with DessMonitor...": "Автентифікація в DessMonitor...",
+        "Loading supported import fields...": "Завантаження підтримуваних полів імпорту...",
+        "Loading inverter control fields...": "Завантаження полів керування інвертором...",
+        "Loading inverter location...": "Завантаження локації інвертора...",
+        "City, region or coordinates": "Місто, регіон або координати",
+        "Profile access and DessMonitor authentication for this inverter.": "Доступ до профілю та автентифікація DessMonitor для цього інвертора.",
+        "Weather and forecast features use this location. You can keep the detected location, search for a place, or choose a point on the map.": "Погодні та прогнозні функції використовують цю локацію. Можна залишити визначену локацію, знайти місце або обрати точку на мапі.",
+        "Controls how often the app refreshes EnergyFlow, runs background sync, and polls Tuya devices for this profile.": "Керує частотою оновлення EnergyFlow, фонової синхронізації та опитування пристроїв Tuya для цього профілю.",
+        "Stores Tuya credentials and endpoint for this profile. The main Tuya tab is visible only when enabled.": "Зберігає облікові дані Tuya та endpoint для цього профілю. Головна вкладка Tuya видима лише коли інтеграцію увімкнено.",
+        "Used to estimate battery charge/discharge time on EnergyFlow. Set 0 to disable the estimate.": "Використовується для оцінки часу заряджання/розряджання батареї в EnergyFlow. Встановіть 0, щоб вимкнути оцінку.",
+        "Run Check to load the device list. All available import fields are added automatically.": "Натисніть Перевірити, щоб завантажити список пристроїв. Усі доступні поля імпорту додаються автоматично.",
+        "Choose the verified inverter. The app always imports every available field.": "Оберіть перевірений інвертор. Застосунок завжди імпортує всі доступні поля.",
+        "Search for a place or click directly on the map to set the inverter location.": "Знайдіть місце або натисніть прямо на мапі, щоб задати локацію інвертора.",
+        "Map view is unavailable in this environment. Please enter location manually.": "Перегляд мапи недоступний у цьому середовищі. Введіть локацію вручну.",
+        "Tip: click a point on the map or search by city, village, or full address.": "Порада: натисніть точку на мапі або знайдіть за містом, селом чи повною адресою.",
+        "Use location": "Використати локацію",
+        "Custom map point": "Власна точка на мапі",
+        "No map point selected yet.": "Точку на мапі ще не вибрано.",
+        "Search city, village or address": "Пошук міста, села або адреси",
+        "Search": "Пошук",
+        "Click on the map to place the inverter.": "Натисніть на мапі, щоб розмістити інвертор.",
+        "Manual location from map": "Ручна локація з мапи",
+        "Manual location": "Ручна локація",
+        "Required for weather-based generation forecast. You can type a place or choose it on the map.": "Потрібно для погодозалежного прогнозу генерації. Ви можете ввести місце або обрати його на мапі.",
+        "Latitude, longitude": "Широта, довгота",
+        "Verify the API connection before saving the profile.": "Перевірте API-підключення перед збереженням профілю.",
+        "DessMonitor did not return the inverter location. Switch Location source to manual and enter it.": "DessMonitor не повернув локацію інвертора. Перемкніть Джерело локації на ручний режим і введіть її.",
+        "Enter the inverter location before saving.": "Вкажіть локацію інвертора перед збереженням.",
+        "Fill in Tuya client ID and Tuya client secret, or disable Tuya for this profile.": "Заповніть Tuya client ID і Tuya client secret або вимкніть Tuya для цього профілю.",
+        "Stopping background requests before closing...": "Зупиняю фонові запити перед закриттям...",
+        "PV forecast updated.": "Прогноз PV оновлено.",
+        "PV forecast loaded from cache (live API unavailable).": "Прогноз PV завантажено з кешу (live API недоступний).",
+        "PV forecast unavailable.": "Прогноз PV недоступний.",
+        "EnergyFlow refresh is already in progress.": "Оновлення EnergyFlow уже виконується.",
+        "Refreshing current EnergyFlow snapshot...": "Оновлення поточного снапшоту EnergyFlow...",
+        "Refreshing current EnergyFlow snapshot for the selected profile.": "Оновлення поточного снапшоту EnergyFlow для вибраного профілю.",
+        "Retrying current EnergyFlow snapshot for the selected profile.": "Повторна спроба оновлення поточного снапшоту EnergyFlow для вибраного профілю.",
+        "Updating today actual PV values for forecast...": "Оновлення фактичних значень PV за сьогодні для прогнозу...",
+        "Auto-sync skipped while another import is running.": "Автосинхронізацію пропущено, бо виконується інший імпорт.",
+        "Auto-sync failed.": "Автосинхронізація не вдалася.",
+        "Failed to load data.": "Не вдалося завантажити дані.",
+        "The local saved-data database was cleared.": "Локальну базу збережених даних очищено.",
+        "Forecast will refresh when you open the Forecast tab.": "Прогноз оновиться, коли ви відкриєте вкладку Прогноз.",
+        "Choose an active device profile to load EnergyFlow.": "Оберіть активний профіль пристрою, щоб завантажити EnergyFlow.",
+        "Actual PV was backfilled from current EnergyFlow snapshot.": "Фактичний PV було дозаповнено з поточного снапшоту EnergyFlow.",
+        "EnergyFlow request timed out. Please retry or check DessMonitor/API connectivity.": "Запит EnergyFlow завершився за таймаутом. Повторіть спробу або перевірте з'єднання з DessMonitor/API.",
+        "EnergyFlow returned an empty snapshot (all primary values are missing).": "EnergyFlow повернув порожній снапшот (усі основні значення відсутні).",
+        "Updating EnergyFlow": "Оновлення EnergyFlow",
+        "EnergyFlow snapshot loaded successfully.": "Снапшот EnergyFlow успішно завантажено.",
+        "EnergyFlow request timed out during profile load. Retrying in {delay_text} ({attempt}/{total}).": "Під час завантаження профілю запит EnergyFlow завершився за таймаутом. Повтор через {delay_text} ({attempt}/{total}).",
+        "Retrying EnergyFlow ({attempt}/{total})": "Повторне оновлення EnergyFlow ({attempt}/{total})",
+        "The saved dataset is empty, so only EnergyFlow was refreshed.": "Збережений датасет порожній, тому було оновлено лише EnergyFlow.",
+        "DessMonitor profile": "Профіль DessMonitor",
+        'Loaded profile "{profile_label}" • {row_count:,} rows • {metric_count} metrics • {date_label}': 'Завантажено профіль "{profile_label}" • {row_count:,} рядків • {metric_count} метрик • {date_label}',
+        "DessMonitor | PN {pn} | addr {addr} | code {code} | SN {sn}": "DessMonitor | PN {pn} | адреса {addr} | код {code} | SN {sn}",
+        "Loaded Excel file {file_name} • {row_count:,} rows • {metric_count} metrics": "Завантажено файл Excel {file_name} • {row_count:,} рядків • {metric_count} метрик",
+        "Loaded weather {series_type} for {device_label} • {row_count:,} rows • {metric_count} metrics": "Завантажено погоду ({series_type}) для {device_label} • {row_count:,} рядків • {metric_count} метрик",
+        "Loaded PV forecast for {device_label} • {row_count:,} rows • {metric_count} metrics": "Завантажено прогноз PV для {device_label} • {row_count:,} рядків • {metric_count} метрик",
+        "PV forecast snapshot": "Снапшот прогнозу PV",
+        "Loaded {source_label} • {row_count:,} rows • {metric_count} metrics": "Завантажено {source_label} • {row_count:,} рядків • {metric_count} метрик",
+        "Pick a custom date to switch this filter to Custom range.": "Оберіть довільну дату, щоб перемкнути цей фільтр у режим Довільний період.",
+        "Start date": "Початкова дата",
+        "End date": "Кінцева дата",
+        "Shows what share of generated solar energy was used at home instead of being exported to the grid.": "Показує, яку частку згенерованої сонячної енергії використано вдома замість експорту в мережу.",
+        "Shows what share of home consumption was covered by your own energy without importing from the grid.": "Показує, яку частку домашнього споживання покрито власною енергією без імпорту з мережі.",
+        "Shows what share of home consumption was covered by battery discharge during the selected period.": "Показує, яку частку домашнього споживання покрито розрядом батареї за вибраний період.",
+        "KPI description is unavailable.": "Опис KPI недоступний.",
+        "Total PV energy generated for the selected period.": "Загальна енергія PV, згенерована за вибраний період.",
+        "Total home energy consumption for the selected period.": "Загальне домашнє споживання енергії за вибраний період.",
+        "Total energy imported from grid for the selected period.": "Загальна енергія, імпортована з мережі за вибраний період.",
+        "Total energy exported to grid for the selected period.": "Загальна енергія, експортована в мережу за вибраний період.",
+        "Total energy used to charge battery for the selected period.": "Загальна енергія, використана на заряд батареї за вибраний період.",
+        "Total energy discharged from battery for the selected period.": "Загальна енергія, віддана батареєю за вибраний період.",
+        "Total home consumption cost for the selected period using day/night tariffs.": "Загальна вартість споживання за вибраний період за денним/нічним тарифом.",
+        "Total grid import cost for the selected period using day/night tariffs.": "Загальна вартість імпорту з мережі за вибраний період за денним/нічним тарифом.",
+        "Day import cost": "Вартість денного імпорту",
+        "Night import cost": "Вартість нічного імпорту",
+        "Estimated from latest daily grid-import profile.": "Оцінка за останнім добовим профілем імпорту з мережі.",
+        "UAH": "грн",
+        "Metric description is unavailable.": "Опис метрики недоступний.",
+    },
+    "en": {},
+}
+
+_TEXT_FRAGMENTS: dict[str, dict[str, str]] = {
+    "uk": {
+        "PV power for ": "Потужність PV за ",
+        "PV generation across ": "Генерація PV за ",
+        "Total generation": "Загальна генерація",
+        "Next 48 hours": "Наступні 48 годин",
+        "Weather-matched rows": "Погодно-зіставлені рядки",
+        "PV source": "Джерело PV",
+        "Snapshot rows": "Рядків снапшоту",
+        "Cached snapshot": "Кешований снапшот",
+        "Cached PV Forecast Snapshot": "Кешований снапшот прогнозу PV",
+        "training day(s)": "навчальних днів",
+        "Adaptive self-correcting hybrid": "Адаптивний самокоригувальний гібрид",
+        "High confidence": "Висока впевненість",
+        "Open a file or choose a device profile to load a chart.": "Відкрийте файл або оберіть профіль пристрою, щоб завантажити графік.",
+        "Failed to render chart.": "Не вдалося відобразити графік.",
+        "Loading...": "Завантаження...",
+        "Refreshing ": "Оновлення ",
+        "Run every ": "Запускати кожні ",
+        " minutes": " хв",
+        "Profile: ": "Профіль: ",
+        "Platform: ": "Платформа: ",
+        "Device: ": "Пристрій: ",
+        "Details: ": "Деталі: ",
+        "Action: ": "Дія: ",
+        "Loaded ": "Завантажено ",
+        " Tuya device(s).": " пристроїв Tuya.",
+        " parameter(s).": " параметрів.",
+        "Settings loaded: ": "Налаштувань завантажено: ",
+        "Updated: ": "Оновлено: ",
+        "Last saved record: ": "Останній збережений запис: ",
+        "Sync range: ": "Діапазон синхронізації: ",
+        "Import started for ": "Імпорт розпочато для ",
+        "Starting profile load for '": "Початок завантаження профілю '",
+        "Refreshing current EnergyFlow snapshot for the selected profile.": "Оновлення поточного снапшоту EnergyFlow для вибраного профілю.",
+        "Loading current EnergyFlow snapshot": "Завантаження поточного снапшоту EnergyFlow",
+        " power for ": " потужність за ",
+        "Monthly grid energy for ": "Місячна енергія мережі за ",
+        "Last updated ": "Оновлено ",
+        " • Source: DessMonitor + Weather • Weather: ": " • Джерело: DessMonitor + Погода • Погода: ",
+        "Loading snapshot for ": "Завантаження снапшоту для ",
+        "Loaded ": "Завантажено ",
+        " available field(s) for ": " доступних полів для ",
+        "Please fill in: ": "Будь ласка, заповніть: ",
+        "Map address: ": "Адреса на мапі: ",
+        "kWh": "кВт*год",
+        "Wh": "Вт*год",
+        " W": " Вт",
+        "W/m2": "Вт/м²",
+        "Daily ": "Щоденний ",
+        "Monthly ": "Місячний ",
+        " trend for ": " тренд за ",
+        " across ": " за період ",
+        "energy for ": "енергії за ",
+        "Grid ": "Мережі ",
+        "grid ": "мережі ",
+        "Tuya error: ": "Помилка Tuya: ",
+        " (showing last known devices)": " (показано останні відомі пристрої)",
+        " device(s). Choose one to import.": " пристроїв. Оберіть один для імпорту.",
+        "All available import fields will be imported automatically (": "Усі доступні поля імпорту буде додано автоматично (",
+        " loaded).": " завантажено).",
+        "Inverter Analysis - ": "Аналіз інвертора - ",
+        " History - ": " Історія - ",
+        " samples for the selected day.": " значень за вибраний день.",
+        " for the selected month.": " за вибраний місяць.",
+        " for the selected year.": " за вибраний рік.",
+        " history available.": " історія недоступна.",
+        " selected": " вибрано",
+        "Active API device: ": "Активний API-пристрій: ",
+        "Profile is active. EnergyFlow timed out; background refresh will continue.": "Профіль активний. EnergyFlow завершився за таймаутом; фонове оновлення продовжиться.",
+        "Could not refresh current value before edit: ": "Не вдалося оновити поточне значення перед редагуванням: ",
+        "Cached local value for ": "Закешовано локальне значення для ",
+        "Inverter settings refresh failed: ": "Не вдалося оновити налаштування інвертора: ",
+        "Auto-sync started for ": "Автосинхронізацію запущено для ",
+        "Auto-sync completed at ": "Автосинхронізацію завершено о ",
+        "Saved dataset exported to ": "Збережений датасет експортовано до ",
+        "Chart exported to ": "Графік експортовано до ",
+        "Exported: ": "Експортовано: ",
+    }
+}
+
+_CURRENT_LANGUAGE = load_ui_language()
+LOGGER = get_logger(__name__)
+_COMBO_SOURCE_ROLE = int(Qt.ItemDataRole.UserRole) + 700
+_TAB_SOURCE_ROLE = int(Qt.ItemDataRole.UserRole) + 701
+_TEXT_SOURCE_PROP = "i18n_source_text"
+_PLACEHOLDER_SOURCE_PROP = "i18n_source_placeholder"
+_TOOLTIP_SOURCE_PROP = "i18n_source_tooltip"
+_AUTO_TRANSLATE_FILTER: "_AutoTranslateEventFilter | None" = None
+_UNIT_SPACING_PATTERN = re.compile(
+    r"(?P<num>-?\d+(?:[.,]\d+)?)\s*(?P<unit>kWh|Wh|kW|W|V|Ah|A|mA|mm|m/s|Hz|C|°C|кВт\*год|Вт\*год|кВт|Вт|В|А\*год|А|мА|мм|м/с|Гц)\b"
+)
+_UK_UNIT_REPLACEMENTS = {
+    "kWh": "кВт*год",
+    "Wh": "Вт*год",
+    "kW": "кВт",
+    "W": "Вт",
+    "V": "В",
+    "Ah": "А*год",
+    "A": "А",
+    "mA": "мА",
+    "mm": "мм",
+    "m/s": "м/с",
+    "Hz": "Гц",
+    "C": "°C",
+    "°C": "°C",
+}
+
+
+def supported_languages() -> tuple[str, ...]:
+    return tuple(_TRANSLATIONS.keys())
+
+
+def current_language() -> str:
+    return _CURRENT_LANGUAGE
+
+
+def set_language(language_code: str, *, persist: bool = True) -> str:
+    global _CURRENT_LANGUAGE
+    code = str(language_code or DEFAULT_UI_LANGUAGE).strip().lower()
+    if code not in _TRANSLATIONS:
+        code = DEFAULT_UI_LANGUAGE
+    _CURRENT_LANGUAGE = code
+    if persist:
+        save_ui_language(code)
+    return code
+
+
+def _normalize_value_unit_spacing(text: str) -> str:
+    source = str(text)
+    if not source:
+        return source
+
+    def _repl(match: re.Match[str]) -> str:
+        number = match.group("num")
+        unit = match.group("unit")
+        if _CURRENT_LANGUAGE == "uk":
+            unit = _UK_UNIT_REPLACEMENTS.get(unit, unit)
+        return f"{number} {unit}"
+
+    return _UNIT_SPACING_PATTERN.sub(_repl, source)
+
+
+def tr(text: str) -> str:
+    source = str(text)
+    if not source:
+        return source
+    translated = _TRANSLATIONS.get(_CURRENT_LANGUAGE, {}).get(source, source)
+    return _normalize_value_unit_spacing(translated)
+
+
+def tr_fragment(text: str) -> str:
+    source = str(text)
+    if not source:
+        return source
+    translated = tr(source)
+    if translated != source:
+        return _normalize_value_unit_spacing(translated)
+    for english, localized in _TEXT_FRAGMENTS.get(_CURRENT_LANGUAGE, {}).items():
+        if english in translated:
+            translated = translated.replace(english, localized)
+    return _normalize_value_unit_spacing(translated)
+
+
+def _remember_source_property(widget: QWidget, prop_name: str, value: str) -> str:
+    source = widget.property(prop_name)
+    if isinstance(source, str) and source:
+        return source
+    widget.setProperty(prop_name, value)
+    return value
+
+
+def _translate_widget(widget: QWidget) -> None:
+    if isinstance(widget, (QWidget, QDialog)):
+        try:
+            source_title = _remember_source_property(widget, _TEXT_SOURCE_PROP + "_window", widget.windowTitle())
+            if source_title:
+                widget.setWindowTitle(tr_fragment(source_title))
+        except Exception:
+            LOGGER.exception("Failed to translate window title for widget %r", widget)
+
+    if isinstance(widget, (QLabel, QPushButton, QCheckBox, QGroupBox)):
+        source_text = _remember_source_property(widget, _TEXT_SOURCE_PROP, widget.text())
+        widget.setText(tr_fragment(source_text))
+
+    if isinstance(widget, QLineEdit):
+        source_placeholder = _remember_source_property(widget, _PLACEHOLDER_SOURCE_PROP, widget.placeholderText())
+        widget.setPlaceholderText(tr_fragment(source_placeholder))
+
+    source_tooltip = _remember_source_property(widget, _TOOLTIP_SOURCE_PROP, widget.toolTip())
+    if source_tooltip:
+        widget.setToolTip(tr_fragment(source_tooltip))
+
+    if isinstance(widget, QComboBox):
+        for index in range(widget.count()):
+            source_text = widget.itemData(index, _COMBO_SOURCE_ROLE)
+            if not isinstance(source_text, str) or not source_text:
+                source_text = widget.itemText(index)
+                widget.setItemData(index, source_text, _COMBO_SOURCE_ROLE)
+            widget.setItemText(index, tr_fragment(source_text))
+
+    if isinstance(widget, QTabWidget):
+        for index in range(widget.count()):
+            source_text = widget.tabBar().tabData(index)
+            if not isinstance(source_text, str) or not source_text:
+                source_text = widget.tabText(index)
+                widget.tabBar().setTabData(index, source_text)
+            widget.setTabText(index, tr_fragment(source_text))
+
+
+def translate_widget_tree(root: QWidget) -> None:
+    if root is None:
+        return
+    _translate_widget(root)
+    for child in root.findChildren(QWidget):
+        _translate_widget(child)
+
+
+class _AutoTranslateEventFilter(QObject):
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() in (
+            QEvent.Type.Show,
+            QEvent.Type.ShowToParent,
+            QEvent.Type.Polish,
+            QEvent.Type.LanguageChange,
+        ) and isinstance(watched, QWidget):
+            try:
+                translate_widget_tree(watched)
+            except Exception:
+                LOGGER.exception("Automatic UI translation failed for %r", watched)
+        return False
+
+
+def install_auto_translation(app: QCoreApplication | None) -> None:
+    global _AUTO_TRANSLATE_FILTER
+    if app is None or _AUTO_TRANSLATE_FILTER is not None:
+        return
+    _AUTO_TRANSLATE_FILTER = _AutoTranslateEventFilter(app)
+    app.installEventFilter(_AUTO_TRANSLATE_FILTER)
+
+
+def _translate_plotly_node(node: Any) -> Any:
+    if isinstance(node, dict):
+        translated_dict: dict[str, Any] = {}
+        for key, value in node.items():
+            if isinstance(value, str) and key in {
+                "text",
+                "name",
+                "title",
+                "hovertemplate",
+                "xaxis_title",
+                "yaxis_title",
+                "legend_title_text",
+                "label",
+            }:
+                translated_dict[key] = tr_fragment(value)
+            else:
+                translated_dict[key] = _translate_plotly_node(value)
+        return translated_dict
+    if isinstance(node, list):
+        return [_translate_plotly_node(item) for item in node]
+    if isinstance(node, tuple):
+        return tuple(_translate_plotly_node(item) for item in node)
+    return node
+
+
+def translate_plotly_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return _translate_plotly_node(payload)

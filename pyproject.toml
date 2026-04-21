@@ -1,0 +1,37 @@
+[project]
+name = "energyflow-studio"
+version = "0.1.0"
+description = "macOS desktop app for syncing DessMonitor telemetry, visualizing EnergyFlow, and exploring energy history."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "openpyxl>=3.1.2",
+  "pandas>=2.2.0",
+  "plotly>=5.24.0",
+  "PySide6>=6.8.0",
+  "requests>=2.32.0",
+]
+
+[project.scripts]
+energyflow-studio = "app.main:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not gui'"
+markers = [
+  "gui: tests that require Qt GUI runtime (excluded by default)",
+]

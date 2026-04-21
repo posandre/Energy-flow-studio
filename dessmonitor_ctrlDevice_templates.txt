@@ -1,0 +1,124 @@
+Profile: Інвертор Ямпіль
+Device: pn=Q0045288611188, devcode=2376, devaddr=1, sn=Q0045288611188094801
+
+Base template:
+https://api.dessmonitor.com/public/?sign=<sign>&salt=<salt>&token=<token>&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=<field_id>&val=<val>
+
+Field templates:
+- sys_eybond_ctrl_57 | Auto Restart When Over Temperature Occurs
+  options: 0:Auto Restart Disable, 1:Auto Restart Enable
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=sys_eybond_ctrl_57&val=%3Cval%3E
+- sys_eybond_ctrl_60 | Battery EQ Mode
+  options: 0:Disable, 1:Enable
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=sys_eybond_ctrl_60&val=%3Cval%3E
+- bat_eybond_ctrl_66 | Battery Type
+  options: 0:AGM, 1:FLD, 2:USER, 3:Li1, 4:Li2, 5:Li3, 6:Li4
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_66&val=%3Cval%3E
+- bat_eybond_ctrl_82 | Low DC Protection SOC In Grid Mode
+  options: -
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_82&val=%3Cval%3E
+- bat_eybond_ctrl_84 | Off grid mode battery discharge SOC protection value
+  options: -
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_84&val=%3Cval%3E
+- bat_eybond_ctrl_83 | SOC recovery value of battery discharge in mains mode
+  options: -
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_83&val=%3Cval%3E
+- sys_eybond_ctrl_52 | Beeps While Primary Source Is Interrupted
+  options: 0:Beeps OFF, 1:Beeps ON
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=sys_eybond_ctrl_52&val=%3Cval%3E
+- bat_eybond_ctrl_68 | Bulk Charging Voltage (C.V Voltage)
+  options: -
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_68&val=%3Cval%3E
+- bat_eybond_ctrl_75 | Charger Source Priority
+  options: 0:Utility First, 1:PV First, 2:PV Is At The Same Level As Utility, 3:Only PV
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_75&val=%3Cval%3E
+- bat_eybond_ctrl_69 | Floating Charging Voltage
+  options: -
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_69&val=%3Cval%3E
+- sys_forced_eq_charging | Forced EQ Charging
+  options: 1:Forced EQ Charging Once
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=sys_forced_eq_charging&val=%3Cval%3E
+- bat_eybond_ctrl_77 | Max.AC.Charging Current
+  options: -
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_77&val=%3Cval%3E
+- bat_eybond_ctrl_76 | Max.Charging Current
+  options: -
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_76&val=%3Cval%3E
+- bat_eybond_ctrl_74 | Time from C.V to Floating Charge
+  options: -
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_74&val=%3Cval%3E
+- bat_eybond_ctrl_73 | Low DC Protection Voltage In Off-Grid Mode
+  options: -
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_73&val=%3Cval%3E
+- sys_eybond_ctrl_51 | Buzzer Mode
+  options: 0:Beeps OFF, 1:Beeps ON, 2:Mute when input source changes, 3:Beeps only in fault mode
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=sys_eybond_ctrl_51&val=%3Cval%3E
+- bse_eybond_ctrl_48 | Output Mode
+  options: 0:Single, 1:Parallel, 2:3P1, 3:3P2, 4:3P3, 5:2P1, 6:2P2
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bse_eybond_ctrl_48&val=%3Cval%3E
+- sys_eybond_ctrl_55 | Power Saving Mode
+  options: 0:Saving Mode Disable, 1:Saving Mode Enable
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=sys_eybond_ctrl_55&val=%3Cval%3E
+- bat_eybond_ctrl_79 | EQ Charing Time
+  options: -
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_79&val=%3Cval%3E
+- bat_eybond_ctrl_81 | EQ Interval Time
+  options: -
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_81&val=%3Cval%3E
+- bat_eybond_ctrl_80 | EQ Timeout Exit time
+  options: -
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_80&val=%3Cval%3E
+- sys_eybond_ctrl_54 | Auto Return To Default Display Screen
+  options: 0:Stay At Latest Screen, 1:Return To Default Display Screen
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=sys_eybond_ctrl_54&val=%3Cval%3E
+- bat_eybond_ctrl_78 | EQ Charing Voltage
+  options: -
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_78&val=%3Cval%3E
+- sys_exit_fault_mode | Exit Fault Mode
+  options: 1:Exit Fault Mode
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=sys_exit_fault_mode&val=%3Cval%3E
+- bat_eybond_ctrl_67 | High DC Protection Voltage
+  options: -
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_67&val=%3Cval%3E
+- bse_eybond_ctrl_50 | Input Voltage Range
+  options: 0:Appliances, 1:UPS, 2:Generator
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bse_eybond_ctrl_50&val=%3Cval%3E
+- bat_eybond_ctrl_71 | Low DC Protection Voltage In Mains Mode
+  options: -
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_71&val=%3Cval%3E
+- bse_eybond_ctrl_65 | Output Frequency
+  options: 50.00:50Hz, 60.00:60Hz
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bse_eybond_ctrl_65&val=%3Cval%3E
+- bse_eybond_ctrl_64 | Output Voltage
+  options: 220.0:220Vac, 230.0:230Vac, 240.0:240Vac
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bse_eybond_ctrl_64&val=%3Cval%3E
+- bat_eybond_ctrl_70 | Recovery Voltage Back To Mains Mode
+  options: -
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bat_eybond_ctrl_70&val=%3Cval%3E
+- sys_eybond_ctrl_82 | Auto AC Output
+  options: 0:Disable With Power Switch OFF, 1:Enable With Power Switch ON
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=sys_eybond_ctrl_82&val=%3Cval%3E
+- sys_eybond_ctrl_56 | Auto Restart When Overload Occurs
+  options: 0:Auto Restart Disable, 1:Auto Restart Enable
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=sys_eybond_ctrl_56&val=%3Cval%3E
+- sys_eybond_ctrl_53 | Backlight Control
+  options: 0:Backlight Timing Off, 1:Backlight On
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=sys_eybond_ctrl_53&val=%3Cval%3E
+- sys_eybond_ctrl_98 | Boot method
+  options: 0:Can be powered on locally or remotely, 1:Only boot locally, 2:Only remote boot
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=sys_eybond_ctrl_98&val=%3Cval%3E
+- sys_eybond_ctrl_95 | Clear Record
+  options: 170:Clear Record
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=sys_eybond_ctrl_95&val=%3Cval%3E
+- sys_eybond_ctrl_97 | Output control
+  options: 0:OFF, 1:ON
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=sys_eybond_ctrl_97&val=%3Cval%3E
+- bse_eybond_ctrl_49 | Output priority
+  options: 0:UTI, 1:SOL, 2:SBU, 3:SUB, 4:SUF
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=bse_eybond_ctrl_49&val=%3Cval%3E
+- sys_eybond_ctrl_58 | Overload Bypass
+  options: 0:Disable, 1:Enable
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=sys_eybond_ctrl_58&val=%3Cval%3E
+- sys_eybond_ctrl_96 | Reset User Settings
+  options: 170:Reset User Settings
+  url: https://api.dessmonitor.com/public/?sign=%3Csign%3E&salt=%3Csalt%3E&token=%3Ctoken%3E&action=ctrlDevice&pn=Q0045288611188&devcode=2376&devaddr=1&sn=Q0045288611188094801&source=1&_app_client_=web&_app_id_=energy-excel-analyzer&_app_version_=0.1.0&id=sys_eybond_ctrl_96&val=%3Cval%3E
