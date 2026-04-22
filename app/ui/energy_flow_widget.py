@@ -64,7 +64,7 @@ class EnergyFlowCanvas(QGraphicsView):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setStyleSheet("background: transparent;")
-        self.setMinimumHeight(680)
+        self.setMinimumHeight(540)
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
         # Animate only when there is active power flow to avoid unnecessary redraw cost.
@@ -72,7 +72,7 @@ class EnergyFlowCanvas(QGraphicsView):
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
-        self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self._apply_view_fit()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         try:
@@ -329,10 +329,23 @@ class EnergyFlowCanvas(QGraphicsView):
             raise
         self._sync_hover_from_cursor(reason="render")
         self._update_hover_overlay()
+        self._apply_view_fit()
         self._log_debug(
             "EnergyFlow scene render complete | "
             f"hover_tag={self._hovered_tag!r} | hover_targets={len(self._hover_target_rects)}"
         )
+
+    def _apply_view_fit(self) -> None:
+        scene_rect = self._scene.sceneRect()
+        if scene_rect.isNull() or scene_rect.isEmpty():
+            return
+        self.resetTransform()
+        self.fitInView(scene_rect, Qt.AspectRatioMode.KeepAspectRatio)
+        transform = self.transform()
+        if transform.m11() > 1.0 or transform.m22() > 1.0:
+            # Keep a stable 1:1 baseline and avoid visual "zoom-in" when viewport grows.
+            self.resetTransform()
+            self.centerOn(scene_rect.center())
 
     def _sync_hover_from_cursor(self, *, reason: str) -> None:
         viewport = self.viewport()

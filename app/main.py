@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import logging
+import time
 from pathlib import Path
 import threading
 
@@ -224,8 +225,44 @@ def main() -> int:
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
 
+    startup_target_w = 1400
+    startup_target_h = 950
     window = MainWindow()
+    window.resize(startup_target_w, startup_target_h)
+    startup_screen = app.primaryScreen()
+    if startup_screen is not None:
+        startup_frame = window.frameGeometry()
+        startup_frame.moveCenter(startup_screen.availableGeometry().center())
+        window.move(startup_frame.topLeft())
     window.show()
+
+    def _enforce_startup_window_size() -> None:
+        try:
+            window.showNormal()
+            window.resize(startup_target_w, startup_target_h)
+            screen = window.windowHandle().screen() if window.windowHandle() is not None else app.primaryScreen()
+            if screen is not None:
+                frame = window.frameGeometry()
+                frame.moveCenter(screen.availableGeometry().center())
+                window.move(frame.topLeft())
+        except Exception:
+            LOGGER.exception("Failed to enforce startup window size")
+
+    QTimer.singleShot(0, _enforce_startup_window_size)
+    QTimer.singleShot(250, _enforce_startup_window_size)
+    QTimer.singleShot(900, _enforce_startup_window_size)
+    startup_guard_deadline = time.monotonic() + 5.0
+    startup_guard_timer = QTimer(app)
+    startup_guard_timer.setInterval(300)
+
+    def _startup_guard_tick() -> None:
+        if time.monotonic() >= startup_guard_deadline:
+            startup_guard_timer.stop()
+            return
+        _enforce_startup_window_size()
+
+    startup_guard_timer.timeout.connect(_startup_guard_tick)
+    startup_guard_timer.start()
 
     # Enforce a centralized cursor policy for every button (existing and future).
     _install_global_button_cursor_policy(app)

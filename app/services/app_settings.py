@@ -396,3 +396,58 @@ def save_last_loaded_profile_name(profile_name: str) -> None:
     settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
     settings.setValue("dessmonitor/last_loaded_profile", profile_name)
     settings.sync()
+
+
+def load_profile_automations(profile_name: str) -> list[dict[str, object]]:
+    normalized_profile = str(profile_name or "").strip()
+    if not normalized_profile:
+        return []
+    settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    raw = settings.value(f"automations/{normalized_profile}/rules", "[]")
+    try:
+        payload = json.loads(raw if isinstance(raw, str) else "[]")
+    except json.JSONDecodeError:
+        payload = []
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict)]
+
+
+def save_profile_automations(profile_name: str, rules: list[dict[str, object]]) -> None:
+    normalized_profile = str(profile_name or "").strip()
+    if not normalized_profile:
+        return
+    settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    settings.setValue(
+        f"automations/{normalized_profile}/rules",
+        json.dumps([item for item in rules if isinstance(item, dict)], ensure_ascii=False),
+    )
+    settings.sync()
+
+
+def load_profile_automation_logs(profile_name: str) -> list[str]:
+    normalized_profile = str(profile_name or "").strip()
+    if not normalized_profile:
+        return []
+    settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    raw = settings.value(f"automations/{normalized_profile}/logs", "[]")
+    try:
+        payload = json.loads(raw if isinstance(raw, str) else "[]")
+    except json.JSONDecodeError:
+        payload = []
+    if not isinstance(payload, list):
+        return []
+    return [str(item) for item in payload if str(item).strip()]
+
+
+def save_profile_automation_logs(profile_name: str, lines: list[str]) -> None:
+    normalized_profile = str(profile_name or "").strip()
+    if not normalized_profile:
+        return
+    trimmed = [str(item) for item in lines if str(item).strip()][-400:]
+    settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    settings.setValue(
+        f"automations/{normalized_profile}/logs",
+        json.dumps(trimmed, ensure_ascii=False),
+    )
+    settings.sync()
