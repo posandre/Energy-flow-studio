@@ -2387,12 +2387,12 @@ class MainWindow(QMainWindow):
             return 0.0
         lowered = text.lower()
         unit = "a"
-        if "ma" in lowered:
+        if "ma" in lowered or "ма" in lowered:
             unit = "ma"
-        numeric = text
-        for token in ("mA", "ma", "A", "a"):
-            numeric = numeric.replace(token, "")
-        numeric = numeric.strip().replace(",", ".")
+        match = re.search(r"-?\d+(?:[.,]\d+)?", text)
+        if match is None:
+            return 0.0
+        numeric = match.group(0).strip().replace(",", ".")
         try:
             value = float(numeric)
         except ValueError:
@@ -2407,15 +2407,16 @@ class MainWindow(QMainWindow):
         text = (raw_value or "").strip()
         if not text:
             return 0.0
-        numeric = text
-        for token in ("kW", "kw", "W", "w"):
-            numeric = numeric.replace(token, "")
-        numeric = numeric.strip().replace(",", ".")
+        lowered = text.lower()
+        match = re.search(r"-?\d+(?:[.,]\d+)?", text)
+        if match is None:
+            return 0.0
+        numeric = match.group(0).strip().replace(",", ".")
         try:
             value = float(numeric)
         except ValueError:
             return 0.0
-        if "kw" in text.lower():
+        if "kw" in lowered or "квт" in lowered:
             value *= 1000.0
         return abs(value)
 
@@ -2621,10 +2622,10 @@ class MainWindow(QMainWindow):
         parsed_items = self._parse_tuya_measurements(raw_text)
         raw_map = {label.strip().lower(): value.strip() for label, value in parsed_items}
         ordered_items = [
-            (tr("Energy"), raw_map.get("energy", "—")),
-            (tr("Current"), raw_map.get("current", "—")),
-            (tr("Power"), raw_map.get("power", "—")),
-            (tr("Voltage"), raw_map.get("voltage", "—")),
+            (tr("Energy"), tr_fragment(raw_map.get("energy", "—"))),
+            (tr("Current"), tr_fragment(raw_map.get("current", "—"))),
+            (tr("Power"), tr_fragment(raw_map.get("power", "—"))),
+            (tr("Voltage"), tr_fragment(raw_map.get("voltage", "—"))),
         ]
 
         for idx, (label, value) in enumerate(ordered_items):
@@ -2678,7 +2679,7 @@ class MainWindow(QMainWindow):
             if not sep:
                 continue
             clean_label = label.strip()
-            clean_value = tr_fragment(value.strip())
+            clean_value = value.strip()
             if not clean_label or not clean_value:
                 continue
             pairs.append((clean_label, clean_value))
