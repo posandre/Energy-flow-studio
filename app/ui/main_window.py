@@ -1822,7 +1822,27 @@ class MainWindow(QMainWindow):
                         measurement_keys_by_device.setdefault(device_id, set()).add(normalized_code)
 
         inverter_measurements = self._build_inverter_numeric_measurements_map()
-        inverter_keys = sorted({key.strip().lower() for key in inverter_measurements if key.strip()})
+        inverter_key_pool: set[str] = {
+            key.strip().lower()
+            for key in inverter_measurements
+            if key.strip()
+        }
+        if self.active_device_profile is not None:
+            for key in (self.active_device_profile.available_parameter_keys or []):
+                normalized = str(key).strip().lower()
+                if normalized:
+                    inverter_key_pool.add(normalized)
+            for key in (self.active_device_profile.selected_parameter_keys or []):
+                normalized = str(key).strip().lower()
+                if normalized:
+                    inverter_key_pool.add(normalized)
+        processed = self._resolved_active_profile_processed_data()
+        if processed is not None:
+            for key in (processed.numeric_columns or []):
+                normalized = str(key).strip().lower()
+                if normalized:
+                    inverter_key_pool.add(normalized)
+        inverter_keys = sorted(inverter_key_pool)
         if inverter_keys:
             device_options.append((AUTOMATION_INVERTER_DEVICE_ID, tr("Inverter")))
             measurement_keys_by_device.setdefault(AUTOMATION_INVERTER_DEVICE_ID, set()).update(inverter_keys)
@@ -3922,10 +3942,61 @@ class MainWindow(QMainWindow):
             QSpinBox::down-button,
             QDoubleSpinBox::up-button,
             QDoubleSpinBox::down-button {
-                width: 16px;
-                border: none;
-                background: transparent;
+                width: 18px;
+                border: 1px solid rgba(34, 211, 238, 0.45);
+                background: rgba(8, 30, 56, 0.88);
                 subcontrol-origin: border;
+                margin-right: 3px;
+            }
+            QSpinBox::up-button,
+            QDoubleSpinBox::up-button {
+                subcontrol-position: top right;
+                border-top-left-radius: 5px;
+                border-top-right-radius: 5px;
+                border-bottom-left-radius: 0px;
+                border-bottom-right-radius: 0px;
+            }
+            QSpinBox::down-button,
+            QDoubleSpinBox::down-button {
+                subcontrol-position: bottom right;
+                border-top-left-radius: 0px;
+                border-top-right-radius: 0px;
+                border-bottom-left-radius: 5px;
+                border-bottom-right-radius: 5px;
+            }
+            QSpinBox::up-arrow,
+            QDoubleSpinBox::up-arrow {
+                image: none;
+                width: 0px;
+                height: 0px;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-bottom: 6px solid #22d3ee;
+                margin-top: 2px;
+            }
+            QSpinBox::down-arrow,
+            QDoubleSpinBox::down-arrow {
+                image: none;
+                width: 0px;
+                height: 0px;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid #22d3ee;
+                margin-bottom: 2px;
+            }
+            QSpinBox::up-button:hover,
+            QSpinBox::down-button:hover,
+            QDoubleSpinBox::up-button:hover,
+            QDoubleSpinBox::down-button:hover {
+                background: rgba(10, 44, 78, 0.95);
+                border-color: #22d3ee;
+            }
+            QSpinBox::up-button:pressed,
+            QSpinBox::down-button:pressed,
+            QDoubleSpinBox::up-button:pressed,
+            QDoubleSpinBox::down-button:pressed {
+                background: rgba(14, 165, 233, 0.3);
+                border-color: #67e8f9;
             }
             QCheckBox {
                 color: #dbeafe;
@@ -5279,6 +5350,7 @@ class MainWindow(QMainWindow):
             pass
             self._last_energyflow_snapshot = snapshot
             self._last_energyflow_snapshot_key = self._active_profile_key()
+            self._sync_automation_catalog_with_tuya_devices()
             self._last_energyflow_updated_at_text = pd.Timestamp.now().strftime("%H:%M:%S")
             self.energyflow_summary_label.setText(self._build_energyflow_summary(snapshot))
             self._set_tab_message(

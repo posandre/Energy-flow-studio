@@ -112,6 +112,7 @@ class FlowDiagramView(QWidget):
         self._blocks: list[dict[str, object]] = []
         self._labels: list[str] = []
         self._selected_index = -1
+        self._selected_gate_condition: tuple[int, int] | None = None
         self._hit_areas: list[QRectF] = []
         self._delete_hit_areas: list[QRectF] = []
         self._move_hit_areas: list[QRectF] = []
@@ -143,7 +144,18 @@ class FlowDiagramView(QWidget):
         self.update()
 
     def set_selected_index(self, index: int) -> None:
+        if self._selected_index != index:
+            self._selected_gate_condition = None
         self._selected_index = index
+        self.update()
+
+    def set_selected_gate_condition(self, gate_index: int, condition_index: int) -> None:
+        if gate_index < 0 or condition_index < 0:
+            self._selected_gate_condition = None
+            self.update()
+            return
+        self._selected_index = gate_index
+        self._selected_gate_condition = (gate_index, condition_index)
         self.update()
 
     def selected_index(self) -> int:
@@ -184,36 +196,46 @@ class FlowDiagramView(QWidget):
                 self._nested_drag_condition_index = condition_index
                 self._nested_drag_insert_index = -1
                 self._drag_active = False
+                self._selected_gate_condition = (gate_index, condition_index)
                 self.block_selected.emit(gate_index)
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                self.update()
                 return
         for gate_index, condition_index, rect in self._gate_condition_delete_hit_areas:
             if rect.contains(point):
                 self._drag_active = False
                 self.setCursor(Qt.CursorShape.PointingHandCursor)
+                self._selected_gate_condition = (gate_index, condition_index)
                 self.block_selected.emit(gate_index)
                 self.gate_condition_delete_requested.emit(gate_index, condition_index)
+                self.update()
                 return
         for gate_index, condition_index, rect in self._gate_condition_up_hit_areas:
             if rect.contains(point):
                 self._drag_active = False
                 self.setCursor(Qt.CursorShape.PointingHandCursor)
+                self._selected_gate_condition = (gate_index, condition_index)
                 self.block_selected.emit(gate_index)
                 self.gate_condition_move_requested.emit(gate_index, condition_index, -1)
+                self.update()
                 return
         for gate_index, condition_index, rect in self._gate_condition_down_hit_areas:
             if rect.contains(point):
                 self._drag_active = False
                 self.setCursor(Qt.CursorShape.PointingHandCursor)
+                self._selected_gate_condition = (gate_index, condition_index)
                 self.block_selected.emit(gate_index)
                 self.gate_condition_move_requested.emit(gate_index, condition_index, 1)
+                self.update()
                 return
         for gate_index, condition_index, rect in self._gate_condition_row_hit_areas:
             if rect.contains(point):
                 self._drag_active = False
                 self._nested_drag_active = False
+                self._selected_gate_condition = (gate_index, condition_index)
                 self.block_selected.emit(gate_index)
                 self.gate_condition_selected.emit(gate_index, condition_index)
+                self.update()
                 self._update_hover_cursor(point)
                 return
         for idx, rect in enumerate(self._delete_hit_areas):
@@ -240,12 +262,14 @@ class FlowDiagramView(QWidget):
                 self._drag_gate_target_index = -1
                 self._drag_active = False
                 self._nested_drag_active = False
+                self._selected_gate_condition = None
                 self._update_hover_cursor(point)
                 self.block_selected.emit(idx)
                 return
         self._update_hover_cursor(point)
         self._drag_active = False
         self._nested_drag_active = False
+        self._selected_gate_condition = None
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
@@ -378,7 +402,11 @@ class FlowDiagramView(QWidget):
             self._move_hit_areas.append(move_rect)
             self._delete_hit_areas.append(delete_rect)
 
-            selected = idx == self._selected_index
+            gate_nested_selected = (
+                self._selected_gate_condition is not None
+                and self._selected_gate_condition[0] == idx
+            )
+            selected = idx == self._selected_index and not gate_nested_selected
             border = QColor(34, 211, 238) if selected else QColor(45, 71, 103)
             background = QColor(12, 28, 52, 220 if selected else 180)
             if self._drag_active and idx == self._drag_origin_index:
@@ -415,8 +443,11 @@ class FlowDiagramView(QWidget):
                 row_top = rect.top() + 48.0
                 for condition_index, condition in enumerate(conditions):
                     cond_rect = QRectF(rect.left() + 12.0, row_top, rect.width() - 24.0, 24.0)
-                    painter.setPen(QPen(QColor(48, 83, 118), 1.0))
-                    painter.setBrush(QColor(8, 60, 92, 220))
+                    condition_selected = self._selected_gate_condition == (idx, condition_index)
+                    cond_border = QColor(34, 211, 238) if condition_selected else QColor(48, 83, 118)
+                    cond_bg = QColor(10, 84, 122, 236) if condition_selected else QColor(8, 60, 92, 220)
+                    painter.setPen(QPen(cond_border, 1.2 if condition_selected else 1.0))
+                    painter.setBrush(cond_bg)
                     painter.drawRoundedRect(cond_rect, 9.0, 9.0)
                     drag_rect_nested = QRectF(cond_rect.right() - 92.0, cond_rect.top() + 3.0, 18.0, 18.0)
                     up_rect = QRectF(cond_rect.right() - 70.0, cond_rect.top() + 3.0, 18.0, 18.0)
@@ -427,8 +458,10 @@ class FlowDiagramView(QWidget):
                     self._gate_condition_up_hit_areas.append((idx, condition_index, up_rect))
                     self._gate_condition_down_hit_areas.append((idx, condition_index, down_rect))
                     self._gate_condition_delete_hit_areas.append((idx, condition_index, delete_rect_nested))
-                    painter.setPen(QPen(QColor(48, 83, 118), 1.0))
-                    painter.setBrush(QColor(9, 24, 45, 230))
+                    action_border = QColor(34, 211, 238) if condition_selected else QColor(48, 83, 118)
+                    action_bg = QColor(8, 38, 66, 238) if condition_selected else QColor(9, 24, 45, 230)
+                    painter.setPen(QPen(action_border, 1.0))
+                    painter.setBrush(action_bg)
                     painter.drawRoundedRect(drag_rect_nested, 5.0, 5.0)
                     painter.drawRoundedRect(up_rect, 5.0, 5.0)
                     painter.drawRoundedRect(down_rect, 5.0, 5.0)
@@ -1084,6 +1117,8 @@ class AutomationTab(QWidget):
                     widget.valueChanged.connect(lambda *_args: self._save_block_editor())
         self.trigger_device.currentIndexChanged.connect(lambda *_args: self._refresh_trigger_metric_options())
         self.condition_device.currentIndexChanged.connect(lambda *_args: self._refresh_condition_metric_options())
+        self.trigger_metric.currentIndexChanged.connect(lambda *_args: self._update_trigger_value_unit_suffix())
+        self.condition_metric.currentIndexChanged.connect(lambda *_args: self._update_condition_value_unit_suffix())
 
     def _add_rule(self) -> None:
         rule = AutomationRule(
@@ -1181,7 +1216,10 @@ class AutomationTab(QWidget):
         if kind == "trigger":
             trigger_type = str(block.get("trigger_type", "measurement"))
             metric_key = str(block.get("metric_key", "")).strip()
-            metric = self._metric_display_text(metric_key) or metric_key or "metric"
+            metric = self._metric_display_text(
+                metric_key,
+                include_code=bool(str(block.get("device_id", "")).strip()),
+            ) or metric_key or "metric"
             operator = str(block.get("operator", ">="))
             value = float(block.get("value", 0.0) or 0.0)
             if trigger_type == "schedule":
@@ -1197,7 +1235,10 @@ class AutomationTab(QWidget):
             )
         if kind == "condition":
             metric_key = str(block.get("metric_key", "")).strip()
-            metric = self._metric_display_text(metric_key) or metric_key or "metric"
+            metric = self._metric_display_text(
+                metric_key,
+                include_code=bool(str(block.get("device_id", "")).strip()),
+            ) or metric_key or "metric"
             operator = str(block.get("operator", ">="))
             value = float(block.get("value", 0.0) or 0.0)
             return tr("Condition: {metric} {operator} {value}").format(
@@ -1337,6 +1378,7 @@ class AutomationTab(QWidget):
         self._refresh_trigger_metric_options()
         self._set_combo_by_data(self.trigger_metric, block.get("metric_key", ""))
         self._set_combo_by_data(self.trigger_operator, block.get("operator", ">="))
+        self._update_trigger_value_unit_suffix()
         self.trigger_value.setValue(float(block.get("value", 0.0) or 0.0))
         self.trigger_schedule.setValue(max(1, int(block.get("schedule_every_minutes", 15) or 15)))
 
@@ -1345,6 +1387,7 @@ class AutomationTab(QWidget):
         self._refresh_condition_metric_options()
         self._set_combo_by_data(self.condition_metric, block.get("metric_key", ""))
         self._set_combo_by_data(self.condition_operator, block.get("operator", ">="))
+        self._update_condition_value_unit_suffix()
         self.condition_value.setValue(float(block.get("value", 0.0) or 0.0))
 
     def _load_action_block(self, block: dict[str, object]) -> None:
@@ -1570,9 +1613,11 @@ class AutomationTab(QWidget):
 
     def _refresh_trigger_metric_options(self) -> None:
         self._refresh_metric_combo_for(self.trigger_metric, self.trigger_device)
+        self._update_trigger_value_unit_suffix()
 
     def _refresh_condition_metric_options(self) -> None:
         self._refresh_metric_combo_for(self.condition_metric, self.condition_device)
+        self._update_condition_value_unit_suffix()
 
     def _refresh_metric_combo_for(self, metric_combo: QComboBox, device_combo: QComboBox) -> None:
         device_id = str(device_combo.currentData() or "").strip()
@@ -1583,15 +1628,18 @@ class AutomationTab(QWidget):
         metric_combo.blockSignals(True)
         metric_combo.clear()
         for key in keys or []:
-            metric_combo.addItem(self._metric_display_text(key), key)
+            metric_combo.addItem(
+                self._metric_display_text(key, include_code=bool(device_id)),
+                key,
+            )
         if metric_combo.count() == 0 and self._measurement_keys:
             for key in self._measurement_keys:
-                metric_combo.addItem(self._metric_display_text(key), key)
+                metric_combo.addItem(self._metric_display_text(key, include_code=False), key)
         index = metric_combo.findData(current)
         metric_combo.setCurrentIndex(index if index >= 0 and metric_combo.count() > 0 else 0)
         metric_combo.blockSignals(False)
 
-    def _metric_display_text(self, metric_key: str) -> str:
+    def _metric_display_text(self, metric_key: str, *, include_code: bool = False) -> str:
         key = str(metric_key or "").strip().lower()
         if not key:
             return ""
@@ -1600,7 +1648,33 @@ class AutomationTab(QWidget):
             "grid_active_power": tr("Grid power"),
             "load_active_power": tr("Load power"),
             "pv_output_power": tr("PV output power"),
-            "battery_soc": tr("Battery SOC"),
+            "battery_soc": tr("Battery state of charge (SOC)"),
+            "battery_current": tr("Battery current"),
+            "battery_direction": tr("Battery direction"),
+            "battery_power": tr("Battery power"),
+            "battery_to_home_power": tr("Battery → Home power"),
+            "battery_voltage": tr("Battery voltage"),
+            "bt_battery_capacity": tr("Battery capacity"),
+            "grid_charge_current": tr("Grid charge current"),
+            "grid_direction": tr("Grid direction"),
+            "grid_frequency": tr("Grid frequency"),
+            "grid_power": tr("Grid power"),
+            "grid_to_battery_power": tr("Grid → Battery power"),
+            "grid_to_home_power": tr("Grid → Home power"),
+            "grid_voltage": tr("Grid voltage"),
+            "load_current": tr("Load current"),
+            "load_direction": tr("Load direction"),
+            "load_frequency": tr("Load frequency"),
+            "load_power": tr("Load power"),
+            "load_voltage": tr("Load voltage"),
+            "pv_charge_current": tr("PV charge current"),
+            "pv_current": tr("PV current"),
+            "pv_direction": tr("PV direction"),
+            "pv_power": tr("PV power"),
+            "pv_to_battery_power": tr("PV → Battery power"),
+            "pv_to_home_current": tr("PV → Home current"),
+            "pv_to_home_power": tr("PV → Home power"),
+            "pv_voltage": tr("PV voltage"),
             "cur_power": tr("Current power"),
             "cur_current": tr("Current"),
             "energy": tr("Energy"),
@@ -1652,7 +1726,66 @@ class AutomationTab(QWidget):
                 else:
                     words.append(token_map.get(chunk, chunk))
             label = " ".join(words).strip()
-        return label or key
+        text = label or key
+        if include_code and text:
+            if text.strip().lower() == key:
+                return key
+            return f"{text} ({key})"
+        return text
+
+    def _update_trigger_value_unit_suffix(self) -> None:
+        metric_key = str(self.trigger_metric.currentData() or "").strip().lower()
+        self.trigger_value.setSuffix(self._metric_value_suffix(metric_key))
+
+    def _update_condition_value_unit_suffix(self) -> None:
+        metric_key = str(self.condition_metric.currentData() or "").strip().lower()
+        self.condition_value.setSuffix(self._metric_value_suffix(metric_key))
+
+    def _metric_value_suffix(self, metric_key: str) -> str:
+        key = str(metric_key or "").strip().lower()
+        if not key:
+            return ""
+        unit_map: dict[str, str] = {
+            "battery_soc": tr("%"),
+            "bt_battery_capacity": tr("Ah"),
+            "battery_voltage": tr("V"),
+            "grid_voltage": tr("V"),
+            "load_voltage": tr("V"),
+            "pv_voltage": tr("V"),
+            "battery_current": tr("A"),
+            "grid_charge_current": tr("A"),
+            "load_current": tr("A"),
+            "pv_charge_current": tr("A"),
+            "pv_current": tr("A"),
+            "pv_to_home_current": tr("A"),
+            "grid_frequency": tr("Hz"),
+            "load_frequency": tr("Hz"),
+            "battery_active_power": tr("W"),
+            "battery_power": tr("W"),
+            "battery_to_home_power": tr("W"),
+            "grid_active_power": tr("W"),
+            "grid_power": tr("W"),
+            "grid_to_battery_power": tr("W"),
+            "grid_to_home_power": tr("W"),
+            "load_active_power": tr("W"),
+            "load_power": tr("W"),
+            "pv_output_power": tr("W"),
+            "pv_power": tr("W"),
+            "pv_to_battery_power": tr("W"),
+            "pv_to_home_power": tr("W"),
+            "cur_power": tr("W"),
+            "power": tr("W"),
+            "voltage": tr("V"),
+            "current": tr("A"),
+            "cur_current": tr("A"),
+            "frequency": tr("Hz"),
+            "energy": tr("kWh"),
+            "add_ele": tr("kWh"),
+        }
+        unit = unit_map.get(key, "")
+        if not unit:
+            return ""
+        return f" {unit}"
 
     def _sync_diagram_from_canvas(self) -> None:
         blocks: list[dict[str, object]] = []
@@ -1668,13 +1801,30 @@ class AutomationTab(QWidget):
             labels.append(str(item.text()))
         self.diagram_view.set_blocks(blocks, labels)
         self._sync_diagram_geometry()
-        self.diagram_view.set_selected_index(self.canvas.currentRow())
+        selected_row = self.canvas.currentRow()
+        self.diagram_view.set_selected_index(selected_row)
+        if self._selected_nested_condition is not None:
+            gate_row, condition_row = self._selected_nested_condition
+            if gate_row == selected_row:
+                self.diagram_view.set_selected_gate_condition(gate_row, condition_row)
 
     def _sync_diagram_selection(self, row: int) -> None:
         self.diagram_view.set_selected_index(row)
+        if self._selected_nested_condition is not None:
+            gate_row, condition_row = self._selected_nested_condition
+            if gate_row == row:
+                self.diagram_view.set_selected_gate_condition(gate_row, condition_row)
+                return
+        self.diagram_view.set_selected_gate_condition(-1, -1)
 
     def _select_block_from_diagram(self, row: int) -> None:
         if 0 <= row < self.canvas.count():
+            self._selected_nested_condition = None
+            self.diagram_view.set_selected_gate_condition(-1, -1)
+            if self.canvas.currentRow() == row:
+                self._show_selected_block_editor(row)
+                self._sync_diagram_selection(row)
+                return
             self.canvas.setCurrentRow(row)
 
     def _select_nested_condition_from_diagram(self, gate_row: int, condition_row: int) -> None:
@@ -1699,6 +1849,7 @@ class AutomationTab(QWidget):
         if self.canvas.currentRow() != gate_row:
             self.canvas.setCurrentRow(gate_row)
         self._selected_nested_condition = (gate_row, condition_row)
+        self.diagram_view.set_selected_gate_condition(gate_row, condition_row)
         self._syncing = True
         self.block_editor.setCurrentIndex(2)
         self._load_condition_block(normalized[condition_row])
