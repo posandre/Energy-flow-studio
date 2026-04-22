@@ -694,6 +694,7 @@ class AutomationTab(QWidget):
             | QAbstractItemView.EditTrigger.EditKeyPressed
             | QAbstractItemView.EditTrigger.SelectedClicked
         )
+        self.rule_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
 
         self.palette = BlockPalette()
         self.palette.setObjectName("AutomationList")
@@ -752,6 +753,14 @@ class AutomationTab(QWidget):
         left = QVBoxLayout()
         left.addWidget(QLabel(tr("Rules")))
         left.addWidget(self.rule_list, 1)
+        left_analytics = QWidget()
+        left_analytics_layout = QVBoxLayout(left_analytics)
+        left_analytics_layout.setContentsMargins(0, 0, 0, 0)
+        left_analytics_layout.setSpacing(12)
+        left_analytics_layout.addWidget(QLabel(tr("Execution Logs")))
+        left_analytics_layout.addWidget(self.logs_view)
+        left_analytics_layout.addWidget(self.analytics_label)
+        left.addWidget(left_analytics, 0)
 
         middle = QVBoxLayout()
         middle.addWidget(QLabel(tr("Palette")))
@@ -782,22 +791,11 @@ class AutomationTab(QWidget):
         right_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         right_scroll.setWidget(right_fields_panel)
 
-        right_bottom = QWidget()
-        right_bottom.setObjectName("AutomationRightPanel")
-        right_bottom_layout = QVBoxLayout(right_bottom)
-        right_bottom_layout.setContentsMargins(0, 0, 0, 0)
-        right_bottom_layout.setSpacing(12)
-        right_bottom_layout.addWidget(QLabel(tr("Execution Analytics")))
-        right_bottom_layout.addWidget(self.analytics_label)
-        right_bottom_layout.addWidget(QLabel(tr("Execution Logs")))
-        right_bottom_layout.addWidget(self.logs_view)
-
         right_column = QVBoxLayout()
         right_column.setContentsMargins(0, 0, 0, 0)
         right_column.setSpacing(12)
         right_column.addWidget(QLabel(tr("Settings")))
         right_column.addWidget(right_scroll, 1)
-        right_column.addWidget(right_bottom, 0)
 
         body.addLayout(left, 0, 0)
         body.addLayout(middle, 0, 1)
