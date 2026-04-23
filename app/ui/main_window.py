@@ -1173,6 +1173,8 @@ class MainWindow(QMainWindow):
     tuya_devices_fetch_finished = Signal(int, object)
     tuya_icon_download_finished = Signal(str, str, object)
     inverter_edit_sync_finished = Signal(str, object, object)
+    automation_log_requested = Signal(str, object, str)
+    automation_save_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -1311,6 +1313,8 @@ class MainWindow(QMainWindow):
         self.tuya_devices_fetch_finished.connect(self._finish_tuya_devices_refresh, Qt.ConnectionType.QueuedConnection)
         self.tuya_icon_download_finished.connect(self._finish_tuya_icon_download, Qt.ConnectionType.QueuedConnection)
         self.inverter_edit_sync_finished.connect(self._on_inverter_edit_sync_finished, Qt.ConnectionType.QueuedConnection)
+        self.automation_log_requested.connect(self._append_automation_log, Qt.ConnectionType.QueuedConnection)
+        self.automation_save_requested.connect(self._save_profile_automations_from_tab, Qt.ConnectionType.QueuedConnection)
         self._last_weather_snapshot: WeatherLiveSnapshot | None = None
         self._weather_live_state = "unknown"
         self._weather_live_error = ""
@@ -1985,7 +1989,7 @@ class MainWindow(QMainWindow):
                 level = "error"
             else:
                 level = "info"
-            self._append_automation_log(
+            self._queue_automation_log(
                 level,
                 rule,
                 f"Node {node_result.node_type}:{node_result.node_id} {node_result.status} ({node_result.reason}).",
@@ -2027,7 +2031,7 @@ class MainWindow(QMainWindow):
                 if action_type == "power":
                     action_value = bool(step.payload.get("value", False))
                     if not action_device_id:
-                        self._append_automation_log("error", rule, tr("Action skipped: no device selected."))
+                        self._queue_automation_log("error", rule, tr("Action skipped: no device selected."))
                         break
                     ok, details = self._execute_automation_power_action(action_device_id, action_value)
                     success_message = tr("Power {state} -> {device_id} (attempt {attempt}/{max_attempts}).").format(
@@ -2048,21 +2052,21 @@ class MainWindow(QMainWindow):
                         max_attempts=max_attempts,
                     )
                 else:
-                    self._append_automation_log(
+                    self._queue_automation_log(
                         "error",
                         rule,
                         tr("Unsupported action type: {action_type}").format(action_type=action_type),
                     )
                     break
                 if ok:
-                    self._append_automation_log(
+                    self._queue_automation_log(
                         "ok",
                         rule,
                         success_message,
                     )
                     success = True
                     break
-                self._append_automation_log(
+                self._queue_automation_log(
                     "error",
                     rule,
                     tr("Action failed for {device_id} (attempt {attempt}/{max_attempts}): {details}").format(
@@ -2075,7 +2079,7 @@ class MainWindow(QMainWindow):
                 if attempt < max_attempts and action_retry_delay_sec > 0:
                     time.sleep(action_retry_delay_sec)
             if not success:
-                self._append_automation_log(
+                self._queue_automation_log(
                     "error",
                     rule,
                     tr("Action exhausted retries for {device_id}.").format(device_id=action_target_label),
@@ -2083,7 +2087,19 @@ class MainWindow(QMainWindow):
 
         if action_steps:
             self._automation_engine.mark_rule_executed(rule.rule_id)
-        self._save_profile_automations_from_tab()
+        self._queue_automation_save()
+
+    def _queue_automation_log(self, level: str, rule: AutomationRule, message: str) -> None:
+        if QThread.currentThread() is self.thread():
+            self._append_automation_log(level, rule, message)
+            return
+        self.automation_log_requested.emit(level, rule, message)
+
+    def _queue_automation_save(self) -> None:
+        if QThread.currentThread() is self.thread():
+            self._save_profile_automations_from_tab()
+            return
+        self.automation_save_requested.emit()
 
     def _execute_automation_power_action(self, device_id: str, turn_on: bool) -> tuple[bool, str]:
         normalized_device_id = device_id.strip()
