@@ -198,8 +198,8 @@ class FlowDiagramView(QWidget):
     condition_dropped_to_gate = Signal(int, int)
     condition_dropped_to_nested_gate = Signal(int, int, int)
     gate_condition_delete_requested = Signal(int, int)
-    gate_condition_move_requested = Signal(int, int, int)
     gate_condition_selected = Signal(int, int)
+    gate_condition_reordered = Signal(int, int, int)
     gate_condition_extract_requested = Signal(int, int, int)
     gate_condition_dropped_to_nested_gate = Signal(int, int, int)
     gate_condition_dropped_to_parent_gate = Signal(int, int)
@@ -223,6 +223,7 @@ class FlowDiagramView(QWidget):
         self._nested_drag_gate_index = -1
         self._nested_drag_condition_index = -1
         self._nested_drag_insert_index = -1
+        self._nested_drag_reorder_target = -1
         self._drag_nested_gate_target: tuple[int, int] | None = None
         self._drag_hover_block_index = -1
         self._dash_phase = 0.0
@@ -231,8 +232,6 @@ class FlowDiagramView(QWidget):
         self._dash_timer.timeout.connect(self._advance_dash_phase)
         self._content_h = 220
         self._gate_condition_delete_hit_areas: list[tuple[int, int, QRectF]] = []
-        self._gate_condition_up_hit_areas: list[tuple[int, int, QRectF]] = []
-        self._gate_condition_down_hit_areas: list[tuple[int, int, QRectF]] = []
         self._gate_condition_row_hit_areas: list[tuple[int, int, QRectF]] = []
         self._gate_condition_drag_hit_areas: list[tuple[int, int, QRectF]] = []
         self._input_socket_hit_areas: list[tuple[int, QRectF]] = []
@@ -368,6 +367,7 @@ class FlowDiagramView(QWidget):
                 return
         for idx, rect in self._input_socket_hit_areas:
             if rect.contains(point):
+                self._connection_drag_active = False
                 self._socket_drag_active = True
                 self._socket_drag_index = idx
                 self._socket_drag_kind = "input"
@@ -377,6 +377,7 @@ class FlowDiagramView(QWidget):
                 return
         for idx, rect in self._input_label_hit_areas:
             if rect.contains(point):
+                self._connection_drag_active = False
                 self._socket_drag_active = True
                 self._socket_drag_index = idx
                 self._socket_drag_kind = "input"
@@ -386,99 +387,75 @@ class FlowDiagramView(QWidget):
                 return
         for idx, rect in self._next_label_hit_areas:
             if rect.contains(point):
-                self._connection_drag_active = True
-                self._connection_source_index = idx
-                self._connection_branch = "next"
-                self._connection_hover_target_index = -1
-                self._connection_cursor_point = QPointF(point)
-                self._connection_source_rect = self._hit_areas[idx] if 0 <= idx < len(self._hit_areas) else QRectF()
-                self._connection_drag_mode = "move"
-                self._connection_drag_changed = False
-                self._connection_drag_start = QPointF(point)
-                self._connection_drag_from_label = True
+                self._connection_drag_active = False
+                self._socket_drag_active = True
+                self._socket_drag_index = idx
+                self._socket_drag_kind = "next"
+                self._socket_drag_changed = False
                 self.block_selected.emit(idx)
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
-                self.update()
                 return
         for idx, rect in self._true_label_hit_areas:
             if rect.contains(point):
-                self._connection_drag_active = True
-                self._connection_source_index = idx
-                self._connection_branch = "true"
-                self._connection_hover_target_index = -1
-                self._connection_cursor_point = QPointF(point)
-                self._connection_source_rect = self._hit_areas[idx] if 0 <= idx < len(self._hit_areas) else QRectF()
-                self._connection_drag_mode = "move"
-                self._connection_drag_changed = False
-                self._connection_drag_start = QPointF(point)
-                self._connection_drag_from_label = True
+                self._connection_drag_active = False
+                self._socket_drag_active = True
+                self._socket_drag_index = idx
+                self._socket_drag_kind = "true"
+                self._socket_drag_changed = False
                 self.block_selected.emit(idx)
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
-                self.update()
                 return
         for idx, rect in self._false_label_hit_areas:
             if rect.contains(point):
-                self._connection_drag_active = True
-                self._connection_source_index = idx
-                self._connection_branch = "false"
-                self._connection_hover_target_index = -1
-                self._connection_cursor_point = QPointF(point)
-                self._connection_source_rect = self._hit_areas[idx] if 0 <= idx < len(self._hit_areas) else QRectF()
-                self._connection_drag_mode = "move"
-                self._connection_drag_changed = False
-                self._connection_drag_start = QPointF(point)
-                self._connection_drag_from_label = True
+                self._connection_drag_active = False
+                self._socket_drag_active = True
+                self._socket_drag_index = idx
+                self._socket_drag_kind = "false"
+                self._socket_drag_changed = False
                 self.block_selected.emit(idx)
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
-                self.update()
                 return
         for idx, rect in self._next_socket_hit_areas:
             if rect.contains(point):
+                self._socket_drag_active = False
                 self._connection_drag_active = True
                 self._connection_source_index = idx
                 self._connection_branch = "next"
                 self._connection_hover_target_index = -1
                 self._connection_cursor_point = QPointF(point)
-                self._connection_source_rect = self._hit_areas[idx] if 0 <= idx < len(self._hit_areas) else QRectF()
-                self._connection_drag_mode = "connect" if bool(event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)) else "move"
-                self._connection_drag_changed = False
-                self._connection_drag_start = QPointF(point)
+                self._connection_drag_mode = "connect"
                 self._connection_drag_from_label = False
-                self.block_selected.emit(idx)
-                self.setCursor(Qt.CursorShape.CrossCursor if self._connection_drag_mode == "connect" else Qt.CursorShape.SizeHorCursor)
+                self.setCursor(Qt.CursorShape.CrossCursor)
                 self.update()
+                self.block_selected.emit(idx)
                 return
         for idx, rect in self._true_socket_hit_areas:
             if rect.contains(point):
+                self._socket_drag_active = False
                 self._connection_drag_active = True
                 self._connection_source_index = idx
                 self._connection_branch = "true"
                 self._connection_hover_target_index = -1
                 self._connection_cursor_point = QPointF(point)
-                self._connection_source_rect = self._hit_areas[idx] if 0 <= idx < len(self._hit_areas) else QRectF()
-                self._connection_drag_mode = "connect" if bool(event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)) else "move"
-                self._connection_drag_changed = False
-                self._connection_drag_start = QPointF(point)
+                self._connection_drag_mode = "connect"
                 self._connection_drag_from_label = False
-                self.block_selected.emit(idx)
-                self.setCursor(Qt.CursorShape.CrossCursor if self._connection_drag_mode == "connect" else Qt.CursorShape.SizeHorCursor)
+                self.setCursor(Qt.CursorShape.CrossCursor)
                 self.update()
+                self.block_selected.emit(idx)
                 return
         for idx, rect in self._false_socket_hit_areas:
             if rect.contains(point):
+                self._socket_drag_active = False
                 self._connection_drag_active = True
                 self._connection_source_index = idx
                 self._connection_branch = "false"
                 self._connection_hover_target_index = -1
                 self._connection_cursor_point = QPointF(point)
-                self._connection_source_rect = self._hit_areas[idx] if 0 <= idx < len(self._hit_areas) else QRectF()
-                self._connection_drag_mode = "connect" if bool(event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)) else "move"
-                self._connection_drag_changed = False
-                self._connection_drag_start = QPointF(point)
+                self._connection_drag_mode = "connect"
                 self._connection_drag_from_label = False
-                self.block_selected.emit(idx)
-                self.setCursor(Qt.CursorShape.CrossCursor if self._connection_drag_mode == "connect" else Qt.CursorShape.SizeHorCursor)
+                self.setCursor(Qt.CursorShape.CrossCursor)
                 self.update()
+                self.block_selected.emit(idx)
                 return
         self._drag_nested_gate_target = None
         for gate_index, condition_index, rect in self._gate_condition_drag_hit_areas:
@@ -487,6 +464,7 @@ class FlowDiagramView(QWidget):
                 self._nested_drag_gate_index = gate_index
                 self._nested_drag_condition_index = condition_index
                 self._nested_drag_insert_index = -1
+                self._nested_drag_reorder_target = -1
                 self._drag_active = False
                 self._selected_gate_condition = (gate_index, condition_index)
                 self.block_selected.emit(gate_index)
@@ -500,24 +478,6 @@ class FlowDiagramView(QWidget):
                 self._selected_gate_condition = (gate_index, condition_index)
                 self.block_selected.emit(gate_index)
                 self.gate_condition_delete_requested.emit(gate_index, condition_index)
-                self.update()
-                return
-        for gate_index, condition_index, rect in self._gate_condition_up_hit_areas:
-            if rect.contains(point):
-                self._drag_active = False
-                self.setCursor(Qt.CursorShape.PointingHandCursor)
-                self._selected_gate_condition = (gate_index, condition_index)
-                self.block_selected.emit(gate_index)
-                self.gate_condition_move_requested.emit(gate_index, condition_index, -1)
-                self.update()
-                return
-        for gate_index, condition_index, rect in self._gate_condition_down_hit_areas:
-            if rect.contains(point):
-                self._drag_active = False
-                self.setCursor(Qt.CursorShape.PointingHandCursor)
-                self._selected_gate_condition = (gate_index, condition_index)
-                self.block_selected.emit(gate_index)
-                self.gate_condition_move_requested.emit(gate_index, condition_index, 1)
                 self.update()
                 return
         for gate_index, condition_index, rect in self._gate_condition_row_hit_areas:
@@ -612,30 +572,8 @@ class FlowDiagramView(QWidget):
             return
         if self._connection_drag_active:
             self._connection_cursor_point = QPointF(point)
-            if self._connection_drag_mode == "move":
-                block_rect = self._connection_source_rect
-                if (
-                    not self._connection_drag_from_label
-                    and block_rect.isValid()
-                    and not block_rect.adjusted(0.0, -18.0, 0.0, 18.0).contains(point)
-                ):
-                    self._connection_drag_mode = "connect"
-                    self._connection_hover_target_index = self._input_target_for_point(point, self._connection_source_index)
-                    self.setCursor(Qt.CursorShape.CrossCursor)
-                    self.update()
-                    super().mouseMoveEvent(event)
-                    return
-                if block_rect.width() > 1.0 and self._set_socket_ratio(
-                    self._connection_source_index,
-                    self._connection_branch,
-                    (point.x() - block_rect.left()) / block_rect.width(),
-                ):
-                    self._connection_drag_changed = True
-                self._connection_hover_target_index = -1
-                self.setCursor(Qt.CursorShape.SizeHorCursor)
-            else:
-                self._connection_hover_target_index = self._input_target_for_point(point, self._connection_source_index)
-                self.setCursor(Qt.CursorShape.CrossCursor)
+            self._connection_hover_target_index = self._input_target_for_point(point, self._connection_source_index)
+            self.setCursor(Qt.CursorShape.CrossCursor)
             self.update()
             super().mouseMoveEvent(event)
             return
@@ -650,12 +588,24 @@ class FlowDiagramView(QWidget):
                 point,
                 self._nested_drag_condition_index,
             )
+            reorder_target = self._nested_gate_row_reorder_target(
+                self._nested_drag_gate_index,
+                point,
+                self._nested_drag_condition_index,
+            )
             if nested_target >= 0:
                 self._drag_nested_gate_target = (self._nested_drag_gate_index, nested_target)
+                self._nested_drag_reorder_target = -1
+                self._drag_hover_block_index = -1
+                self._ensure_dash_animation(True)
+            elif reorder_target >= 0:
+                self._drag_nested_gate_target = None
+                self._nested_drag_reorder_target = reorder_target
                 self._drag_hover_block_index = -1
                 self._ensure_dash_animation(True)
             else:
                 self._drag_nested_gate_target = None
+                self._nested_drag_reorder_target = -1
                 source_gate_rect = self._hit_areas[self._nested_drag_gate_index] if 0 <= self._nested_drag_gate_index < len(self._hit_areas) else QRectF()
                 if source_gate_rect.contains(point):
                     # Allow dropping nested items back into the parent (root) gate.
@@ -747,30 +697,13 @@ class FlowDiagramView(QWidget):
             super().mouseReleaseEvent(event)
             return
         if self._connection_drag_active:
-            target_index = (
-                self._input_target_for_point(drop_point, self._connection_source_index)
-                if self._connection_drag_mode != "move"
-                else -1
-            )
+            target_index = self._input_target_for_point(drop_point, self._connection_source_index)
             if (
-                self._connection_drag_mode != "move"
-                and target_index >= 0
+                target_index >= 0
                 and self._connection_source_index >= 0
                 and self._connection_branch in {"true", "false", "next"}
             ):
                 self.branch_connected.emit(self._connection_source_index, self._connection_branch, target_index)
-            elif (
-                self._connection_drag_mode == "move"
-                and self._connection_source_index >= 0
-                and self._connection_branch in {"true", "false", "next"}
-            ):
-                block_rect = self._hit_areas[self._connection_source_index] if 0 <= self._connection_source_index < len(self._hit_areas) else QRectF()
-                if block_rect.width() > 1.0:
-                    ratio = (drop_point.x() - block_rect.left()) / block_rect.width()
-                    if self._set_socket_ratio(self._connection_source_index, self._connection_branch, ratio):
-                        self._connection_drag_changed = True
-            if self._connection_drag_changed:
-                self.blocks_reordered.emit([dict(item) for item in self._blocks if isinstance(item, dict)])
             self._connection_drag_active = False
             self._connection_source_index = -1
             self._connection_branch = ""
@@ -795,6 +728,37 @@ class FlowDiagramView(QWidget):
                 self._nested_drag_condition_index,
             )
             if nested_gate_target >= 0:
+                source_parent_path = self._gate_child_parent_path(
+                    self._nested_drag_gate_index,
+                    self._nested_drag_condition_index,
+                )
+                target_parent_path = self._gate_child_parent_path(
+                    self._nested_drag_gate_index,
+                    nested_gate_target,
+                )
+                if (
+                    source_parent_path is not None
+                    and target_parent_path is not None
+                    and source_parent_path == target_parent_path
+                ):
+                    # If pointer is over a gate on the same nesting level, treat it as reorder.
+                    self.gate_condition_reordered.emit(
+                        self._nested_drag_gate_index,
+                        self._nested_drag_condition_index,
+                        nested_gate_target,
+                    )
+                    self._nested_drag_active = False
+                    self._nested_drag_gate_index = -1
+                    self._nested_drag_condition_index = -1
+                    self._nested_drag_insert_index = -1
+                    self._nested_drag_reorder_target = -1
+                    self._drag_nested_gate_target = None
+                    self._update_hover_cursor(drop_point)
+                    self._drag_hover_block_index = -1
+                    self._ensure_dash_animation(False)
+                    self.update()
+                    super().mouseReleaseEvent(event)
+                    return
                 self.gate_condition_dropped_to_nested_gate.emit(
                     self._nested_drag_gate_index,
                     self._nested_drag_condition_index,
@@ -804,6 +768,48 @@ class FlowDiagramView(QWidget):
                 self._nested_drag_gate_index = -1
                 self._nested_drag_condition_index = -1
                 self._nested_drag_insert_index = -1
+                self._nested_drag_reorder_target = -1
+                self._drag_nested_gate_target = None
+                self._update_hover_cursor(drop_point)
+                self._drag_hover_block_index = -1
+                self._ensure_dash_animation(False)
+                self.update()
+                super().mouseReleaseEvent(event)
+                return
+            if self._nested_drag_reorder_target >= 0:
+                self.gate_condition_reordered.emit(
+                    self._nested_drag_gate_index,
+                    self._nested_drag_condition_index,
+                    self._nested_drag_reorder_target,
+                )
+                self._nested_drag_active = False
+                self._nested_drag_gate_index = -1
+                self._nested_drag_condition_index = -1
+                self._nested_drag_insert_index = -1
+                self._nested_drag_reorder_target = -1
+                self._drag_nested_gate_target = None
+                self._update_hover_cursor(drop_point)
+                self._drag_hover_block_index = -1
+                self._ensure_dash_animation(False)
+                self.update()
+                super().mouseReleaseEvent(event)
+                return
+            reorder_target = self._nested_gate_row_reorder_target(
+                self._nested_drag_gate_index,
+                drop_point,
+                self._nested_drag_condition_index,
+            )
+            if reorder_target >= 0:
+                self.gate_condition_reordered.emit(
+                    self._nested_drag_gate_index,
+                    self._nested_drag_condition_index,
+                    reorder_target,
+                )
+                self._nested_drag_active = False
+                self._nested_drag_gate_index = -1
+                self._nested_drag_condition_index = -1
+                self._nested_drag_insert_index = -1
+                self._nested_drag_reorder_target = -1
                 self._drag_nested_gate_target = None
                 self._update_hover_cursor(drop_point)
                 self._drag_hover_block_index = -1
@@ -821,6 +827,7 @@ class FlowDiagramView(QWidget):
                 self._nested_drag_gate_index = -1
                 self._nested_drag_condition_index = -1
                 self._nested_drag_insert_index = -1
+                self._nested_drag_reorder_target = -1
                 self._drag_nested_gate_target = None
                 self._update_hover_cursor(drop_point)
                 self._drag_hover_block_index = -1
@@ -838,6 +845,7 @@ class FlowDiagramView(QWidget):
             self._nested_drag_gate_index = -1
             self._nested_drag_condition_index = -1
             self._nested_drag_insert_index = -1
+            self._nested_drag_reorder_target = -1
             self._drag_nested_gate_target = None
             self._update_hover_cursor(drop_point)
             self._drag_hover_block_index = -1
@@ -907,6 +915,7 @@ class FlowDiagramView(QWidget):
         self._nested_drag_gate_index = -1
         self._nested_drag_condition_index = -1
         self._nested_drag_insert_index = -1
+        self._nested_drag_reorder_target = -1
         self._drag_nested_gate_target = None
         self._drag_hover_block_index = -1
         self._ensure_dash_animation(False)
@@ -945,8 +954,6 @@ class FlowDiagramView(QWidget):
         self._delete_hit_areas = []
         self._move_hit_areas = []
         self._gate_condition_delete_hit_areas = []
-        self._gate_condition_up_hit_areas = []
-        self._gate_condition_down_hit_areas = []
         self._gate_condition_row_hit_areas = []
         self._gate_condition_drag_hit_areas = []
         self._input_socket_hit_areas = []
@@ -1123,7 +1130,7 @@ class FlowDiagramView(QWidget):
             current_top = rect.bottom() + gap
 
         self._draw_top_level_connections(painter)
-        if self._connection_drag_active and self._connection_source_index >= 0 and self._connection_drag_mode != "move":
+        if self._connection_drag_active and self._connection_source_index >= 0:
             start = self._branch_socket_center(self._connection_source_index, self._connection_branch)
             if start is not None:
                 preview_color = QColor(34, 211, 238) if self._connection_branch == "true" else QColor(245, 158, 11) if self._connection_branch == "false" else QColor(96, 165, 250)
@@ -1229,7 +1236,8 @@ class FlowDiagramView(QWidget):
         if not key:
             return False
         normalized = self._clamp(float(ratio), 0.08, 0.92)
-        if abs(float(block.get(key, normalized) or normalized) - normalized) <= 1e-4:
+        current = self._socket_ratio(block, kind)
+        if abs(current - normalized) <= 1e-4:
             return False
         block[key] = normalized
         return True
@@ -1375,6 +1383,31 @@ class FlowDiagramView(QWidget):
                 return flat_index
         return -1
 
+    def _gate_child_parent_path(self, gate_index: int, child_flat_index: int) -> tuple[int, ...] | None:
+        if gate_index < 0 or gate_index >= len(self._blocks):
+            return None
+        gate_block = self._blocks[gate_index]
+        if not isinstance(gate_block, dict):
+            return None
+        path = self._gate_child_path_from_flat_index(gate_block, child_flat_index)
+        if path is None:
+            return None
+        return path[:-1]
+
+    def _nested_gate_row_reorder_target(self, gate_index: int, point: QPointF, source_child_index: int) -> int:
+        best_index = -1
+        best_distance = 99999.0
+        for hit_gate_index, flat_index, rect in self._gate_condition_row_hit_areas:
+            if hit_gate_index != gate_index or flat_index == source_child_index:
+                continue
+            expanded = rect.adjusted(0.0, -10.0, 0.0, 10.0)
+            if expanded.contains(point):
+                distance = abs(point.y() - rect.center().y())
+                if distance < best_distance:
+                    best_distance = distance
+                    best_index = flat_index
+        return best_index
+
     def _draw_gate_children(
         self,
         painter: QPainter,
@@ -1400,8 +1433,13 @@ class FlowDiagramView(QWidget):
                 and self._nested_drag_condition_index == condition_index
             )
             nested_target = self._drag_nested_gate_target == (root_gate_index, condition_index)
-            cond_border = QColor(34, 211, 238) if (condition_selected or nested_target) else QColor(48, 83, 118)
-            cond_bg = QColor(10, 84, 122, 236) if (condition_selected or nested_target) else QColor(8, 60, 92, 220)
+            reorder_target = (
+                self._nested_drag_active
+                and self._nested_drag_gate_index == root_gate_index
+                and self._nested_drag_reorder_target == condition_index
+            )
+            cond_border = QColor(34, 211, 238) if (condition_selected or nested_target or reorder_target) else QColor(48, 83, 118)
+            cond_bg = QColor(10, 84, 122, 236) if (condition_selected or nested_target or reorder_target) else QColor(8, 60, 92, 220)
             if is_dragged_nested:
                 cond_bg = QColor(7, 40, 62, 150)
             painter.setPen(QPen(cond_border, 1.2 if condition_selected else 1.0))
@@ -1415,15 +1453,18 @@ class FlowDiagramView(QWidget):
                 painter.setPen(dash_pen)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRoundedRect(cond_rect.adjusted(1.0, 1.0, -1.0, -1.0), 9.0, 9.0)
+            if reorder_target and self._nested_drag_active:
+                line_pen = QPen(QColor(34, 211, 238), 2.4)
+                painter.setPen(line_pen)
+                painter.drawLine(
+                    QPointF(cond_rect.left() + 8.0, cond_rect.top() - 2.0),
+                    QPointF(cond_rect.right() - 8.0, cond_rect.top() - 2.0),
+                )
 
-            drag_rect_nested = QRectF(cond_rect.right() - 92.0, cond_rect.top() + 3.0, 18.0, 18.0)
-            up_rect = QRectF(cond_rect.right() - 70.0, cond_rect.top() + 3.0, 18.0, 18.0)
-            down_rect = QRectF(cond_rect.right() - 48.0, cond_rect.top() + 3.0, 18.0, 18.0)
+            drag_rect_nested = QRectF(cond_rect.right() - 48.0, cond_rect.top() + 3.0, 18.0, 18.0)
             delete_rect_nested = QRectF(cond_rect.right() - 26.0, cond_rect.top() + 3.0, 18.0, 18.0)
             self._gate_condition_row_hit_areas.append((root_gate_index, condition_index, cond_rect))
             self._gate_condition_drag_hit_areas.append((root_gate_index, condition_index, drag_rect_nested))
-            self._gate_condition_up_hit_areas.append((root_gate_index, condition_index, up_rect))
-            self._gate_condition_down_hit_areas.append((root_gate_index, condition_index, down_rect))
             self._gate_condition_delete_hit_areas.append((root_gate_index, condition_index, delete_rect_nested))
             action_border = QColor(34, 211, 238) if condition_selected else QColor(48, 83, 118)
             action_bg = QColor(8, 38, 66, 238) if condition_selected else QColor(9, 24, 45, 230)
@@ -1432,18 +1473,14 @@ class FlowDiagramView(QWidget):
             painter.setPen(QPen(action_border, 1.0))
             painter.setBrush(action_bg)
             painter.drawRoundedRect(drag_rect_nested, 5.0, 5.0)
-            painter.drawRoundedRect(up_rect, 5.0, 5.0)
-            painter.drawRoundedRect(down_rect, 5.0, 5.0)
             painter.drawRoundedRect(delete_rect_nested, 5.0, 5.0)
             painter.setPen(QColor(188, 202, 220) if is_dragged_nested else QColor(227, 240, 252))
             painter.drawText(drag_rect_nested, Qt.AlignmentFlag.AlignCenter, "≡")
-            painter.drawText(up_rect, Qt.AlignmentFlag.AlignCenter, "↑")
-            painter.drawText(down_rect, Qt.AlignmentFlag.AlignCenter, "↓")
             painter.drawText(delete_rect_nested, Qt.AlignmentFlag.AlignCenter, "✕")
 
             painter.setPen(QColor(188, 202, 220) if is_dragged_nested else QColor(227, 240, 252))
             painter.drawText(
-                cond_rect.adjusted(10.0, 0.0, -96.0, 0.0),
+                cond_rect.adjusted(10.0, 0.0, -52.0, 0.0),
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                 self._gate_child_text(condition),
             )
@@ -1520,10 +1557,7 @@ class FlowDiagramView(QWidget):
 
     def _update_hover_cursor(self, point: QPointF) -> None:
         if self._connection_drag_active:
-            if self._connection_drag_mode == "move":
-                self.setCursor(Qt.CursorShape.SizeHorCursor)
-            else:
-                self.setCursor(Qt.CursorShape.CrossCursor)
+            self.setCursor(Qt.CursorShape.CrossCursor)
             return
         for _, _, _, rect in self._connection_delete_hit_areas:
             if rect.contains(point):
@@ -1586,14 +1620,6 @@ class FlowDiagramView(QWidget):
                 self.setCursor(Qt.CursorShape.OpenHandCursor)
                 return
         for _, _, rect in self._gate_condition_delete_hit_areas:
-            if rect.contains(point):
-                self.setCursor(Qt.CursorShape.PointingHandCursor)
-                return
-        for _, _, rect in self._gate_condition_up_hit_areas:
-            if rect.contains(point):
-                self.setCursor(Qt.CursorShape.PointingHandCursor)
-                return
-        for _, _, rect in self._gate_condition_down_hit_areas:
             if rect.contains(point):
                 self.setCursor(Qt.CursorShape.PointingHandCursor)
                 return
@@ -1953,6 +1979,7 @@ class AutomationTab(QWidget):
         self._syncing = False
         self._selected_nested_condition: tuple[int, int] | None = None
         self._rule_row_widgets: dict[str, RuleListRowWidget] = {}
+        self._palette_tile_by_type: dict[str, PaletteTileButton] = {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -2103,6 +2130,7 @@ class AutomationTab(QWidget):
                 tooltip="",
             )
             tile.block_requested.connect(self._add_block)
+            self._palette_tile_by_type[block_type] = tile
             palette_tiles_layout.addWidget(tile)
         palette_tiles_layout.addStretch(1)
         middle.addWidget(self.palette_tiles)
@@ -2163,9 +2191,9 @@ class AutomationTab(QWidget):
         self.diagram_view.condition_dropped_to_gate.connect(self._move_condition_into_gate_from_diagram)
         self.diagram_view.condition_dropped_to_nested_gate.connect(self._move_condition_into_nested_gate_from_diagram)
         self.diagram_view.gate_condition_selected.connect(self._select_nested_condition_from_diagram)
+        self.diagram_view.gate_condition_reordered.connect(self._reorder_gate_child_in_diagram)
         self.diagram_view.gate_condition_extract_requested.connect(self._extract_condition_from_gate_in_diagram)
         self.diagram_view.gate_condition_delete_requested.connect(self._remove_condition_from_gate_in_diagram)
-        self.diagram_view.gate_condition_move_requested.connect(self._move_condition_within_gate_in_diagram)
         self.diagram_view.gate_condition_dropped_to_nested_gate.connect(self._move_gate_child_into_nested_gate_in_diagram)
         self.diagram_view.gate_condition_dropped_to_parent_gate.connect(self._move_gate_child_into_parent_gate_in_diagram)
         self.diagram_view.branch_connected.connect(self._set_branch_connection_from_diagram)
@@ -2175,6 +2203,7 @@ class AutomationTab(QWidget):
 
         self._connect_block_editors()
         self._add_rule()
+        self._update_palette_block_availability()
         self._update_block_editor_height()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -2794,7 +2823,9 @@ class AutomationTab(QWidget):
             flow_blocks=[{"type": "start"}, {"type": "trigger"}, {"type": "action"}],
         )
         self._rules.append(rule)
-        self._refresh_rule_list(select_rule_id=rule.rule_id)
+        # Do not rebuild the whole rule list on every autosave - it resets
+        # canvas selection to the first block ("Start") and steals focus.
+        self._update_rule_row_selection_state()
         self.rules_changed.emit()
 
     def _header_action_button(self, symbol: str, tooltip: str, handler) -> QPushButton:
@@ -2870,6 +2901,9 @@ class AutomationTab(QWidget):
 
     def _add_block(self, block_type: str) -> None:
         normalized_type = str(block_type).strip().lower()
+        if normalized_type == "end" and self._has_end_block_in_canvas():
+            self._update_palette_block_availability()
+            return
         if self._try_add_palette_block_to_active_target(normalized_type):
             return
 
@@ -2890,6 +2924,26 @@ class AutomationTab(QWidget):
             block = {"type": "action", "action_type": "power", "value": True, "retries": 0, "retry_delay_sec": 1.0}
         self._append_block_item(block)
         self._save_current_rule()
+
+    def _has_end_block_in_canvas(self) -> bool:
+        for idx in range(self.canvas.count()):
+            item = self.canvas.item(idx)
+            if item is None:
+                continue
+            block = item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("type", "")).strip().lower() == "end":
+                return True
+        return False
+
+    def _update_palette_block_availability(self) -> None:
+        end_tile = self._palette_tile_by_type.get("end")
+        if end_tile is None:
+            return
+        can_add_end = not self._has_end_block_in_canvas()
+        end_tile.setEnabled(can_add_end)
+        end_tile.setCursor(Qt.CursorShape.OpenHandCursor if can_add_end else Qt.CursorShape.ForbiddenCursor)
 
     def _try_add_palette_block_to_active_target(self, block_type: str) -> bool:
         normalized_type = str(block_type).strip().lower()
@@ -3328,6 +3382,29 @@ class AutomationTab(QWidget):
         target_gate["conditions"] = nested_children
         return cls._set_gate_child_at_path(gate_block, gate_path, target_gate)
 
+    @classmethod
+    def _insert_child_into_gate_path(
+        cls,
+        gate_block: dict[str, object],
+        gate_path: tuple[int, ...],
+        insert_index: int,
+        child_block: dict[str, object],
+    ) -> bool:
+        if gate_path:
+            target_gate = cls._gate_child_at_path(gate_block, gate_path)
+            if not isinstance(target_gate, dict) or str(target_gate.get("type", "")).strip().lower() != "gate":
+                return False
+            children = cls._gate_children(target_gate)
+            bounded_index = max(0, min(insert_index, len(children)))
+            children.insert(bounded_index, dict(child_block))
+            target_gate["conditions"] = children
+            return cls._set_gate_child_at_path(gate_block, gate_path, target_gate)
+        children = cls._gate_children(gate_block)
+        bounded_index = max(0, min(insert_index, len(children)))
+        children.insert(bounded_index, dict(child_block))
+        gate_block["conditions"] = children
+        return True
+
     def _save_block_editor(self) -> None:
         if self._syncing:
             return
@@ -3524,7 +3601,9 @@ class AutomationTab(QWidget):
             )
         rule.actions = parsed_actions
 
-        self._refresh_rule_list(select_rule_id=rule.rule_id)
+        # Keep current canvas focus/selection while autosaving.
+        # Full rule-list refresh repopulates canvas and jumps to row 0 ("Start").
+        self._update_rule_row_selection_state()
         self.rules_changed.emit()
 
     @staticmethod
@@ -3809,6 +3888,7 @@ class AutomationTab(QWidget):
             gate_row, condition_row = self._selected_nested_condition
             if gate_row == selected_row:
                 self.diagram_view.set_selected_gate_condition(gate_row, condition_row)
+        self._update_palette_block_availability()
 
     def _sync_diagram_selection(self, row: int) -> None:
         self.diagram_view.set_selected_index(row)
@@ -4168,6 +4248,51 @@ class AutomationTab(QWidget):
         parent_children = self._gate_children(gate_block)
         parent_children.append(moved_child)
         gate_block["conditions"] = parent_children
+        gate_item.setData(Qt.ItemDataRole.UserRole, gate_block)
+        gate_item.setText(self._block_label(gate_block))
+        self.canvas.setCurrentRow(gate_row)
+        self._selected_nested_condition = None
+        self._sync_diagram_from_canvas()
+        self._save_current_rule()
+
+    def _reorder_gate_child_in_diagram(self, gate_row: int, source_child_row: int, target_child_row: int) -> None:
+        if gate_row < 0 or gate_row >= self.canvas.count():
+            return
+        if source_child_row < 0 or target_child_row < 0 or source_child_row == target_child_row:
+            return
+        gate_item = self.canvas.item(gate_row)
+        if gate_item is None:
+            return
+        gate_block = gate_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(gate_block, dict) or str(gate_block.get("type", "")).strip().lower() != "gate":
+            return
+        source_path = self._gate_child_path_from_flat_index(gate_block, source_child_row)
+        target_path = self._gate_child_path_from_flat_index(gate_block, target_child_row)
+        if source_path is None or target_path is None or source_path == target_path:
+            return
+        source_child = self._gate_child_at_path(gate_block, source_path)
+        if not isinstance(source_child, dict):
+            return
+        source_type = str(source_child.get("type", "")).strip().lower()
+        if source_type == "gate" and len(target_path) >= len(source_path) and target_path[: len(source_path)] == source_path:
+            return
+
+        moved_child = self._pop_gate_child_at_path(gate_block, source_path)
+        if not isinstance(moved_child, dict):
+            return
+
+        target_parent_path = target_path[:-1]
+        target_index = target_path[-1]
+        if (
+            len(source_path) == len(target_path)
+            and source_path[:-1] == target_parent_path
+            and source_path[-1] < target_index
+        ):
+            target_index -= 1
+
+        if not self._insert_child_into_gate_path(gate_block, target_parent_path, target_index, moved_child):
+            return
+
         gate_item.setData(Qt.ItemDataRole.UserRole, gate_block)
         gate_item.setText(self._block_label(gate_block))
         self.canvas.setCurrentRow(gate_row)

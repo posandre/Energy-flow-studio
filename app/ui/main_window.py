@@ -3938,6 +3938,11 @@ class MainWindow(QMainWindow):
                 border-color: #06b6d4;
                 background: rgba(7, 20, 42, 1);
             }
+            QToolButton#AutomationPaletteTile:disabled {
+                border-color: #1f334c;
+                background: rgba(7, 18, 34, 0.78);
+                color: rgba(148, 163, 184, 0.65);
+            }
             #EnergyFlowStatus {
                 color: #94a3b8;
                 background: rgba(8, 15, 30, 0.72);
