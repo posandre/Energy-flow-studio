@@ -4,11 +4,13 @@ from dataclasses import replace
 import uuid
 from typing import Iterable
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QDrag, QPainter, QPen, QPolygonF
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal, QTimer, QLineF
+from PySide6.QtGui import QColor, QDrag, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtCore import QMimeData
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
@@ -16,16 +18,19 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
     QSpinBox,
     QStackedWidget,
     QTextBrowser,
+    QToolButton,
     QVBoxLayout,
     QWidget,
     QScrollArea,
     QSizePolicy,
+    QStyle,
 )
 
 from app.services.automations import (
@@ -38,8 +43,10 @@ from app.services.automations import (
 )
 from app.services.i18n import tr
 from app.services.tuya_api import TuyaDevice
+from app.ui.dialogs import ask_compact_confirmation
 
 BLOCK_MIME = "application/x-energyflow-automation-block"
+INVERTER_DEVICE_ID = "__inverter__"
 
 
 class BlockPalette(QListWidget):
@@ -60,6 +67,92 @@ class BlockPalette(QListWidget):
         drag = QDrag(self)
         drag.setMimeData(mime)
         drag.exec(Qt.DropAction.CopyAction)
+
+
+class PaletteTileButton(QToolButton):
+    block_requested = Signal(str)
+
+    def __init__(self, block_type: str, icon: str, title: str, tooltip: str, parent=None) -> None:
+        super().__init__(parent)
+        self._block_type = block_type
+        self._drag_start = None
+        self._dragging = False
+        self.setObjectName("AutomationPaletteTile")
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip("")
+        self.setText(title)
+        self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+        self.setIcon(self._symbol_icon(icon))
+        self.setIconSize(QSize(30, 30))
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCheckable(False)
+
+    @staticmethod
+    def _symbol_icon(symbol: str) -> QIcon:
+        pixmap = QPixmap(72, 72)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(QColor("#dbeafe"))
+        font = QFont()
+        font.setPixelSize(52)
+        font.setWeight(QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, symbol)
+        painter.end()
+        return QIcon(pixmap)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start = event.position().toPoint()
+            self._dragging = False
+            self.setDown(False)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            return super().mouseMoveEvent(event)
+        if self._drag_start is None:
+            return super().mouseMoveEvent(event)
+        if (event.position().toPoint() - self._drag_start).manhattanLength() < QApplication.startDragDistance():
+            return super().mouseMoveEvent(event)
+        self._dragging = True
+        mime = QMimeData()
+        mime.setData(BLOCK_MIME, self._block_type.encode("utf-8"))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        drag.exec(Qt.DropAction.CopyAction)
+        self._reset_interaction_state()
+        event.accept()
+        return
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton:
+            return super().mouseReleaseEvent(event)
+        if self._dragging:
+            self._dragging = False
+            self._reset_interaction_state()
+            event.accept()
+            return
+        if self._drag_start is not None:
+            self.block_requested.emit(self._block_type)
+        self._reset_interaction_state()
+        event.accept()
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._reset_interaction_state()
+        super().leaveEvent(event)
+
+    def _reset_interaction_state(self) -> None:
+        self.setDown(False)
+        self.clearFocus()
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self._drag_start = None
+        self._dragging = False
+        self.update()
 
 
 class FlowCanvas(QListWidget):
@@ -99,13 +192,19 @@ class FlowDiagramView(QWidget):
     block_selected = Signal(int)
     block_added = Signal(str)
     palette_block_dropped_to_gate = Signal(str, int)
+    palette_block_dropped_to_nested_gate = Signal(str, int, int)
     blocks_reordered = Signal(list)
     block_delete_requested = Signal(int)
     condition_dropped_to_gate = Signal(int, int)
+    condition_dropped_to_nested_gate = Signal(int, int, int)
     gate_condition_delete_requested = Signal(int, int)
     gate_condition_move_requested = Signal(int, int, int)
     gate_condition_selected = Signal(int, int)
     gate_condition_extract_requested = Signal(int, int, int)
+    gate_condition_dropped_to_nested_gate = Signal(int, int, int)
+    gate_condition_dropped_to_parent_gate = Signal(int, int)
+    branch_connected = Signal(int, str, int)
+    branch_deleted = Signal(int, str, int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -124,12 +223,52 @@ class FlowDiagramView(QWidget):
         self._nested_drag_gate_index = -1
         self._nested_drag_condition_index = -1
         self._nested_drag_insert_index = -1
+        self._drag_nested_gate_target: tuple[int, int] | None = None
+        self._drag_hover_block_index = -1
+        self._dash_phase = 0.0
+        self._dash_timer = QTimer(self)
+        self._dash_timer.setInterval(60)
+        self._dash_timer.timeout.connect(self._advance_dash_phase)
         self._content_h = 220
         self._gate_condition_delete_hit_areas: list[tuple[int, int, QRectF]] = []
         self._gate_condition_up_hit_areas: list[tuple[int, int, QRectF]] = []
         self._gate_condition_down_hit_areas: list[tuple[int, int, QRectF]] = []
         self._gate_condition_row_hit_areas: list[tuple[int, int, QRectF]] = []
         self._gate_condition_drag_hit_areas: list[tuple[int, int, QRectF]] = []
+        self._input_socket_hit_areas: list[tuple[int, QRectF]] = []
+        self._input_label_hit_areas: list[tuple[int, QRectF]] = []
+        self._true_socket_hit_areas: list[tuple[int, QRectF]] = []
+        self._true_label_hit_areas: list[tuple[int, QRectF]] = []
+        self._false_socket_hit_areas: list[tuple[int, QRectF]] = []
+        self._false_label_hit_areas: list[tuple[int, QRectF]] = []
+        self._next_socket_hit_areas: list[tuple[int, QRectF]] = []
+        self._next_label_hit_areas: list[tuple[int, QRectF]] = []
+        self._resize_left_hit_areas: list[tuple[int, QRectF]] = []
+        self._resize_right_hit_areas: list[tuple[int, QRectF]] = []
+        self._connection_drag_active = False
+        self._connection_source_index = -1
+        self._connection_branch = ""
+        self._connection_hover_target_index = -1
+        self._connection_cursor_point = QPointF()
+        self._connection_source_rect = QRectF()
+        self._connection_drag_mode = ""
+        self._connection_drag_changed = False
+        self._connection_drag_start = QPointF()
+        self._connection_drag_from_label = False
+        self._resize_drag_active = False
+        self._resize_drag_index = -1
+        self._resize_drag_side = ""
+        self._resize_anchor_x = 0.0
+        self._align_drag_active = False
+        self._align_drag_index = -1
+        self._align_drag_changed = False
+        self._socket_drag_active = False
+        self._socket_drag_index = -1
+        self._socket_drag_kind = ""
+        self._socket_drag_changed = False
+        self._connection_hit_areas: list[tuple[int, str, int, QLineF]] = []
+        self._connection_hover: tuple[int, str, int] | None = None
+        self._connection_delete_hit_areas: list[tuple[int, str, int, QRectF]] = []
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
         self.setMinimumHeight(220)
@@ -163,12 +302,14 @@ class FlowDiagramView(QWidget):
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802
         if event.mimeData().hasFormat(BLOCK_MIME):
+            self._update_external_drag_target(event.position(), event.mimeData())
             event.acceptProposedAction()
             return
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event) -> None:  # noqa: N802
         if event.mimeData().hasFormat(BLOCK_MIME):
+            self._update_external_drag_target(event.position(), event.mimeData())
             event.acceptProposedAction()
             return
         super().dragMoveEvent(event)
@@ -177,6 +318,13 @@ class FlowDiagramView(QWidget):
         if event.mimeData().hasFormat(BLOCK_MIME):
             block_type = bytes(event.mimeData().data(BLOCK_MIME)).decode("utf-8").strip()
             if block_type:
+                nested_target = self._nested_gate_drop_target_for_palette(event.position())
+                if nested_target is not None:
+                    gate_index, child_index = nested_target
+                    self.block_selected.emit(gate_index)
+                    self.palette_block_dropped_to_nested_gate.emit(block_type, gate_index, child_index)
+                    event.acceptProposedAction()
+                    return
                 gate_index = self._gate_drop_target_for_palette(event.position())
                 if gate_index >= 0:
                     self.block_selected.emit(gate_index)
@@ -184,11 +332,155 @@ class FlowDiagramView(QWidget):
                 else:
                     self.block_added.emit(block_type)
             event.acceptProposedAction()
+            self._drag_hover_block_index = -1
+            self._drag_nested_gate_target = None
+            self._ensure_dash_animation(False)
+            self.update()
             return
         super().dropEvent(event)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         point = event.position()
+        for source_index, branch, target_index, rect in self._connection_delete_hit_areas:
+            if rect.contains(point):
+                self.branch_deleted.emit(source_index, branch, target_index)
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+                return
+        for idx, rect in self._resize_left_hit_areas:
+            if rect.contains(point):
+                self._resize_drag_active = True
+                self._resize_drag_index = idx
+                self._resize_drag_side = "left"
+                source_rect = self._hit_areas[idx] if 0 <= idx < len(self._hit_areas) else QRectF()
+                self._resize_anchor_x = source_rect.right()
+                self.block_selected.emit(idx)
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                return
+        for idx, rect in self._resize_right_hit_areas:
+            if rect.contains(point):
+                self._resize_drag_active = True
+                self._resize_drag_index = idx
+                self._resize_drag_side = "right"
+                source_rect = self._hit_areas[idx] if 0 <= idx < len(self._hit_areas) else QRectF()
+                self._resize_anchor_x = source_rect.left()
+                self.block_selected.emit(idx)
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                return
+        for idx, rect in self._input_socket_hit_areas:
+            if rect.contains(point):
+                self._socket_drag_active = True
+                self._socket_drag_index = idx
+                self._socket_drag_kind = "input"
+                self._socket_drag_changed = False
+                self.block_selected.emit(idx)
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                return
+        for idx, rect in self._input_label_hit_areas:
+            if rect.contains(point):
+                self._socket_drag_active = True
+                self._socket_drag_index = idx
+                self._socket_drag_kind = "input"
+                self._socket_drag_changed = False
+                self.block_selected.emit(idx)
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                return
+        for idx, rect in self._next_label_hit_areas:
+            if rect.contains(point):
+                self._connection_drag_active = True
+                self._connection_source_index = idx
+                self._connection_branch = "next"
+                self._connection_hover_target_index = -1
+                self._connection_cursor_point = QPointF(point)
+                self._connection_source_rect = self._hit_areas[idx] if 0 <= idx < len(self._hit_areas) else QRectF()
+                self._connection_drag_mode = "move"
+                self._connection_drag_changed = False
+                self._connection_drag_start = QPointF(point)
+                self._connection_drag_from_label = True
+                self.block_selected.emit(idx)
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                self.update()
+                return
+        for idx, rect in self._true_label_hit_areas:
+            if rect.contains(point):
+                self._connection_drag_active = True
+                self._connection_source_index = idx
+                self._connection_branch = "true"
+                self._connection_hover_target_index = -1
+                self._connection_cursor_point = QPointF(point)
+                self._connection_source_rect = self._hit_areas[idx] if 0 <= idx < len(self._hit_areas) else QRectF()
+                self._connection_drag_mode = "move"
+                self._connection_drag_changed = False
+                self._connection_drag_start = QPointF(point)
+                self._connection_drag_from_label = True
+                self.block_selected.emit(idx)
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                self.update()
+                return
+        for idx, rect in self._false_label_hit_areas:
+            if rect.contains(point):
+                self._connection_drag_active = True
+                self._connection_source_index = idx
+                self._connection_branch = "false"
+                self._connection_hover_target_index = -1
+                self._connection_cursor_point = QPointF(point)
+                self._connection_source_rect = self._hit_areas[idx] if 0 <= idx < len(self._hit_areas) else QRectF()
+                self._connection_drag_mode = "move"
+                self._connection_drag_changed = False
+                self._connection_drag_start = QPointF(point)
+                self._connection_drag_from_label = True
+                self.block_selected.emit(idx)
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                self.update()
+                return
+        for idx, rect in self._next_socket_hit_areas:
+            if rect.contains(point):
+                self._connection_drag_active = True
+                self._connection_source_index = idx
+                self._connection_branch = "next"
+                self._connection_hover_target_index = -1
+                self._connection_cursor_point = QPointF(point)
+                self._connection_source_rect = self._hit_areas[idx] if 0 <= idx < len(self._hit_areas) else QRectF()
+                self._connection_drag_mode = "connect" if bool(event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)) else "move"
+                self._connection_drag_changed = False
+                self._connection_drag_start = QPointF(point)
+                self._connection_drag_from_label = False
+                self.block_selected.emit(idx)
+                self.setCursor(Qt.CursorShape.CrossCursor if self._connection_drag_mode == "connect" else Qt.CursorShape.SizeHorCursor)
+                self.update()
+                return
+        for idx, rect in self._true_socket_hit_areas:
+            if rect.contains(point):
+                self._connection_drag_active = True
+                self._connection_source_index = idx
+                self._connection_branch = "true"
+                self._connection_hover_target_index = -1
+                self._connection_cursor_point = QPointF(point)
+                self._connection_source_rect = self._hit_areas[idx] if 0 <= idx < len(self._hit_areas) else QRectF()
+                self._connection_drag_mode = "connect" if bool(event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)) else "move"
+                self._connection_drag_changed = False
+                self._connection_drag_start = QPointF(point)
+                self._connection_drag_from_label = False
+                self.block_selected.emit(idx)
+                self.setCursor(Qt.CursorShape.CrossCursor if self._connection_drag_mode == "connect" else Qt.CursorShape.SizeHorCursor)
+                self.update()
+                return
+        for idx, rect in self._false_socket_hit_areas:
+            if rect.contains(point):
+                self._connection_drag_active = True
+                self._connection_source_index = idx
+                self._connection_branch = "false"
+                self._connection_hover_target_index = -1
+                self._connection_cursor_point = QPointF(point)
+                self._connection_source_rect = self._hit_areas[idx] if 0 <= idx < len(self._hit_areas) else QRectF()
+                self._connection_drag_mode = "connect" if bool(event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)) else "move"
+                self._connection_drag_changed = False
+                self._connection_drag_start = QPointF(point)
+                self._connection_drag_from_label = False
+                self.block_selected.emit(idx)
+                self.setCursor(Qt.CursorShape.CrossCursor if self._connection_drag_mode == "connect" else Qt.CursorShape.SizeHorCursor)
+                self.update()
+                return
+        self._drag_nested_gate_target = None
         for gate_index, condition_index, rect in self._gate_condition_drag_hit_areas:
             if rect.contains(point):
                 self._nested_drag_active = True
@@ -263,7 +555,13 @@ class FlowDiagramView(QWidget):
                 self._drag_active = False
                 self._nested_drag_active = False
                 self._selected_gate_condition = None
-                self._update_hover_cursor(point)
+                if self._block_width_ratio(self._blocks[idx]) < 0.999:
+                    self._align_drag_active = True
+                    self._align_drag_index = idx
+                    self._align_drag_changed = False
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
+                else:
+                    self._update_hover_cursor(point)
                 self.block_selected.emit(idx)
                 return
         self._update_hover_cursor(point)
@@ -274,8 +572,98 @@ class FlowDiagramView(QWidget):
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         point = event.position()
+        if self._resize_drag_active and self._resize_drag_index >= 0:
+            source_rect = self._hit_areas[self._resize_drag_index] if 0 <= self._resize_drag_index < len(self._hit_areas) else QRectF()
+            if not source_rect.isValid():
+                super().mouseMoveEvent(event)
+                return
+            canvas_width = self._canvas_inner_width()
+            if self._resize_drag_side == "left":
+                new_width = self._clamp(self._resize_anchor_x - point.x(), canvas_width * 0.35, canvas_width)
+                changed = self._set_block_layout(self._resize_drag_index, width_ratio=(new_width / canvas_width), align="right")
+            else:
+                new_width = self._clamp(point.x() - self._resize_anchor_x, canvas_width * 0.35, canvas_width)
+                changed = self._set_block_layout(self._resize_drag_index, width_ratio=(new_width / canvas_width), align="left")
+            if changed:
+                self.update()
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+            super().mouseMoveEvent(event)
+            return
+        if self._socket_drag_active and self._socket_drag_index >= 0 and self._socket_drag_kind:
+            block_rect = self._hit_areas[self._socket_drag_index] if 0 <= self._socket_drag_index < len(self._hit_areas) else QRectF()
+            if block_rect.width() > 1.0:
+                ratio = (point.x() - block_rect.left()) / block_rect.width()
+                if self._set_socket_ratio(self._socket_drag_index, self._socket_drag_kind, ratio):
+                    self._socket_drag_changed = True
+                    self.update()
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+            super().mouseMoveEvent(event)
+            return
+        if self._align_drag_active and self._align_drag_index >= 0:
+            block = self._blocks[self._align_drag_index] if 0 <= self._align_drag_index < len(self._blocks) else {}
+            if isinstance(block, dict) and self._block_width_ratio(block) < 0.999:
+                canvas_mid_x = 16.0 + (self._canvas_inner_width() / 2.0)
+                preview_align = "left" if point.x() <= canvas_mid_x else "right"
+                if self._set_block_layout(self._align_drag_index, align=preview_align):
+                    self._align_drag_changed = True
+                    self.update()
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+            super().mouseMoveEvent(event)
+            return
+        if self._connection_drag_active:
+            self._connection_cursor_point = QPointF(point)
+            if self._connection_drag_mode == "move":
+                block_rect = self._connection_source_rect
+                if (
+                    not self._connection_drag_from_label
+                    and block_rect.isValid()
+                    and not block_rect.adjusted(0.0, -18.0, 0.0, 18.0).contains(point)
+                ):
+                    self._connection_drag_mode = "connect"
+                    self._connection_hover_target_index = self._input_target_for_point(point, self._connection_source_index)
+                    self.setCursor(Qt.CursorShape.CrossCursor)
+                    self.update()
+                    super().mouseMoveEvent(event)
+                    return
+                if block_rect.width() > 1.0 and self._set_socket_ratio(
+                    self._connection_source_index,
+                    self._connection_branch,
+                    (point.x() - block_rect.left()) / block_rect.width(),
+                ):
+                    self._connection_drag_changed = True
+                self._connection_hover_target_index = -1
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            else:
+                self._connection_hover_target_index = self._input_target_for_point(point, self._connection_source_index)
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            self.update()
+            super().mouseMoveEvent(event)
+            return
+        hovered_connection = self._connection_at_point(point)
+        if hovered_connection != self._connection_hover:
+            self._connection_hover = hovered_connection
+            self.update()
         self._update_hover_cursor(point)
         if self._nested_drag_active and self._nested_drag_gate_index >= 0 and self._nested_drag_condition_index >= 0:
+            nested_target = self._nested_gate_row_drop_target(
+                self._nested_drag_gate_index,
+                point,
+                self._nested_drag_condition_index,
+            )
+            if nested_target >= 0:
+                self._drag_nested_gate_target = (self._nested_drag_gate_index, nested_target)
+                self._drag_hover_block_index = -1
+                self._ensure_dash_animation(True)
+            else:
+                self._drag_nested_gate_target = None
+                source_gate_rect = self._hit_areas[self._nested_drag_gate_index] if 0 <= self._nested_drag_gate_index < len(self._hit_areas) else QRectF()
+                if source_gate_rect.contains(point):
+                    # Allow dropping nested items back into the parent (root) gate.
+                    self._drag_hover_block_index = self._nested_drag_gate_index
+                    self._ensure_dash_animation(True)
+                else:
+                    self._drag_hover_block_index = -1
+                    self._ensure_dash_animation(False)
             source_gate_rect = self._hit_areas[self._nested_drag_gate_index] if 0 <= self._nested_drag_gate_index < len(self._hit_areas) else QRectF()
             if source_gate_rect.contains(point):
                 self._nested_drag_insert_index = -1
@@ -285,9 +673,29 @@ class FlowDiagramView(QWidget):
             super().mouseMoveEvent(event)
             return
         if not self._drag_active or self._drag_origin_index < 0:
+            self._ensure_dash_animation(False)
+            self._drag_hover_block_index = -1
+            self._drag_nested_gate_target = None
             super().mouseMoveEvent(event)
             return
-        self._drag_gate_target_index = self._gate_drop_target_at(point, self._drag_origin_index)
+        nested_target = self._nested_gate_drop_target_for_point(point)
+        if nested_target is not None:
+            gate_index, flat_index = nested_target
+            if self._drag_origin_index != gate_index:
+                self._drag_nested_gate_target = (gate_index, flat_index)
+                self._drag_hover_block_index = -1
+                self._ensure_dash_animation(True)
+            else:
+                self._drag_nested_gate_target = None
+                gate_target = self._gate_drop_target_at(point, self._drag_origin_index)
+                self._drag_hover_block_index = gate_target if gate_target >= 0 else -1
+                self._ensure_dash_animation(gate_target >= 0)
+        else:
+            self._drag_nested_gate_target = None
+            gate_target = self._gate_drop_target_at(point, self._drag_origin_index)
+            self._drag_hover_block_index = gate_target if gate_target >= 0 else -1
+            self._ensure_dash_animation(gate_target >= 0)
+        self._drag_gate_target_index = self._drag_hover_block_index
         insert_index = len(self._hit_areas)
         for idx, rect in enumerate(self._hit_areas):
             if point.y() < rect.center().y():
@@ -299,11 +707,127 @@ class FlowDiagramView(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         drop_point = event.position()
+        if self._resize_drag_active:
+            self._resize_drag_active = False
+            self._resize_drag_index = -1
+            self._resize_drag_side = ""
+            self._resize_anchor_x = 0.0
+            self._drag_origin_index = -1
+            self._drag_insert_index = -1
+            self.blocks_reordered.emit([dict(item) for item in self._blocks if isinstance(item, dict)])
+            self._update_hover_cursor(drop_point)
+            self.update()
+            super().mouseReleaseEvent(event)
+            return
+        if self._socket_drag_active:
+            changed = self._socket_drag_changed
+            self._socket_drag_active = False
+            self._socket_drag_index = -1
+            self._socket_drag_kind = ""
+            self._socket_drag_changed = False
+            self._drag_origin_index = -1
+            self._drag_insert_index = -1
+            if changed:
+                self.blocks_reordered.emit([dict(item) for item in self._blocks if isinstance(item, dict)])
+            self._update_hover_cursor(drop_point)
+            self.update()
+            super().mouseReleaseEvent(event)
+            return
+        if self._align_drag_active:
+            changed = self._align_drag_changed
+            self._align_drag_active = False
+            self._align_drag_index = -1
+            self._align_drag_changed = False
+            self._drag_origin_index = -1
+            self._drag_insert_index = -1
+            if changed:
+                self.blocks_reordered.emit([dict(item) for item in self._blocks if isinstance(item, dict)])
+            self._update_hover_cursor(drop_point)
+            self.update()
+            super().mouseReleaseEvent(event)
+            return
+        if self._connection_drag_active:
+            target_index = (
+                self._input_target_for_point(drop_point, self._connection_source_index)
+                if self._connection_drag_mode != "move"
+                else -1
+            )
+            if (
+                self._connection_drag_mode != "move"
+                and target_index >= 0
+                and self._connection_source_index >= 0
+                and self._connection_branch in {"true", "false", "next"}
+            ):
+                self.branch_connected.emit(self._connection_source_index, self._connection_branch, target_index)
+            elif (
+                self._connection_drag_mode == "move"
+                and self._connection_source_index >= 0
+                and self._connection_branch in {"true", "false", "next"}
+            ):
+                block_rect = self._hit_areas[self._connection_source_index] if 0 <= self._connection_source_index < len(self._hit_areas) else QRectF()
+                if block_rect.width() > 1.0:
+                    ratio = (drop_point.x() - block_rect.left()) / block_rect.width()
+                    if self._set_socket_ratio(self._connection_source_index, self._connection_branch, ratio):
+                        self._connection_drag_changed = True
+            if self._connection_drag_changed:
+                self.blocks_reordered.emit([dict(item) for item in self._blocks if isinstance(item, dict)])
+            self._connection_drag_active = False
+            self._connection_source_index = -1
+            self._connection_branch = ""
+            self._connection_hover_target_index = -1
+            self._connection_source_rect = QRectF()
+            self._connection_drag_mode = ""
+            self._connection_drag_changed = False
+            self._connection_drag_from_label = False
+            self._ensure_dash_animation(False)
+            self._update_hover_cursor(drop_point)
+            self.update()
+            super().mouseReleaseEvent(event)
+            return
         if (
             self._nested_drag_active
             and self._nested_drag_gate_index >= 0
             and self._nested_drag_condition_index >= 0
         ):
+            nested_gate_target = self._nested_gate_row_drop_target(
+                self._nested_drag_gate_index,
+                drop_point,
+                self._nested_drag_condition_index,
+            )
+            if nested_gate_target >= 0:
+                self.gate_condition_dropped_to_nested_gate.emit(
+                    self._nested_drag_gate_index,
+                    self._nested_drag_condition_index,
+                    nested_gate_target,
+                )
+                self._nested_drag_active = False
+                self._nested_drag_gate_index = -1
+                self._nested_drag_condition_index = -1
+                self._nested_drag_insert_index = -1
+                self._drag_nested_gate_target = None
+                self._update_hover_cursor(drop_point)
+                self._drag_hover_block_index = -1
+                self._ensure_dash_animation(False)
+                self.update()
+                super().mouseReleaseEvent(event)
+                return
+            source_gate_rect = self._hit_areas[self._nested_drag_gate_index] if 0 <= self._nested_drag_gate_index < len(self._hit_areas) else QRectF()
+            if source_gate_rect.contains(drop_point):
+                self.gate_condition_dropped_to_parent_gate.emit(
+                    self._nested_drag_gate_index,
+                    self._nested_drag_condition_index,
+                )
+                self._nested_drag_active = False
+                self._nested_drag_gate_index = -1
+                self._nested_drag_condition_index = -1
+                self._nested_drag_insert_index = -1
+                self._drag_nested_gate_target = None
+                self._update_hover_cursor(drop_point)
+                self._drag_hover_block_index = -1
+                self._ensure_dash_animation(False)
+                self.update()
+                super().mouseReleaseEvent(event)
+                return
             if self._nested_drag_insert_index >= 0:
                 self.gate_condition_extract_requested.emit(
                     self._nested_drag_gate_index,
@@ -314,7 +838,10 @@ class FlowDiagramView(QWidget):
             self._nested_drag_gate_index = -1
             self._nested_drag_condition_index = -1
             self._nested_drag_insert_index = -1
+            self._drag_nested_gate_target = None
             self._update_hover_cursor(drop_point)
+            self._drag_hover_block_index = -1
+            self._ensure_dash_animation(False)
             self.update()
             super().mouseReleaseEvent(event)
             return
@@ -324,17 +851,40 @@ class FlowDiagramView(QWidget):
             and self._drag_insert_index >= 0
             and 0 <= self._drag_origin_index < len(self._blocks)
         ):
-            drop_gate_index = self._drag_gate_target_index
             source_block = self._blocks[self._drag_origin_index]
             source_type = str(source_block.get("type", "")).strip().lower()
-            if drop_gate_index >= 0 and source_type == "condition":
+            nested_target = self._nested_gate_drop_target_for_point(drop_point)
+            if (
+                nested_target is not None
+                and source_type in {"condition", "gate"}
+                and self._drag_origin_index != nested_target[0]
+            ):
+                gate_index, child_index = nested_target
+                self.block_selected.emit(gate_index)
+                self.condition_dropped_to_nested_gate.emit(self._drag_origin_index, gate_index, child_index)
+                self._drag_origin_index = -1
+                self._drag_insert_index = -1
+                self._drag_gate_target_index = -1
+                self._drag_active = False
+                self._drag_nested_gate_target = None
+                self._update_hover_cursor(drop_point)
+                self._drag_hover_block_index = -1
+                self._ensure_dash_animation(False)
+                self.update()
+                super().mouseReleaseEvent(event)
+                return
+            drop_gate_index = self._drag_gate_target_index
+            if drop_gate_index >= 0 and source_type in {"condition", "gate"}:
                 self.block_selected.emit(drop_gate_index)
                 self.condition_dropped_to_gate.emit(self._drag_origin_index, drop_gate_index)
                 self._drag_origin_index = -1
                 self._drag_insert_index = -1
                 self._drag_gate_target_index = -1
                 self._drag_active = False
+                self._drag_nested_gate_target = None
                 self._update_hover_cursor(drop_point)
+                self._drag_hover_block_index = -1
+                self._ensure_dash_animation(False)
                 self.update()
                 super().mouseReleaseEvent(event)
                 return
@@ -357,12 +907,20 @@ class FlowDiagramView(QWidget):
         self._nested_drag_gate_index = -1
         self._nested_drag_condition_index = -1
         self._nested_drag_insert_index = -1
+        self._drag_nested_gate_target = None
+        self._drag_hover_block_index = -1
+        self._ensure_dash_animation(False)
         self._update_hover_cursor(drop_point)
         self.update()
         super().mouseReleaseEvent(event)
 
     def leaveEvent(self, event) -> None:  # noqa: N802
-        self.unsetCursor()
+        if not self._connection_drag_active:
+            self.unsetCursor()
+        self._drag_hover_block_index = -1
+        self._drag_nested_gate_target = None
+        self._connection_hover = None
+        self._ensure_dash_animation(False)
         super().leaveEvent(event)
 
     def paintEvent(self, event) -> None:  # noqa: N802
@@ -391,118 +949,191 @@ class FlowDiagramView(QWidget):
         self._gate_condition_down_hit_areas = []
         self._gate_condition_row_hit_areas = []
         self._gate_condition_drag_hit_areas = []
+        self._input_socket_hit_areas = []
+        self._input_label_hit_areas = []
+        self._true_socket_hit_areas = []
+        self._true_label_hit_areas = []
+        self._false_socket_hit_areas = []
+        self._false_label_hit_areas = []
+        self._next_socket_hit_areas = []
+        self._next_label_hit_areas = []
+        self._resize_left_hit_areas = []
+        self._resize_right_hit_areas = []
+        self._connection_hit_areas = []
+        self._connection_delete_hit_areas = []
         current_top = top
 
+        connectivity = self._connectivity_state()
         for idx, block in enumerate(self._blocks):
             block_height = float(self._block_height(block))
-            rect = QRectF(margin_x, current_top, width, block_height)
+            block_type = str(block.get("type", "")).strip().lower()
+            immutable_start = block_type == "start"
+            block_ratio = self._block_width_ratio(block)
+            block_width = width * block_ratio
+            block_align = self._block_align(block)
+            block_left = margin_x if block_align != "right" or block_ratio >= 0.999 else margin_x + (width - block_width)
+            rect = QRectF(block_left, current_top, block_width, block_height)
             self._hit_areas.append(rect)
-            move_rect = QRectF(rect.right() - 54.0, rect.top() + 6.0, 20.0, 20.0)
-            delete_rect = QRectF(rect.right() - 28.0, rect.top() + 6.0, 20.0, 20.0)
+            move_rect = QRectF()
+            delete_rect = QRectF()
+            if not immutable_start:
+                move_rect = QRectF(rect.right() - 54.0, rect.top() + 6.0, 20.0, 20.0)
+                delete_rect = QRectF(rect.right() - 28.0, rect.top() + 6.0, 20.0, 20.0)
             self._move_hit_areas.append(move_rect)
             self._delete_hit_areas.append(delete_rect)
+            left_resize_rect = QRectF()
+            right_resize_rect = QRectF()
+            if not immutable_start:
+                left_resize_rect = QRectF(rect.left() - 4.0, rect.center().y() - 12.0, 8.0, 24.0)
+                right_resize_rect = QRectF(rect.right() - 4.0, rect.center().y() - 12.0, 8.0, 24.0)
+            self._resize_left_hit_areas.append((idx, left_resize_rect))
+            self._resize_right_hit_areas.append((idx, right_resize_rect))
 
             gate_nested_selected = (
                 self._selected_gate_condition is not None
                 and self._selected_gate_condition[0] == idx
             )
+            is_dragged_block = self._drag_active and idx == self._drag_origin_index
             selected = idx == self._selected_index and not gate_nested_selected
+            invalid_connection = connectivity.get(idx, False)
             border = QColor(34, 211, 238) if selected else QColor(45, 71, 103)
             background = QColor(12, 28, 52, 220 if selected else 180)
-            if self._drag_active and idx == self._drag_origin_index:
+            if invalid_connection:
+                border = QColor(248, 113, 113)
+                background = QColor(54, 19, 28, 205 if selected else 175)
+            if is_dragged_block:
                 border = QColor(103, 232, 249)
+                # Dim the block while dragging so the transfer source is obvious.
+                background = QColor(10, 20, 36, 140)
             if self._drag_active and idx == self._drag_gate_target_index:
                 border = QColor(45, 212, 191)
                 background = QColor(10, 42, 60, 230)
             painter.setPen(QPen(border, 1.6))
             painter.setBrush(background)
             painter.drawRoundedRect(rect, 12.0, 12.0)
+            if idx == self._drag_hover_block_index and (self._drag_active or self._nested_drag_active or self._dash_timer.isActive()):
+                dash_pen = QPen(QColor(34, 211, 238), 1.8)
+                dash_pen.setStyle(Qt.PenStyle.CustomDashLine)
+                dash_pen.setDashPattern([5.0, 3.5])
+                dash_pen.setDashOffset(self._dash_phase)
+                painter.setPen(dash_pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(rect.adjusted(1.5, 1.5, -1.5, -1.5), 12.0, 12.0)
+            if self._align_drag_active and idx == self._align_drag_index and block_ratio < 0.999:
+                preview_align = self._block_align(block)
+                marker_x = rect.left() + 6.0 if preview_align == "left" else rect.right() - 6.0
+                painter.setPen(QPen(QColor(34, 211, 238), 2.0))
+                painter.drawLine(QPointF(marker_x, rect.top() + 6.0), QPointF(marker_x, rect.bottom() - 6.0))
 
-            painter.setPen(QPen(QColor(48, 83, 118), 1.2))
-            painter.setBrush(QColor(9, 24, 45, 230))
-            painter.drawRoundedRect(move_rect, 6.0, 6.0)
-            painter.setPen(QColor(227, 240, 252))
-            painter.drawText(move_rect, Qt.AlignmentFlag.AlignCenter, "≡")
+            if not immutable_start:
+                painter.setPen(QPen(QColor(56, 92, 130), 1.2))
+                painter.setBrush(QColor(10, 28, 50, 240))
+                painter.drawRoundedRect(left_resize_rect, 3.0, 3.0)
+                painter.drawRoundedRect(right_resize_rect, 3.0, 3.0)
 
-            painter.setPen(QPen(QColor(48, 83, 118), 1.2))
-            painter.setBrush(QColor(9, 24, 45, 230))
-            painter.drawRoundedRect(delete_rect, 6.0, 6.0)
-            painter.setPen(QColor(227, 240, 252))
-            painter.drawText(delete_rect, Qt.AlignmentFlag.AlignCenter, "-")
+                painter.setPen(QPen(QColor(48, 83, 118), 1.2))
+                painter.setBrush(QColor(9, 24, 45, 180 if is_dragged_block else 230))
+                painter.drawRoundedRect(move_rect, 6.0, 6.0)
+                painter.setPen(QColor(188, 202, 220) if is_dragged_block else QColor(227, 240, 252))
+                painter.drawText(move_rect, Qt.AlignmentFlag.AlignCenter, "≡")
+
+                painter.setPen(QPen(QColor(48, 83, 118), 1.2))
+                painter.setBrush(QColor(9, 24, 45, 180 if is_dragged_block else 230))
+                painter.drawRoundedRect(delete_rect, 6.0, 6.0)
+                painter.setPen(QColor(188, 202, 220) if is_dragged_block else QColor(227, 240, 252))
+                painter.drawText(delete_rect, Qt.AlignmentFlag.AlignCenter, "✕")
+
+            if not immutable_start:
+                input_center = self._socket_center(rect, block, "input")
+                input_rect = QRectF(input_center.x() - 6.0, input_center.y() - 6.0, 12.0, 12.0)
+                input_label_rect = QRectF(input_rect.left() - 48.0, input_rect.top() - 1.0, 42.0, 14.0)
+                self._input_socket_hit_areas.append((idx, input_rect))
+                self._input_label_hit_areas.append((idx, input_label_rect))
+                painter.setPen(QPen(QColor(82, 111, 141), 1.2))
+                painter.setBrush(QColor(6, 20, 38, 235))
+                painter.drawEllipse(input_rect)
+                if self._connection_hover_target_index == idx:
+                    glow_pen = QPen(QColor(34, 211, 238), 1.6)
+                    painter.setPen(glow_pen)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawEllipse(input_rect.adjusted(-2.0, -2.0, 2.0, 2.0))
+                painter.setPen(QColor(139, 192, 255))
+                painter.drawText(input_label_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, tr("In"))
 
             if str(block.get("type", "")).strip().lower() == "gate":
-                title_rect = QRectF(rect.left() + 12.0, rect.top() + 8.0, rect.width() - 76.0, 18.0)
-                mode_rect = QRectF(rect.left() + 12.0, rect.top() + 27.0, rect.width() - 76.0, 16.0)
-                painter.setPen(QColor(236, 246, 255))
+                title_rect = QRectF(rect.left() + 12.0, rect.top() + 20.0, rect.width() - 76.0, 18.0)
+                mode_rect = QRectF(rect.left() + 12.0, rect.top() + 40.0, rect.width() - 76.0, 16.0)
+                painter.setPen(QColor(205, 220, 236) if is_dragged_block else QColor(236, 246, 255))
                 painter.drawText(title_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._title_for_block(block))
-                painter.setPen(QColor(152, 176, 201))
+                painter.setPen(QColor(126, 146, 168) if is_dragged_block else QColor(152, 176, 201))
                 subtitle = self._labels[idx] if idx < len(self._labels) else ""
                 painter.drawText(mode_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, subtitle)
-
-                conditions = self._gate_conditions(block)
-                row_top = rect.top() + 48.0
-                for condition_index, condition in enumerate(conditions):
-                    cond_rect = QRectF(rect.left() + 12.0, row_top, rect.width() - 24.0, 24.0)
-                    condition_selected = self._selected_gate_condition == (idx, condition_index)
-                    cond_border = QColor(34, 211, 238) if condition_selected else QColor(48, 83, 118)
-                    cond_bg = QColor(10, 84, 122, 236) if condition_selected else QColor(8, 60, 92, 220)
-                    painter.setPen(QPen(cond_border, 1.2 if condition_selected else 1.0))
-                    painter.setBrush(cond_bg)
-                    painter.drawRoundedRect(cond_rect, 9.0, 9.0)
-                    drag_rect_nested = QRectF(cond_rect.right() - 92.0, cond_rect.top() + 3.0, 18.0, 18.0)
-                    up_rect = QRectF(cond_rect.right() - 70.0, cond_rect.top() + 3.0, 18.0, 18.0)
-                    down_rect = QRectF(cond_rect.right() - 48.0, cond_rect.top() + 3.0, 18.0, 18.0)
-                    delete_rect_nested = QRectF(cond_rect.right() - 26.0, cond_rect.top() + 3.0, 18.0, 18.0)
-                    self._gate_condition_row_hit_areas.append((idx, condition_index, cond_rect))
-                    self._gate_condition_drag_hit_areas.append((idx, condition_index, drag_rect_nested))
-                    self._gate_condition_up_hit_areas.append((idx, condition_index, up_rect))
-                    self._gate_condition_down_hit_areas.append((idx, condition_index, down_rect))
-                    self._gate_condition_delete_hit_areas.append((idx, condition_index, delete_rect_nested))
-                    action_border = QColor(34, 211, 238) if condition_selected else QColor(48, 83, 118)
-                    action_bg = QColor(8, 38, 66, 238) if condition_selected else QColor(9, 24, 45, 230)
-                    painter.setPen(QPen(action_border, 1.0))
-                    painter.setBrush(action_bg)
-                    painter.drawRoundedRect(drag_rect_nested, 5.0, 5.0)
-                    painter.drawRoundedRect(up_rect, 5.0, 5.0)
-                    painter.drawRoundedRect(down_rect, 5.0, 5.0)
-                    painter.drawRoundedRect(delete_rect_nested, 5.0, 5.0)
-                    painter.setPen(QColor(227, 240, 252))
-                    painter.drawText(drag_rect_nested, Qt.AlignmentFlag.AlignCenter, "≡")
-                    painter.drawText(up_rect, Qt.AlignmentFlag.AlignCenter, "↑")
-                    painter.drawText(down_rect, Qt.AlignmentFlag.AlignCenter, "↓")
-                    painter.drawText(delete_rect_nested, Qt.AlignmentFlag.AlignCenter, "-")
-                    painter.setPen(QColor(227, 240, 252))
-                    painter.drawText(
-                        cond_rect.adjusted(10.0, 0.0, -96.0, 0.0),
-                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                        self._gate_condition_text(condition),
-                    )
-                    row_top += 30.0
+                self._draw_gate_children(
+                    painter=painter,
+                    root_gate_index=idx,
+                    gate_block=block,
+                    row_top=rect.top() + 64.0,
+                    outer_rect=rect,
+                    level=0,
+                    flat_counter=[0],
+                )
             else:
-                title_rect = rect.adjusted(12, 8, -64, -26)
-                subtitle_rect = rect.adjusted(12, 28, -64, -8)
-                painter.setPen(QColor(236, 246, 255))
+                title_rect = QRectF(rect.left() + 12.0, rect.top() + 20.0, rect.width() - 76.0, 18.0)
+                subtitle_rect = QRectF(rect.left() + 12.0, rect.top() + 42.0, rect.width() - 76.0, 16.0)
+                painter.setPen(QColor(205, 220, 236) if is_dragged_block else QColor(236, 246, 255))
                 painter.drawText(title_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._title_for_block(block))
-                painter.setPen(QColor(152, 176, 201))
+                painter.setPen(QColor(126, 146, 168) if is_dragged_block else QColor(152, 176, 201))
                 subtitle = self._labels[idx] if idx < len(self._labels) else ""
                 painter.drawText(subtitle_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, subtitle)
 
-            if idx < len(self._blocks) - 1:
-                line_x = rect.center().x()
-                line_top = rect.bottom() + 4.0
-                line_bottom = rect.bottom() + gap - 6.0
-                painter.setPen(QPen(QColor(102, 178, 232), 1.4))
-                painter.drawLine(QPointF(line_x, line_top), QPointF(line_x, line_bottom))
-                arrow = QPolygonF(
-                    [
-                        QPointF(line_x, line_bottom + 5.0),
-                        QPointF(line_x - 5.0, line_bottom - 3.0),
-                        QPointF(line_x + 5.0, line_bottom - 3.0),
-                    ]
-                )
-                painter.setBrush(QColor(102, 178, 232))
-                painter.drawPolygon(arrow)
+            if block_type in {"condition", "gate"}:
+                true_center = self._socket_center(rect, block, "true")
+                false_center = self._socket_center(rect, block, "false")
+                true_rect = QRectF(true_center.x() - 6.0, true_center.y() - 6.0, 12.0, 12.0)
+                false_rect = QRectF(false_center.x() - 6.0, false_center.y() - 6.0, 12.0, 12.0)
+                true_label_rect = QRectF(true_rect.left() - 52.0, true_rect.top() - 1.0, 46.0, 14.0)
+                false_label_rect = QRectF(false_rect.left() - 54.0, false_rect.top() - 1.0, 48.0, 14.0)
+                self._true_socket_hit_areas.append((idx, true_rect))
+                self._true_label_hit_areas.append((idx, true_label_rect))
+                self._false_socket_hit_areas.append((idx, false_rect))
+                self._false_label_hit_areas.append((idx, false_label_rect))
+                painter.setPen(QPen(QColor(34, 211, 238), 1.2))
+                painter.setBrush(QColor(8, 84, 120, 235))
+                painter.drawEllipse(true_rect)
+                painter.setPen(QPen(QColor(245, 158, 11), 1.2))
+                painter.setBrush(QColor(82, 52, 8, 235))
+                painter.drawEllipse(false_rect)
+                label_pen_true = QColor(110, 220, 255)
+                label_pen_false = QColor(245, 185, 96)
+                painter.setPen(label_pen_true)
+                painter.drawText(true_label_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, tr("True"))
+                painter.setPen(label_pen_false)
+                painter.drawText(false_label_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, tr("False"))
+            elif block_type != "end":
+                next_center = self._socket_center(rect, block, "next")
+                next_rect = QRectF(next_center.x() - 6.0, next_center.y() - 6.0, 12.0, 12.0)
+                next_label_rect = QRectF(next_rect.left() - 50.0, next_rect.top() - 1.0, 44.0, 14.0)
+                self._next_socket_hit_areas.append((idx, next_rect))
+                self._next_label_hit_areas.append((idx, next_label_rect))
+                painter.setPen(QPen(QColor(96, 165, 250), 1.2))
+                painter.setBrush(QColor(13, 49, 89, 235))
+                painter.drawEllipse(next_rect)
+                painter.setPen(QColor(139, 192, 255))
+                painter.drawText(next_label_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, tr("Out"))
             current_top = rect.bottom() + gap
+
+        self._draw_top_level_connections(painter)
+        if self._connection_drag_active and self._connection_source_index >= 0 and self._connection_drag_mode != "move":
+            start = self._branch_socket_center(self._connection_source_index, self._connection_branch)
+            if start is not None:
+                preview_color = QColor(34, 211, 238) if self._connection_branch == "true" else QColor(245, 158, 11) if self._connection_branch == "false" else QColor(96, 165, 250)
+                preview_pen = QPen(preview_color, 1.8)
+                preview_pen.setStyle(Qt.PenStyle.CustomDashLine)
+                preview_pen.setDashPattern([5.0, 3.0])
+                preview_pen.setDashOffset(self._dash_phase)
+                painter.setPen(preview_pen)
+                painter.drawLine(start, self._connection_cursor_point)
+                self._ensure_dash_animation(True)
 
         if self._drag_active and self._drag_origin_index >= 0 and self._drag_insert_index >= 0:
             line_y = self._insertion_line_y(self._drag_insert_index)
@@ -514,7 +1145,7 @@ class FlowDiagramView(QWidget):
             painter.drawLine(QPointF(margin_x + 8.0, line_y), QPointF(margin_x + width - 8.0, line_y))
 
     def sizeHint(self) -> QSize:  # noqa: N802
-        return QSize(640, 220)
+        return QSize(640, max(220, int(self._content_h)))
 
     def minimumSizeHint(self) -> QSize:  # noqa: N802
         return QSize(320, 220)
@@ -527,6 +1158,86 @@ class FlowDiagramView(QWidget):
         bottom = 16
         heights = [self._block_height(block) for block in self._blocks]
         return top + sum(heights) + (max(0, len(heights) - 1) * gap) + bottom
+
+    @staticmethod
+    def _clamp(value: float, low: float, high: float) -> float:
+        return max(low, min(high, value))
+
+    def _canvas_inner_width(self) -> float:
+        margin_x = 16.0
+        return max(120.0, self.width() - margin_x * 2.0)
+
+    def _block_width_ratio(self, block: dict[str, object]) -> float:
+        raw = float(block.get("ui_width_ratio", 1.0) or 1.0)
+        return self._clamp(raw, 0.35, 1.0)
+
+    @staticmethod
+    def _block_align(block: dict[str, object]) -> str:
+        align = str(block.get("ui_align", "left")).strip().lower()
+        return "right" if align == "right" else "left"
+
+    def _set_block_layout(self, index: int, *, width_ratio: float | None = None, align: str | None = None) -> bool:
+        if index < 0 or index >= len(self._blocks):
+            return False
+        block = self._blocks[index]
+        if not isinstance(block, dict):
+            return False
+        changed = False
+        if width_ratio is not None:
+            normalized = self._clamp(float(width_ratio), 0.35, 1.0)
+            if abs(float(block.get("ui_width_ratio", 1.0) or 1.0) - normalized) > 1e-4:
+                block["ui_width_ratio"] = normalized
+                changed = True
+        if align is not None:
+            normalized_align = "right" if str(align).strip().lower() == "right" else "left"
+            if str(block.get("ui_align", "left")).strip().lower() != normalized_align:
+                block["ui_align"] = normalized_align
+                changed = True
+        return changed
+
+    def _socket_ratio(self, block: dict[str, object], kind: str) -> float:
+        key_map = {
+            "input": "ui_input_x",
+            "next": "ui_output_x",
+            "true": "ui_true_output_x",
+            "false": "ui_false_output_x",
+        }
+        default_map = {
+            "input": 0.5,
+            "next": 0.5,
+            "true": 0.25,
+            "false": 0.75,
+        }
+        key = key_map.get(kind, "ui_output_x")
+        default = default_map.get(kind, 0.5)
+        raw = float(block.get(key, default) or default)
+        return self._clamp(raw, 0.08, 0.92)
+
+    def _set_socket_ratio(self, index: int, kind: str, ratio: float) -> bool:
+        if index < 0 or index >= len(self._blocks):
+            return False
+        block = self._blocks[index]
+        if not isinstance(block, dict):
+            return False
+        key_map = {
+            "input": "ui_input_x",
+            "next": "ui_output_x",
+            "true": "ui_true_output_x",
+            "false": "ui_false_output_x",
+        }
+        key = key_map.get(kind)
+        if not key:
+            return False
+        normalized = self._clamp(float(ratio), 0.08, 0.92)
+        if abs(float(block.get(key, normalized) or normalized) - normalized) <= 1e-4:
+            return False
+        block[key] = normalized
+        return True
+
+    def _socket_center(self, rect: QRectF, block: dict[str, object], kind: str) -> QPointF:
+        x = rect.left() + (rect.width() * self._socket_ratio(block, kind))
+        y = rect.top() + 6.0 if kind == "input" else rect.bottom() - 10.0
+        return QPointF(x, y)
 
     def _insertion_line_y(self, insert_index: int) -> float:
         if not self._hit_areas:
@@ -547,7 +1258,10 @@ class FlowDiagramView(QWidget):
 
     def _gate_drop_target_at(self, point: QPointF, source_index: int) -> int:
         source_block = self._blocks[source_index] if 0 <= source_index < len(self._blocks) else {}
-        if not isinstance(source_block, dict) or str(source_block.get("type", "")).strip().lower() != "condition":
+        if not isinstance(source_block, dict):
+            return -1
+        source_type = str(source_block.get("type", "")).strip().lower()
+        if source_type not in {"condition", "gate"}:
             return -1
 
         for idx, rect in enumerate(self._hit_areas):
@@ -579,17 +1293,39 @@ class FlowDiagramView(QWidget):
                 return idx
         return -1
 
+    def _nested_gate_drop_target_for_palette(self, point: QPointF) -> tuple[int, int] | None:
+        return self._nested_gate_drop_target_for_point(point)
+
+    def _nested_gate_drop_target_for_point(self, point: QPointF) -> tuple[int, int] | None:
+        for gate_index, flat_index, rect in self._gate_condition_row_hit_areas:
+            if not rect.contains(point):
+                continue
+            if gate_index < 0 or gate_index >= len(self._blocks):
+                continue
+            gate_block = self._blocks[gate_index]
+            if not isinstance(gate_block, dict):
+                continue
+            child_path = self._gate_child_path_from_flat_index(gate_block, flat_index)
+            if child_path is None:
+                continue
+            child = self._gate_child_at_path(gate_block, child_path)
+            if not isinstance(child, dict):
+                continue
+            if str(child.get("type", "")).strip().lower() == "gate":
+                return (gate_index, flat_index)
+        return None
+
     def _block_height(self, block: dict[str, object]) -> int:
         block_type = str(block.get("type", "")).strip().lower()
         if block_type != "gate":
-            return 58
-        conditions = self._gate_conditions(block)
-        if not conditions:
-            return 58
-        return 58 + (len(conditions) * 30) + 8
+            return 84
+        visible_rows = self._gate_visible_rows(block)
+        if visible_rows <= 0:
+            return 84
+        return 84 + (visible_rows * 30) + 12
 
     @staticmethod
-    def _gate_conditions(block: dict[str, object]) -> list[dict[str, object]]:
+    def _gate_children(block: dict[str, object]) -> list[dict[str, object]]:
         raw = block.get("conditions", [])
         if not isinstance(raw, list):
             return []
@@ -597,29 +1333,254 @@ class FlowDiagramView(QWidget):
         for item in raw:
             if not isinstance(item, dict):
                 continue
-            if str(item.get("type", "")).strip().lower() != "condition":
+            if str(item.get("type", "")).strip().lower() not in {"condition", "gate"}:
                 continue
             result.append(item)
         return result
 
+    @classmethod
+    def _gate_visible_rows(cls, block: dict[str, object]) -> int:
+        rows = 0
+        for child in cls._gate_children(block):
+            rows += 1
+            if str(child.get("type", "")).strip().lower() == "gate":
+                rows += cls._gate_visible_rows(child)
+        return rows
+
+    def _nested_gate_row_drop_target(self, gate_index: int, point: QPointF, source_child_index: int) -> int:
+        if gate_index < 0 or gate_index >= len(self._blocks):
+            return -1
+        gate_block = self._blocks[gate_index]
+        if not isinstance(gate_block, dict):
+            return -1
+        source_path = self._gate_child_path_from_flat_index(gate_block, source_child_index)
+        if source_path is None:
+            return -1
+        source_child = self._gate_child_at_path(gate_block, source_path)
+        source_is_gate = isinstance(source_child, dict) and str(source_child.get("type", "")).strip().lower() == "gate"
+        for hit_gate_index, flat_index, rect in self._gate_condition_row_hit_areas:
+            if hit_gate_index != gate_index or flat_index == source_child_index:
+                continue
+            if not rect.contains(point):
+                continue
+            target_path = self._gate_child_path_from_flat_index(gate_block, flat_index)
+            if target_path is None:
+                continue
+            if source_is_gate and len(target_path) >= len(source_path) and target_path[: len(source_path)] == source_path:
+                continue
+            child = self._gate_child_at_path(gate_block, target_path)
+            if not isinstance(child, dict):
+                continue
+            if str(child.get("type", "")).strip().lower() == "gate":
+                return flat_index
+        return -1
+
+    def _draw_gate_children(
+        self,
+        painter: QPainter,
+        root_gate_index: int,
+        gate_block: dict[str, object],
+        row_top: float,
+        outer_rect: QRectF,
+        level: int,
+        flat_counter: list[int],
+    ) -> float:
+        children = self._gate_children(gate_block)
+        left_offset = 12.0 + (level * 18.0)
+        right_padding = 24.0 + (level * 8.0)
+        row_width = max(120.0, outer_rect.width() - left_offset - right_padding)
+        for condition in children:
+            condition_index = flat_counter[0]
+            flat_counter[0] += 1
+            cond_rect = QRectF(outer_rect.left() + left_offset, row_top, row_width, 24.0)
+            condition_selected = self._selected_gate_condition == (root_gate_index, condition_index)
+            is_dragged_nested = (
+                self._nested_drag_active
+                and self._nested_drag_gate_index == root_gate_index
+                and self._nested_drag_condition_index == condition_index
+            )
+            nested_target = self._drag_nested_gate_target == (root_gate_index, condition_index)
+            cond_border = QColor(34, 211, 238) if (condition_selected or nested_target) else QColor(48, 83, 118)
+            cond_bg = QColor(10, 84, 122, 236) if (condition_selected or nested_target) else QColor(8, 60, 92, 220)
+            if is_dragged_nested:
+                cond_bg = QColor(7, 40, 62, 150)
+            painter.setPen(QPen(cond_border, 1.2 if condition_selected else 1.0))
+            painter.setBrush(cond_bg)
+            painter.drawRoundedRect(cond_rect, 9.0, 9.0)
+            if nested_target and (self._drag_active or self._nested_drag_active or self._dash_timer.isActive()):
+                dash_pen = QPen(QColor(34, 211, 238), 1.6)
+                dash_pen.setStyle(Qt.PenStyle.CustomDashLine)
+                dash_pen.setDashPattern([4.5, 3.0])
+                dash_pen.setDashOffset(self._dash_phase)
+                painter.setPen(dash_pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(cond_rect.adjusted(1.0, 1.0, -1.0, -1.0), 9.0, 9.0)
+
+            drag_rect_nested = QRectF(cond_rect.right() - 92.0, cond_rect.top() + 3.0, 18.0, 18.0)
+            up_rect = QRectF(cond_rect.right() - 70.0, cond_rect.top() + 3.0, 18.0, 18.0)
+            down_rect = QRectF(cond_rect.right() - 48.0, cond_rect.top() + 3.0, 18.0, 18.0)
+            delete_rect_nested = QRectF(cond_rect.right() - 26.0, cond_rect.top() + 3.0, 18.0, 18.0)
+            self._gate_condition_row_hit_areas.append((root_gate_index, condition_index, cond_rect))
+            self._gate_condition_drag_hit_areas.append((root_gate_index, condition_index, drag_rect_nested))
+            self._gate_condition_up_hit_areas.append((root_gate_index, condition_index, up_rect))
+            self._gate_condition_down_hit_areas.append((root_gate_index, condition_index, down_rect))
+            self._gate_condition_delete_hit_areas.append((root_gate_index, condition_index, delete_rect_nested))
+            action_border = QColor(34, 211, 238) if condition_selected else QColor(48, 83, 118)
+            action_bg = QColor(8, 38, 66, 238) if condition_selected else QColor(9, 24, 45, 230)
+            if is_dragged_nested:
+                action_bg = QColor(9, 24, 45, 170)
+            painter.setPen(QPen(action_border, 1.0))
+            painter.setBrush(action_bg)
+            painter.drawRoundedRect(drag_rect_nested, 5.0, 5.0)
+            painter.drawRoundedRect(up_rect, 5.0, 5.0)
+            painter.drawRoundedRect(down_rect, 5.0, 5.0)
+            painter.drawRoundedRect(delete_rect_nested, 5.0, 5.0)
+            painter.setPen(QColor(188, 202, 220) if is_dragged_nested else QColor(227, 240, 252))
+            painter.drawText(drag_rect_nested, Qt.AlignmentFlag.AlignCenter, "≡")
+            painter.drawText(up_rect, Qt.AlignmentFlag.AlignCenter, "↑")
+            painter.drawText(down_rect, Qt.AlignmentFlag.AlignCenter, "↓")
+            painter.drawText(delete_rect_nested, Qt.AlignmentFlag.AlignCenter, "✕")
+
+            painter.setPen(QColor(188, 202, 220) if is_dragged_nested else QColor(227, 240, 252))
+            painter.drawText(
+                cond_rect.adjusted(10.0, 0.0, -96.0, 0.0),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                self._gate_child_text(condition),
+            )
+            row_top += 30.0
+            if str(condition.get("type", "")).strip().lower() == "gate":
+                row_top = self._draw_gate_children(
+                    painter=painter,
+                    root_gate_index=root_gate_index,
+                    gate_block=condition,
+                    row_top=row_top,
+                    outer_rect=outer_rect,
+                    level=level + 1,
+                    flat_counter=flat_counter,
+                )
+        return row_top
+
+    @classmethod
+    def _gate_child_path_from_flat_index(cls, gate_block: dict[str, object], flat_index: int) -> tuple[int, ...] | None:
+        paths = cls._gate_child_paths(gate_block)
+        if flat_index < 0 or flat_index >= len(paths):
+            return None
+        return paths[flat_index]
+
+    @classmethod
+    def _gate_child_paths(cls, gate_block: dict[str, object], prefix: tuple[int, ...] = ()) -> list[tuple[int, ...]]:
+        paths: list[tuple[int, ...]] = []
+        children = cls._gate_children(gate_block)
+        for idx, child in enumerate(children):
+            path = prefix + (idx,)
+            paths.append(path)
+            if str(child.get("type", "")).strip().lower() == "gate":
+                paths.extend(cls._gate_child_paths(child, path))
+        return paths
+
+    @classmethod
+    def _gate_child_at_path(cls, gate_block: dict[str, object], path: tuple[int, ...]) -> dict[str, object] | None:
+        current = dict(gate_block)
+        for depth, idx in enumerate(path):
+            children = cls._gate_children(current)
+            if idx < 0 or idx >= len(children):
+                return None
+            child = dict(children[idx])
+            if depth == len(path) - 1:
+                return child
+            if str(child.get("type", "")).strip().lower() != "gate":
+                return None
+            current = child
+        return None
+
     @staticmethod
-    def _gate_condition_text(block: dict[str, object]) -> str:
+    def _gate_child_text(block: dict[str, object]) -> str:
+        block_type = str(block.get("type", "")).strip().lower()
+        if block_type == "gate":
+            mode = str(block.get("mode", "and")).strip().lower() or "and"
+            mode_label = tr("All conditions") if mode == "and" else tr("Any condition")
+            child_count = 0
+            nested = block.get("conditions", [])
+            if isinstance(nested, list):
+                child_count = len(
+                    [
+                        item
+                        for item in nested
+                        if isinstance(item, dict) and str(item.get("type", "")).strip().lower() in {"condition", "gate"}
+                    ]
+                )
+            return tr("Gate: {mode} ({count})").format(mode=mode_label, count=child_count)
         metric = str(block.get("metric_key", "")).strip() or "metric"
         operator = str(block.get("operator", ">=")).strip() or ">="
         value = float(block.get("value", 0.0) or 0.0)
-        return tr("Condition: {metric} {operator} {value}").format(
-            metric=metric,
-            operator=operator,
-            value=f"{value:g}",
-        )
+        return tr("Condition: {metric} {operator} {value}").format(metric=metric, operator=operator, value=f"{value:g}")
 
     def content_height(self) -> int:
         return self._content_h
 
     def _update_hover_cursor(self, point: QPointF) -> None:
+        if self._connection_drag_active:
+            if self._connection_drag_mode == "move":
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            else:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            return
+        for _, _, _, rect in self._connection_delete_hit_areas:
+            if rect.contains(point):
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+                return
+        if self._connection_hover is not None:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            return
+        if self._resize_drag_active or self._socket_drag_active:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+            return
+        if self._align_drag_active:
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+            return
         if self._drag_active or self._nested_drag_active:
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
+        for _, rect in self._resize_left_hit_areas:
+            if rect.contains(point):
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                return
+        for _, rect in self._resize_right_hit_areas:
+            if rect.contains(point):
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                return
+        for _, rect in self._true_socket_hit_areas:
+            if rect.contains(point):
+                self.setCursor(Qt.CursorShape.CrossCursor)
+                return
+        for _, rect in self._true_label_hit_areas:
+            if rect.contains(point):
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                return
+        for _, rect in self._false_socket_hit_areas:
+            if rect.contains(point):
+                self.setCursor(Qt.CursorShape.CrossCursor)
+                return
+        for _, rect in self._false_label_hit_areas:
+            if rect.contains(point):
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                return
+        for _, rect in self._next_socket_hit_areas:
+            if rect.contains(point):
+                self.setCursor(Qt.CursorShape.CrossCursor)
+                return
+        for _, rect in self._next_label_hit_areas:
+            if rect.contains(point):
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                return
+        for _, rect in self._input_socket_hit_areas:
+            if rect.contains(point):
+                self.setCursor(Qt.CursorShape.CrossCursor)
+                return
+        for _, rect in self._input_label_hit_areas:
+            if rect.contains(point):
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                return
         for _, _, rect in self._gate_condition_drag_hit_areas:
             if rect.contains(point):
                 self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -644,11 +1605,22 @@ class FlowDiagramView(QWidget):
             if rect.contains(point):
                 self.setCursor(Qt.CursorShape.OpenHandCursor)
                 return
+        for idx, rect in enumerate(self._hit_areas):
+            if rect.contains(point):
+                block = self._blocks[idx] if 0 <= idx < len(self._blocks) else {}
+                if isinstance(block, dict) and self._block_width_ratio(block) < 0.999:
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
+                    return
+                break
         self.unsetCursor()
 
     @staticmethod
     def _title_for_block(block: dict[str, object]) -> str:
         block_type = str(block.get("type", "")).strip().lower()
+        if block_type == "start":
+            return tr("Start")
+        if block_type == "end":
+            return tr("End")
         if block_type == "trigger":
             return tr("Trigger")
         if block_type == "condition":
@@ -661,11 +1633,313 @@ class FlowDiagramView(QWidget):
             return tr("Action")
         return tr("Block")
 
+    def _input_target_for_point(self, point: QPointF, source_index: int) -> int:
+        for idx, rect in self._input_socket_hit_areas:
+            if idx == source_index:
+                continue
+            if rect.adjusted(-4.0, -4.0, 4.0, 4.0).contains(point):
+                return idx
+        return -1
+
+    def _branch_socket_center(self, source_index: int, branch: str) -> QPointF | None:
+        if branch == "next":
+            hit_areas = self._next_socket_hit_areas
+        else:
+            hit_areas = self._true_socket_hit_areas if branch == "true" else self._false_socket_hit_areas
+        for idx, rect in hit_areas:
+            if idx == source_index:
+                return rect.center()
+        return None
+
+    def _input_socket_center(self, target_index: int) -> QPointF | None:
+        for idx, rect in self._input_socket_hit_areas:
+            if idx == target_index:
+                return rect.center()
+        return None
+
+    def _block_id_to_index(self) -> dict[str, int]:
+        mapping: dict[str, int] = {}
+        for idx, block in enumerate(self._blocks):
+            if not isinstance(block, dict):
+                continue
+            block_id = str(block.get("_id", "")).strip()
+            if block_id:
+                mapping[block_id] = idx
+        return mapping
+
+    @staticmethod
+    def _branch_target_ids_from_block(block: dict[str, object], branch: str) -> list[str]:
+        list_key = "next_target_ids" if branch == "next" else "true_target_ids" if branch == "true" else "false_target_ids"
+        single_key = "next_target_id" if branch == "next" else "true_target_id" if branch == "true" else "false_target_id"
+        ids: list[str] = []
+        raw_list = block.get(list_key, [])
+        if isinstance(raw_list, list):
+            for value in raw_list:
+                target_id = str(value).strip()
+                if target_id and target_id not in ids:
+                    ids.append(target_id)
+        raw_single = str(block.get(single_key, "")).strip()
+        if raw_single and raw_single not in ids:
+            ids.append(raw_single)
+        return ids
+
+    def _resolved_branch_target_indices(self, source_index: int, branch: str) -> list[int]:
+        if source_index < 0 or source_index >= len(self._blocks):
+            return []
+        block = self._blocks[source_index]
+        if not isinstance(block, dict):
+            return []
+        id_to_index = self._block_id_to_index()
+        indices: list[int] = []
+        for target_id in self._branch_target_ids_from_block(block, branch):
+            target_idx = id_to_index.get(target_id, -1)
+            if target_idx >= 0 and target_idx != source_index and target_idx not in indices:
+                indices.append(target_idx)
+        return indices
+
+    def _connectivity_state(self) -> dict[int, bool]:
+        id_to_index = self._block_id_to_index()
+        incoming: dict[int, int] = {idx: 0 for idx in range(len(self._blocks))}
+        out_next: dict[int, int] = {idx: 0 for idx in range(len(self._blocks))}
+        out_true_false: dict[int, int] = {idx: 0 for idx in range(len(self._blocks))}
+        for idx, block in enumerate(self._blocks):
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type", "")).strip().lower()
+            if block_type in {"condition", "gate"}:
+                for branch in ("true", "false"):
+                    for target_id in self._branch_target_ids_from_block(block, branch):
+                        target_idx = id_to_index.get(target_id, -1)
+                        if target_idx < 0 or target_idx == idx:
+                            continue
+                        incoming[target_idx] = incoming.get(target_idx, 0) + 1
+                        out_true_false[idx] = out_true_false.get(idx, 0) + 1
+            elif block_type != "end":
+                for target_id in self._branch_target_ids_from_block(block, "next"):
+                    target_idx = id_to_index.get(target_id, -1)
+                    if target_idx < 0 or target_idx == idx:
+                        continue
+                    incoming[target_idx] = incoming.get(target_idx, 0) + 1
+                    out_next[idx] = out_next.get(idx, 0) + 1
+
+        invalid: dict[int, bool] = {}
+        for idx, block in enumerate(self._blocks):
+            if not isinstance(block, dict):
+                invalid[idx] = False
+                continue
+            block_type = str(block.get("type", "")).strip().lower()
+            if block_type == "start":
+                invalid[idx] = out_next.get(idx, 0) <= 0
+            elif block_type == "end":
+                invalid[idx] = incoming.get(idx, 0) <= 0
+            elif block_type in {"condition", "gate"}:
+                invalid[idx] = incoming.get(idx, 0) <= 0 or out_true_false.get(idx, 0) <= 0
+            else:
+                invalid[idx] = incoming.get(idx, 0) <= 0 or out_next.get(idx, 0) <= 0
+        return invalid
+
+    def _draw_top_level_connections(self, painter: QPainter) -> None:
+        self._connection_hit_areas = []
+        self._connection_delete_hit_areas = []
+        connection_midpoints: dict[tuple[int, str, int], QPointF] = {}
+        for idx, block in enumerate(self._blocks):
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type", "")).strip().lower()
+            if block_type in {"condition", "gate"}:
+                for branch, color in (
+                    ("true", QColor(34, 211, 238)),
+                    ("false", QColor(245, 158, 11)),
+                ):
+                    source = self._branch_socket_center(idx, branch)
+                    if source is None:
+                        continue
+                    for target_idx in self._resolved_branch_target_indices(idx, branch):
+                        target = self._input_socket_center(target_idx)
+                        if target is None:
+                            continue
+                        key = (idx, branch, target_idx)
+                        hovered = self._connection_hover == key
+                        pen_color = color.lighter(125) if hovered else color
+                        painter.setPen(QPen(pen_color, 2.6 if hovered else 1.6))
+                        segments = self._orthogonal_segments(source, target)
+                        for segment in segments:
+                            painter.drawLine(segment)
+                            self._connection_hit_areas.append((idx, branch, target_idx, segment))
+                        connection_midpoints[key] = self._polyline_midpoint(segments)
+                        self._draw_connection_arrow(painter, segments[-1], color)
+            elif block_type != "end":
+                source = self._branch_socket_center(idx, "next")
+                if source is None:
+                    continue
+                color = QColor(102, 178, 232)
+                for target_idx in self._resolved_branch_target_indices(idx, "next"):
+                    target = self._input_socket_center(target_idx)
+                    if target is None:
+                        continue
+                    key = (idx, "next", target_idx)
+                    hovered = self._connection_hover == key
+                    pen_color = color.lighter(130) if hovered else color
+                    painter.setPen(QPen(pen_color, 2.2 if hovered else 1.2))
+                    segments = self._orthogonal_segments(source, target)
+                    for segment in segments:
+                        painter.drawLine(segment)
+                        self._connection_hit_areas.append((idx, "next", target_idx, segment))
+                    connection_midpoints[key] = self._polyline_midpoint(segments)
+                    self._draw_connection_arrow(painter, segments[-1], color)
+
+        if self._connection_hover is not None:
+            source_index, branch, target_index = self._connection_hover
+            key = (source_index, branch, target_index)
+            center = connection_midpoints.get(key)
+            if center is not None:
+                delete_rect = QRectF(center.x() - 9.0, center.y() - 9.0, 18.0, 18.0)
+                self._connection_delete_hit_areas.append((source_index, branch, target_index, delete_rect))
+                painter.setPen(QPen(QColor(48, 83, 118), 1.2))
+                painter.setBrush(QColor(9, 24, 45, 230))
+                painter.drawRoundedRect(delete_rect, 6.0, 6.0)
+                painter.setPen(QColor(227, 240, 252))
+                painter.drawText(delete_rect, Qt.AlignmentFlag.AlignCenter, "✕")
+
+    @staticmethod
+    def _orthogonal_segments(source: QPointF, target: QPointF) -> list[QLineF]:
+        if abs(source.y() - target.y()) <= 1.0:
+            return [QLineF(source, target)]
+        mid_y = (source.y() + target.y()) / 2.0
+        p1 = QPointF(source.x(), mid_y)
+        p2 = QPointF(target.x(), mid_y)
+        return [QLineF(source, p1), QLineF(p1, p2), QLineF(p2, target)]
+
+    @staticmethod
+    def _polyline_midpoint(segments: list[QLineF]) -> QPointF:
+        if not segments:
+            return QPointF()
+        mid = segments[len(segments) // 2]
+        return QPointF((mid.p1().x() + mid.p2().x()) / 2.0, (mid.p1().y() + mid.p2().y()) / 2.0)
+
+    @staticmethod
+    def _draw_connection_arrow(painter: QPainter, last_segment: QLineF, color: QColor) -> None:
+        target = last_segment.p2()
+        dx = last_segment.p2().x() - last_segment.p1().x()
+        dy = last_segment.p2().y() - last_segment.p1().y()
+        if abs(dx) >= abs(dy):
+            if dx >= 0:
+                arrow = QPolygonF([QPointF(target.x(), target.y()), QPointF(target.x() - 7.0, target.y() - 4.0), QPointF(target.x() - 7.0, target.y() + 4.0)])
+            else:
+                arrow = QPolygonF([QPointF(target.x(), target.y()), QPointF(target.x() + 7.0, target.y() - 4.0), QPointF(target.x() + 7.0, target.y() + 4.0)])
+        else:
+            if dy >= 0:
+                arrow = QPolygonF([QPointF(target.x(), target.y()), QPointF(target.x() - 4.0, target.y() - 7.0), QPointF(target.x() + 4.0, target.y() - 7.0)])
+            else:
+                arrow = QPolygonF([QPointF(target.x(), target.y()), QPointF(target.x() - 4.0, target.y() + 7.0), QPointF(target.x() + 4.0, target.y() + 7.0)])
+        painter.setBrush(color)
+        painter.drawPolygon(arrow)
+
+    @staticmethod
+    def _distance_to_line(point: QPointF, line: QLineF) -> float:
+        x0, y0 = point.x(), point.y()
+        x1, y1 = line.p1().x(), line.p1().y()
+        x2, y2 = line.p2().x(), line.p2().y()
+        dx = x2 - x1
+        dy = y2 - y1
+        length_sq = (dx * dx) + (dy * dy)
+        if length_sq <= 1e-6:
+            return ((x0 - x1) ** 2 + (y0 - y1) ** 2) ** 0.5
+        t = ((x0 - x1) * dx + (y0 - y1) * dy) / length_sq
+        t = max(0.0, min(1.0, t))
+        proj_x = x1 + (t * dx)
+        proj_y = y1 + (t * dy)
+        return ((x0 - proj_x) ** 2 + (y0 - proj_y) ** 2) ** 0.5
+
+    def _connection_at_point(self, point: QPointF) -> tuple[int, str, int] | None:
+        best: tuple[int, str, int] | None = None
+        best_distance = 99999.0
+        for source_index, branch, target_index, line in self._connection_hit_areas:
+            distance = self._distance_to_line(point, line)
+            if distance <= 8.0 and distance < best_distance:
+                best_distance = distance
+                best = (source_index, branch, target_index)
+        return best
+
+    def _advance_dash_phase(self) -> None:
+        self._dash_phase -= 1.0
+        if self._dash_phase < -1000.0:
+            self._dash_phase = 0.0
+        self.update()
+
+    def _ensure_dash_animation(self, enabled: bool) -> None:
+        if enabled:
+            if not self._dash_timer.isActive():
+                self._dash_phase = 0.0
+                self._dash_timer.start()
+        elif self._dash_timer.isActive():
+            self._dash_timer.stop()
+
+    def _update_external_drag_target(self, point: QPointF, mime: QMimeData) -> None:
+        block_type = bytes(mime.data(BLOCK_MIME)).decode("utf-8").strip().lower()
+        self._drag_hover_block_index = -1
+        self._drag_nested_gate_target = None
+        if block_type in {"condition", "gate"}:
+            nested_target = self._nested_gate_drop_target_for_point(point)
+            if nested_target is not None:
+                self._drag_nested_gate_target = nested_target
+            else:
+                gate_index = self._gate_drop_target_for_palette(point)
+                if gate_index >= 0:
+                    self._drag_hover_block_index = gate_index
+        self._ensure_dash_animation(self._drag_hover_block_index >= 0 or self._drag_nested_gate_target is not None)
+        self.update()
+
+
+class RuleListRowWidget(QWidget):
+    selected = Signal(str)
+    toggled = Signal(str, bool)
+
+    def __init__(self, rule_id: str, name: str, enabled: bool, parent=None) -> None:
+        super().__init__(parent)
+        self._rule_id = rule_id
+        self.setObjectName("AutomationRuleRow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setProperty("selected", False)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(8)
+
+        self.enabled_check = QCheckBox()
+        self.enabled_check.setObjectName("AutomationRuleEnabled")
+        self.enabled_check.setChecked(enabled)
+        self.enabled_check.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self.name_label = QLabel(name)
+        self.name_label.setObjectName("AutomationRuleName")
+        self.name_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+        layout.addWidget(self.enabled_check)
+        layout.addWidget(self.name_label, 1)
+
+        self.enabled_check.toggled.connect(lambda checked: self.toggled.emit(self._rule_id, checked))
+
+    def set_selected(self, selected: bool) -> None:
+        self.setProperty("selected", bool(selected))
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def set_name(self, name: str) -> None:
+        self.name_label.setText(name)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        self.selected.emit(self._rule_id)
+        super().mousePressEvent(event)
+
 
 class AutomationTab(QWidget):
     rules_changed = Signal()
     manual_run_requested = Signal(str)
     simulate_requested = Signal(str)
+    logs_clear_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -673,9 +1947,12 @@ class AutomationTab(QWidget):
         self._device_options: list[tuple[str, str]] = []
         self._measurement_keys: list[str] = []
         self._measurement_keys_by_device: dict[str, list[str]] = {}
+        self._inverter_setting_options: list[dict[str, object]] = []
+        self._action_inverter_rows: list[dict[str, object]] = []
         self._active_rule_id: str | None = None
         self._syncing = False
         self._selected_nested_condition: tuple[int, int] | None = None
+        self._rule_row_widgets: dict[str, RuleListRowWidget] = {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -695,27 +1972,6 @@ class AutomationTab(QWidget):
         title_row.addWidget(title)
         title_row.addStretch(1)
 
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(8)
-        self.add_rule_btn = QPushButton(tr("New Rule"))
-        self.delete_rule_btn = QPushButton(tr("Delete"))
-        self.duplicate_rule_btn = QPushButton(tr("Duplicate"))
-        self.activate_btn = QPushButton(tr("Activate"))
-        self.manual_run_btn = QPushButton(tr("Run"))
-        self.simulate_btn = QPushButton(tr("Simulate"))
-        for button in (
-            self.add_rule_btn,
-            self.delete_rule_btn,
-            self.duplicate_rule_btn,
-            self.activate_btn,
-            self.manual_run_btn,
-            self.simulate_btn,
-        ):
-            button.setObjectName("AutomationActionButton")
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
-            toolbar.addWidget(button)
-        toolbar.addStretch(1)
-
         body = QGridLayout()
         body.setHorizontalSpacing(12)
         body.setVerticalSpacing(12)
@@ -729,14 +1985,6 @@ class AutomationTab(QWidget):
         )
         self.rule_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
 
-        self.palette = BlockPalette()
-        self.palette.setObjectName("AutomationList")
-        self.palette.addItem(self._palette_item(tr("Trigger"), "trigger"))
-        self.palette.addItem(self._palette_item(tr("Condition"), "condition"))
-        self.palette.addItem(self._palette_item(tr("Gate"), "gate"))
-        self.palette.addItem(self._palette_item(tr("Delay"), "delay"))
-        self.palette.addItem(self._palette_item(tr("Action"), "action"))
-
         self.canvas = FlowCanvas()
         self.canvas.setObjectName("AutomationList")
         self.canvas.hide()
@@ -746,6 +1994,7 @@ class AutomationTab(QWidget):
         self.diagram_scroll.setObjectName("AutomationList")
         self.diagram_scroll.setWidgetResizable(True)
         self.diagram_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.diagram_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.diagram_scroll.setWidget(self.diagram_view)
         self.diagram_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
 
@@ -754,7 +2003,7 @@ class AutomationTab(QWidget):
         self.rule_cooldown.setSuffix(" sec")
 
         self.block_editor = QStackedWidget()
-        self.block_editor.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.block_editor.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.block_editor.addWidget(self._build_empty_editor())
         self.trigger_editor = self._build_trigger_editor()
         self.condition_editor = self._build_condition_editor()
@@ -784,7 +2033,26 @@ class AutomationTab(QWidget):
         self._expand_fields(self.rule_cooldown)
 
         left = QVBoxLayout()
-        left.addWidget(QLabel(tr("Rules")))
+        rules_header = QHBoxLayout()
+        rules_header.setContentsMargins(0, 0, 0, 0)
+        rules_header.setSpacing(8)
+        rules_header.addWidget(QLabel(tr("Rules")))
+        self.add_rule_btn = QPushButton("+")
+        self.add_rule_btn.setObjectName("AutomationHeaderPlusButton")
+        self.add_rule_btn.setToolTip(tr("New Rule"))
+        self.add_rule_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_rule_btn.setFixedSize(24, 24)
+        rules_header.addWidget(self.add_rule_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.duplicate_rule_btn = self._header_action_button("⧉", tr("Duplicate"), self._duplicate_rule)
+        self.manual_run_btn = self._header_action_button("▶", tr("Run"), self._emit_manual_run)
+        self.simulate_btn = self._header_action_button("◉", tr("Simulate"), self._emit_simulate)
+        self.delete_rule_btn = self._header_action_button("✕", tr("Delete"), self._delete_rule)
+        rules_header.addWidget(self.duplicate_rule_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        rules_header.addWidget(self.manual_run_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        rules_header.addWidget(self.simulate_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        rules_header.addWidget(self.delete_rule_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        rules_header.addStretch(1)
+        left.addLayout(rules_header)
         left.addWidget(self.rule_list, 1)
         left_analytics = QWidget()
         left_analytics_layout = QVBoxLayout(left_analytics)
@@ -792,18 +2060,52 @@ class AutomationTab(QWidget):
         left_analytics_layout.setSpacing(12)
         left_analytics_layout.addWidget(QLabel(tr("Execution Logs")))
         left_analytics_layout.addWidget(self.logs_view)
-        left_analytics_layout.addWidget(self.analytics_label)
+        analytics_row = QHBoxLayout()
+        analytics_row.setContentsMargins(0, 0, 0, 0)
+        analytics_row.setSpacing(8)
+        analytics_row.addWidget(self.analytics_label, 1)
+        self.clear_logs_link = QLabel(f'<a href="clear">{tr("Clear")}</a>')
+        self.clear_logs_link.setObjectName("AutomationInlineLink")
+        self.clear_logs_link.setTextFormat(Qt.TextFormat.RichText)
+        self.clear_logs_link.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.clear_logs_link.setOpenExternalLinks(False)
+        self.clear_logs_link.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clear_logs_link.linkActivated.connect(lambda _href: self.logs_clear_requested.emit())
+        analytics_row.addWidget(self.clear_logs_link, 0, Qt.AlignmentFlag.AlignRight)
+        left_analytics_layout.addLayout(analytics_row)
         left.addWidget(left_analytics, 0)
 
         middle = QVBoxLayout()
-        middle.addWidget(QLabel(tr("Palette")))
-        middle.addWidget(self.palette)
         flow_header = QHBoxLayout()
         flow_header.setContentsMargins(0, 0, 0, 0)
         flow_header.setSpacing(8)
         flow_header.addWidget(QLabel(tr("Flow Canvas (drag to reorder)")))
         flow_header.addStretch(1)
         middle.addLayout(flow_header)
+        self.palette_tiles = QWidget()
+        self.palette_tiles.setObjectName("AutomationPaletteTiles")
+        palette_tiles_layout = QHBoxLayout(self.palette_tiles)
+        palette_tiles_layout.setContentsMargins(0, 0, 0, 0)
+        palette_tiles_layout.setSpacing(8)
+        tile_specs = [
+            ("trigger", "◎", tr("Trigger")),
+            ("condition", "◇", tr("Condition")),
+            ("gate", "⊞", tr("Gate")),
+            ("delay", "⏱", tr("Delay")),
+            ("action", "⚙", tr("Action")),
+            ("end", "◍", tr("End")),
+        ]
+        for block_type, icon, title_text in tile_specs:
+            tile = PaletteTileButton(
+                block_type=block_type,
+                icon=icon,
+                title=title_text,
+                tooltip="",
+            )
+            tile.block_requested.connect(self._add_block)
+            palette_tiles_layout.addWidget(tile)
+        palette_tiles_layout.addStretch(1)
+        middle.addWidget(self.palette_tiles)
         middle.addWidget(self.diagram_scroll, 1)
 
         right_fields_panel = QWidget()
@@ -839,18 +2141,11 @@ class AutomationTab(QWidget):
 
         section_layout.addLayout(title_row)
         section_layout.addWidget(subtitle)
-        section_layout.addLayout(toolbar)
         section_layout.addLayout(body)
         root.addWidget(section)
 
         self.add_rule_btn.clicked.connect(self._add_rule)
-        self.delete_rule_btn.clicked.connect(self._delete_rule)
-        self.duplicate_rule_btn.clicked.connect(self._duplicate_rule)
-        self.activate_btn.clicked.connect(self._activate_current_rule)
-        self.manual_run_btn.clicked.connect(self._emit_manual_run)
-        self.simulate_btn.clicked.connect(self._emit_simulate)
         self.rule_list.currentRowChanged.connect(self._switch_rule)
-        self.rule_list.itemChanged.connect(self._on_rule_item_changed)
         self.canvas.block_added.connect(self._add_block)
         self.canvas.currentRowChanged.connect(self._show_selected_block_editor)
         self.canvas.currentRowChanged.connect(self._sync_diagram_selection)
@@ -861,14 +2156,20 @@ class AutomationTab(QWidget):
         self.canvas.model().dataChanged.connect(lambda *_args: self._sync_diagram_from_canvas())
         self.diagram_view.block_added.connect(self._add_block)
         self.diagram_view.palette_block_dropped_to_gate.connect(self._add_palette_block_into_gate)
+        self.diagram_view.palette_block_dropped_to_nested_gate.connect(self._add_palette_block_into_nested_gate)
         self.diagram_view.block_selected.connect(self._select_block_from_diagram)
         self.diagram_view.block_delete_requested.connect(self._remove_block_by_index)
         self.diagram_view.blocks_reordered.connect(self._apply_diagram_reorder)
         self.diagram_view.condition_dropped_to_gate.connect(self._move_condition_into_gate_from_diagram)
+        self.diagram_view.condition_dropped_to_nested_gate.connect(self._move_condition_into_nested_gate_from_diagram)
         self.diagram_view.gate_condition_selected.connect(self._select_nested_condition_from_diagram)
         self.diagram_view.gate_condition_extract_requested.connect(self._extract_condition_from_gate_in_diagram)
         self.diagram_view.gate_condition_delete_requested.connect(self._remove_condition_from_gate_in_diagram)
         self.diagram_view.gate_condition_move_requested.connect(self._move_condition_within_gate_in_diagram)
+        self.diagram_view.gate_condition_dropped_to_nested_gate.connect(self._move_gate_child_into_nested_gate_in_diagram)
+        self.diagram_view.gate_condition_dropped_to_parent_gate.connect(self._move_gate_child_into_parent_gate_in_diagram)
+        self.diagram_view.branch_connected.connect(self._set_branch_connection_from_diagram)
+        self.diagram_view.branch_deleted.connect(self._clear_branch_connection_from_diagram)
 
         self.rule_cooldown.valueChanged.connect(lambda *_args: self._save_current_rule())
 
@@ -905,6 +2206,7 @@ class AutomationTab(QWidget):
             combo.blockSignals(False)
         self._refresh_trigger_metric_options()
         self._refresh_condition_metric_options()
+        self._update_action_editor_mode()
 
     def set_measurement_keys(self, keys: list[str]) -> None:
         cleaned = sorted({str(item).strip() for item in keys if str(item).strip()})
@@ -935,6 +2237,349 @@ class AutomationTab(QWidget):
         self._refresh_trigger_metric_options()
         self._refresh_condition_metric_options()
 
+    def set_inverter_control_fields(self, fields: list[dict[str, object]]) -> None:
+        normalized: list[dict[str, object]] = []
+        seen_ids: set[str] = set()
+        for raw in fields:
+            if not isinstance(raw, dict):
+                continue
+            field_id = str(raw.get("field_id", "")).strip()
+            if not field_id or field_id in seen_ids:
+                continue
+            seen_ids.add(field_id)
+            label = str(raw.get("label", "")).strip() or field_id
+            unit = str(raw.get("unit", "")).strip()
+            options_raw = raw.get("options", [])
+            options: list[tuple[str, str]] = []
+            if isinstance(options_raw, list):
+                for item in options_raw:
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        options.append((str(item[0]).strip(), str(item[1]).strip()))
+            normalized.append(
+                {
+                    "field_id": field_id,
+                    "label": label,
+                    "unit": unit,
+                    "options": options,
+                }
+            )
+        self._inverter_setting_options = sorted(
+            normalized,
+            key=lambda item: str(item.get("label", "")).lower(),
+        )
+        if self._action_is_inverter_mode():
+            self._refresh_inverter_action_field_combos()
+            if not self._action_inverter_rows and self._inverter_setting_options:
+                self._add_inverter_action_row()
+        self._update_action_editor_mode()
+
+    def _action_is_inverter_mode(self) -> bool:
+        return str(self.action_device.currentData() or "").strip() == INVERTER_DEVICE_ID
+
+    def _update_action_editor_mode(self) -> None:
+        inverter_mode = self._action_is_inverter_mode()
+        if hasattr(self, "_action_form"):
+            self._action_form.setRowVisible(self.action_state, not inverter_mode)
+            self._action_form.setRowVisible(self.action_inverter_editor, inverter_mode)
+        if inverter_mode:
+            if not self._action_inverter_rows and self._inverter_setting_options:
+                self._add_inverter_action_row()
+            self._refresh_inverter_action_field_combos()
+        self._update_block_editor_height()
+        self._save_block_editor()
+
+    def _inverter_field_by_id(self, field_id: str) -> dict[str, object] | None:
+        normalized = str(field_id).strip()
+        for item in self._inverter_setting_options:
+            if str(item.get("field_id", "")).strip() == normalized:
+                return item
+        return None
+
+    def _inverter_field_text(self, field_id: str) -> str:
+        data = self._inverter_field_by_id(field_id)
+        if data is None:
+            return field_id
+        label = str(data.get("label", "")).strip() or field_id
+        return label
+
+    def _selected_inverter_field_ids(self) -> set[str]:
+        selected: set[str] = set()
+        for row in self._action_inverter_rows:
+            combo = row.get("field_combo")
+            if isinstance(combo, QComboBox):
+                field_id = str(combo.currentData() or "").strip()
+                if field_id:
+                    selected.add(field_id)
+        return selected
+
+    def _available_inverter_field_ids_for_row(self, current_field_id: str) -> list[str]:
+        used_elsewhere = self._selected_inverter_field_ids()
+        if current_field_id in used_elsewhere:
+            used_elsewhere.remove(current_field_id)
+        available: list[str] = []
+        for item in self._inverter_setting_options:
+            field_id = str(item.get("field_id", "")).strip()
+            if field_id and field_id not in used_elsewhere:
+                available.append(field_id)
+        return available
+
+    def _refresh_inverter_action_field_combos(self) -> None:
+        for row in self._action_inverter_rows:
+            combo = row.get("field_combo")
+            if not isinstance(combo, QComboBox):
+                continue
+            current_field_id = str(combo.currentData() or "").strip()
+            available = self._available_inverter_field_ids_for_row(current_field_id)
+            combo.blockSignals(True)
+            combo.clear()
+            for field_id in available:
+                combo.addItem(self._inverter_field_text(field_id), field_id)
+            if available:
+                target_field_id = current_field_id if current_field_id in available else available[0]
+                combo.setCurrentIndex(combo.findData(target_field_id))
+            combo.blockSignals(False)
+            self._ensure_combo_popup_width(combo)
+            self._refresh_inverter_action_row_input(row)
+        self._refresh_inverter_action_row_controls()
+
+    def _refresh_inverter_action_row_controls(self) -> None:
+        can_add_more = bool(self._inverter_setting_options) and (
+            len(self._selected_inverter_field_ids()) < len(self._inverter_setting_options)
+        )
+        last_index = len(self._action_inverter_rows) - 1
+        for index, row in enumerate(self._action_inverter_rows):
+            add_btn = row.get("add_btn")
+            if isinstance(add_btn, QPushButton):
+                show_add = index == last_index and can_add_more
+                # Keep width stable across rows so both editor fields stay equal.
+                add_btn.setVisible(True)
+                add_btn.setEnabled(show_add)
+
+    def _refresh_inverter_action_row_input(self, row: dict[str, object]) -> None:
+        field_combo = row.get("field_combo")
+        value_stack = row.get("value_stack")
+        value_combo = row.get("value_combo")
+        value_edit = row.get("value_edit")
+        if not isinstance(field_combo, QComboBox):
+            return
+        if not isinstance(value_stack, QStackedWidget):
+            return
+        if not isinstance(value_combo, QComboBox):
+            return
+        if not isinstance(value_edit, QLineEdit):
+            return
+        field_id = str(field_combo.currentData() or "").strip()
+        field_data = self._inverter_field_by_id(field_id) or {}
+        options = field_data.get("options", [])
+        value_combo.blockSignals(True)
+        value_combo.clear()
+        if isinstance(options, list) and options:
+            for option_value, option_label in options:
+                value_combo.addItem(option_label or option_value, option_value)
+            current_value = str(row.get("value", "")).strip()
+            idx = value_combo.findData(current_value)
+            value_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            row["value"] = str(value_combo.currentData() or "")
+            value_stack.setCurrentIndex(0)
+            self._ensure_combo_popup_width(value_combo)
+        else:
+            current_text = str(row.get("value", "")).strip()
+            value_edit.blockSignals(True)
+            value_edit.setText(current_text)
+            value_edit.blockSignals(False)
+            value_stack.setCurrentIndex(1)
+        value_combo.blockSignals(False)
+        self._save_block_editor()
+
+    def _add_inverter_action_row(self, _checked: bool = False, *, field_id: str = "", value: object = "") -> None:
+        if not self._inverter_setting_options:
+            return
+        available = self._available_inverter_field_ids_for_row("")
+        if not available and not field_id:
+            return
+        selected_field_id = str(field_id).strip()
+        if not selected_field_id:
+            selected_field_id = available[0] if available else ""
+        if not selected_field_id:
+            return
+
+        row_widget = QWidget()
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(8)
+
+        field_combo = QComboBox()
+        field_combo.setMinimumWidth(0)
+        field_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        field_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        field_combo.setMinimumContentsLength(1)
+        value_stack = QStackedWidget()
+        value_stack.setMinimumWidth(0)
+        value_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        value_combo = QComboBox()
+        value_combo.setMinimumWidth(0)
+        value_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        value_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        value_combo.setMinimumContentsLength(1)
+        value_edit = QLineEdit()
+        value_edit.setMinimumWidth(0)
+        value_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        value_edit.setPlaceholderText(tr("Value"))
+        controls_wrap = QWidget()
+        controls_wrap.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        controls_wrap.setFixedWidth(44)
+        controls_layout = QHBoxLayout(controls_wrap)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(6)
+        remove_btn = QPushButton("✕")
+        remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_btn.setFixedSize(18, 18)
+        remove_btn.setFlat(True)
+        remove_btn.setStyleSheet(
+            "QPushButton {"
+            "background: transparent;"
+            "border: none;"
+            "color: #22d3ee;"
+            "font-size: 18px;"
+            "font-weight: 800;"
+            "padding: 0;"
+            "}"
+            "QPushButton:hover { color: #67e8f9; }"
+            "QPushButton:pressed { color: #06b6d4; }"
+            "QPushButton:disabled { color: rgba(34, 211, 238, 0.4); }"
+        )
+        add_btn = QPushButton("+")
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.setFixedSize(18, 18)
+        add_btn.setFlat(True)
+        add_btn.setStyleSheet(
+            "QPushButton {"
+            "background: transparent;"
+            "border: none;"
+            "color: #22d3ee;"
+            "font-size: 18px;"
+            "font-weight: 800;"
+            "padding: 0;"
+            "}"
+            "QPushButton:hover { color: #67e8f9; }"
+            "QPushButton:pressed { color: #06b6d4; }"
+            "QPushButton:disabled { color: rgba(34, 211, 238, 0.4); }"
+        )
+
+        value_stack.addWidget(value_combo)
+        value_stack.addWidget(value_edit)
+        controls_layout.addWidget(remove_btn)
+        controls_layout.addWidget(add_btn)
+        row_layout.addWidget(field_combo, 1)
+        row_layout.addWidget(value_stack, 1)
+        row_layout.addWidget(controls_wrap, 0)
+
+        row_data: dict[str, object] = {
+            "widget": row_widget,
+            "field_combo": field_combo,
+            "value_stack": value_stack,
+            "value_combo": value_combo,
+            "value_edit": value_edit,
+            "remove_btn": remove_btn,
+            "add_btn": add_btn,
+            "value": str(value).strip(),
+        }
+        self._action_inverter_rows.append(row_data)
+        self.action_inverter_rows_layout.addWidget(row_widget)
+
+        field_combo.currentIndexChanged.connect(lambda *_args, row=row_data: self._on_inverter_action_row_changed(row))
+        value_combo.currentIndexChanged.connect(lambda *_args, row=row_data: self._on_inverter_action_row_value_changed(row))
+        value_edit.textChanged.connect(lambda *_args, row=row_data: self._on_inverter_action_row_value_changed(row))
+        remove_btn.clicked.connect(lambda _checked=False, row=row_data: self._remove_inverter_action_row(row))
+        add_btn.clicked.connect(self._add_inverter_action_row)
+
+        self._refresh_inverter_action_field_combos()
+        target_index = field_combo.findData(selected_field_id)
+        if target_index >= 0:
+            field_combo.setCurrentIndex(target_index)
+        self._refresh_inverter_action_row_input(row_data)
+        self._update_block_editor_height()
+        self._save_block_editor()
+
+    def _remove_inverter_action_row(self, row: dict[str, object]) -> None:
+        if row not in self._action_inverter_rows:
+            return
+        self._action_inverter_rows.remove(row)
+        widget = row.get("widget")
+        if isinstance(widget, QWidget):
+            self.action_inverter_rows_layout.removeWidget(widget)
+            widget.deleteLater()
+        self._refresh_inverter_action_field_combos()
+        self._update_block_editor_height()
+        self._save_block_editor()
+
+    def _on_inverter_action_row_changed(self, row: dict[str, object]) -> None:
+        self._refresh_inverter_action_field_combos()
+        self._refresh_inverter_action_row_input(row)
+        self._save_block_editor()
+
+    def _on_inverter_action_row_value_changed(self, row: dict[str, object]) -> None:
+        value_stack = row.get("value_stack")
+        value_combo = row.get("value_combo")
+        value_edit = row.get("value_edit")
+        if isinstance(value_stack, QStackedWidget) and isinstance(value_combo, QComboBox) and value_stack.currentIndex() == 0:
+            row["value"] = str(value_combo.currentData() or "")
+        elif isinstance(value_edit, QLineEdit):
+            row["value"] = value_edit.text().strip()
+        self._save_block_editor()
+
+    def _clear_inverter_action_rows(self) -> None:
+        for row in list(self._action_inverter_rows):
+            widget = row.get("widget")
+            if isinstance(widget, QWidget):
+                self.action_inverter_rows_layout.removeWidget(widget)
+                widget.deleteLater()
+        self._action_inverter_rows.clear()
+        self._refresh_inverter_action_field_combos()
+        self._update_block_editor_height()
+
+    def _load_inverter_action_rows(self, changes: list[dict[str, object]]) -> None:
+        self._clear_inverter_action_rows()
+        seen: set[str] = set()
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            field_id = str(change.get("field_id", "")).strip()
+            if not field_id or field_id in seen:
+                continue
+            seen.add(field_id)
+            self._add_inverter_action_row(field_id=field_id, value=change.get("value", ""))
+        if not self._action_inverter_rows and self._inverter_setting_options:
+            self._add_inverter_action_row()
+
+    def _collect_inverter_action_changes(self) -> list[dict[str, object]]:
+        changes: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for row in self._action_inverter_rows:
+            field_combo = row.get("field_combo")
+            if not isinstance(field_combo, QComboBox):
+                continue
+            field_id = str(field_combo.currentData() or "").strip()
+            if not field_id or field_id in seen:
+                continue
+            seen.add(field_id)
+            value_stack = row.get("value_stack")
+            value_combo = row.get("value_combo")
+            value_edit = row.get("value_edit")
+            if isinstance(value_stack, QStackedWidget) and isinstance(value_combo, QComboBox) and value_stack.currentIndex() == 0:
+                value = str(value_combo.currentData() or "")
+            elif isinstance(value_edit, QLineEdit):
+                value = value_edit.text().strip()
+            else:
+                value = str(row.get("value", "")).strip()
+            changes.append(
+                {
+                    "field_id": field_id,
+                    "value": value,
+                }
+            )
+        return changes
+
     def set_rules(self, rules: list[AutomationRule]) -> None:
         self._rules = [replace(item) for item in rules]
         self._refresh_rule_list()
@@ -958,11 +2603,6 @@ class AutomationTab(QWidget):
                 info=bucket.get("info", 0),
             )
         )
-
-    def _palette_item(self, title: str, block_type: str) -> QListWidgetItem:
-        item = QListWidgetItem(title)
-        item.setData(Qt.ItemDataRole.UserRole, block_type)
-        return item
 
     def _build_empty_editor(self) -> QWidget:
         box = QWidget()
@@ -1043,7 +2683,7 @@ class AutomationTab(QWidget):
         self.gate_mode = QComboBox()
         self.gate_mode.addItem(tr("All conditions"), "and")
         self.gate_mode.addItem(tr("Any condition"), "or")
-        self.gate_hint = QLabel(tr("Drag condition blocks into the logical container on canvas."))
+        self.gate_hint = QLabel(tr("Drag condition or logical blocks into the logical container on canvas."))
         self.gate_hint.setObjectName("SidebarMeta")
         self.gate_hint.setWordWrap(True)
         form.addRow(tr("Type"), self.gate_mode)
@@ -1069,10 +2709,13 @@ class AutomationTab(QWidget):
         form = QFormLayout(box)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        self._action_form = form
         self.action_device = QComboBox()
         self.action_state = QComboBox()
         self.action_state.addItem(tr("Turn ON"), True)
         self.action_state.addItem(tr("Turn OFF"), False)
+        self.action_inverter_editor = self._build_action_inverter_editor()
+        self.action_inverter_editor.setVisible(False)
         self.action_retries = QSpinBox()
         self.action_retries.setRange(0, 5)
         self.action_retry_delay = QDoubleSpinBox()
@@ -1080,7 +2723,8 @@ class AutomationTab(QWidget):
         self.action_retry_delay.setDecimals(1)
         self.action_retry_delay.setSuffix(" sec")
         form.addRow(tr("Device"), self.action_device)
-        form.addRow(tr("State"), self.action_state)
+        form.addRow(tr("Action"), self.action_state)
+        form.addRow(self.action_inverter_editor)
         form.addRow(tr("Retries"), self.action_retries)
         form.addRow(tr("Retry delay"), self.action_retry_delay)
         self._expand_fields(
@@ -1089,7 +2733,27 @@ class AutomationTab(QWidget):
             self.action_retries,
             self.action_retry_delay,
         )
+        self._update_action_editor_mode()
         return box
+
+    def _build_action_inverter_editor(self) -> QWidget:
+        panel = QWidget()
+        root = QVBoxLayout(panel)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(8)
+
+        hint = QLabel(tr("Add inverter setting changes. Each field can be selected once."))
+        hint.setObjectName("SidebarMeta")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        rows_holder = QWidget()
+        rows_layout = QVBoxLayout(rows_holder)
+        rows_layout.setContentsMargins(0, 0, 0, 0)
+        rows_layout.setSpacing(8)
+        self.action_inverter_rows_layout = rows_layout
+        root.addWidget(rows_holder)
+        return panel
 
     def _connect_block_editors(self) -> None:
         for widget in (
@@ -1119,6 +2783,7 @@ class AutomationTab(QWidget):
         self.condition_device.currentIndexChanged.connect(lambda *_args: self._refresh_condition_metric_options())
         self.trigger_metric.currentIndexChanged.connect(lambda *_args: self._update_trigger_value_unit_suffix())
         self.condition_metric.currentIndexChanged.connect(lambda *_args: self._update_condition_value_unit_suffix())
+        self.action_device.currentIndexChanged.connect(lambda *_args: self._update_action_editor_mode())
 
     def _add_rule(self) -> None:
         rule = AutomationRule(
@@ -1126,15 +2791,27 @@ class AutomationTab(QWidget):
             name=tr("Automation {index}").format(index=len(self._rules) + 1),
             enabled=True,
             active=False,
-            flow_blocks=[{"type": "trigger"}, {"type": "action"}],
+            flow_blocks=[{"type": "start"}, {"type": "trigger"}, {"type": "action"}],
         )
         self._rules.append(rule)
         self._refresh_rule_list(select_rule_id=rule.rule_id)
         self.rules_changed.emit()
 
-    def _delete_rule(self) -> None:
-        row = self.rule_list.currentRow()
+    def _header_action_button(self, symbol: str, tooltip: str, handler) -> QPushButton:
+        button = QPushButton(symbol)
+        button.setObjectName("AutomationHeaderIconButton")
+        button.setToolTip(tooltip)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setFixedSize(24, 24)
+        button.clicked.connect(handler)
+        return button
+
+    def _delete_rule(self, rule_id: str | None = None) -> None:
+        row = self._row_for_rule_id(rule_id) if rule_id else self.rule_list.currentRow()
         if row < 0 or row >= len(self._rules):
+            return
+        rule_name = str(self._rules[row].name or "").strip() or tr("Rule")
+        if not self._confirm_delete_rule(rule_name):
             return
         self._rules.pop(row)
         if not self._rules:
@@ -1143,8 +2820,18 @@ class AutomationTab(QWidget):
         self._refresh_rule_list(select_row=max(0, row - 1))
         self.rules_changed.emit()
 
-    def _duplicate_rule(self) -> None:
-        rule = self._current_rule()
+    def _confirm_delete_rule(self, rule_name: str) -> bool:
+        return ask_compact_confirmation(
+            self,
+            title=tr("Delete rule"),
+            text=tr('Are you sure you want to delete rule "{name}"?').format(name=rule_name),
+            accept_text=tr("Delete"),
+            reject_text=tr("Cancel"),
+            destructive=True,
+        )
+
+    def _duplicate_rule(self, rule_id: str | None = None) -> None:
+        rule = self._rule_by_id(rule_id) if rule_id else self._current_rule()
         if rule is None:
             return
         clone = AutomationRule.from_dict(rule.to_dict())
@@ -1156,46 +2843,80 @@ class AutomationTab(QWidget):
         self._refresh_rule_list(select_rule_id=clone.rule_id)
         self.rules_changed.emit()
 
-    def _emit_manual_run(self) -> None:
-        rule = self._current_rule()
+    def _emit_manual_run(self, rule_id: str | None = None) -> None:
+        rule = self._rule_by_id(rule_id) if rule_id else self._current_rule()
         if rule is None:
             return
         self.manual_run_requested.emit(rule.rule_id)
 
-    def _emit_simulate(self) -> None:
-        rule = self._current_rule()
+    def _emit_simulate(self, rule_id: str | None = None) -> None:
+        rule = self._rule_by_id(rule_id) if rule_id else self._current_rule()
         if rule is None:
             return
         self.simulate_requested.emit(rule.rule_id)
 
-    def _activate_current_rule(self) -> None:
-        rule = self._current_rule()
+    def _toggle_rule_enabled(self, rule_id: str, enabled: bool) -> None:
+        rule = self._rule_by_id(rule_id)
         if rule is None:
             return
         self._save_current_rule()
-        for item in self._rules:
-            if item.rule_id == rule.rule_id:
-                item.active = True
-                item.version = max(item.version, item.draft_version)
-                item.updated_at = _now_label()
-                break
+        rule.enabled = bool(enabled)
+        rule.active = bool(enabled)
+        if rule.active:
+            rule.version = max(rule.version, rule.draft_version)
+        rule.updated_at = _now_label()
         self._refresh_rule_list(select_rule_id=rule.rule_id)
         self.rules_changed.emit()
 
     def _add_block(self, block_type: str) -> None:
+        normalized_type = str(block_type).strip().lower()
+        if self._try_add_palette_block_to_active_target(normalized_type):
+            return
+
         block: dict[str, object]
-        if block_type == "trigger":
+        if normalized_type == "start":
+            block = {"type": "start"}
+        elif normalized_type == "trigger":
             block = {"type": "trigger", "trigger_type": "measurement", "operator": ">=", "value": 0.0}
-        elif block_type == "condition":
+        elif normalized_type == "condition":
             block = {"type": "condition", "operator": ">=", "value": 0.0}
-        elif block_type == "gate":
+        elif normalized_type == "gate":
             block = {"type": "gate", "mode": "and"}
-        elif block_type == "delay":
+        elif normalized_type == "delay":
             block = {"type": "delay", "seconds": 1.0}
+        elif normalized_type == "end":
+            block = {"type": "end"}
         else:
             block = {"type": "action", "action_type": "power", "value": True, "retries": 0, "retry_delay_sec": 1.0}
         self._append_block_item(block)
         self._save_current_rule()
+
+    def _try_add_palette_block_to_active_target(self, block_type: str) -> bool:
+        normalized_type = str(block_type).strip().lower()
+        if normalized_type not in {"condition", "gate"}:
+            return False
+
+        # Keep palette click adding to top-level by default.
+        # Nested insertion is allowed only when a nested gate row is actively selected.
+        if self._selected_nested_condition is not None:
+            gate_row, child_row = self._selected_nested_condition
+            if 0 <= gate_row < self.canvas.count():
+                gate_item = self.canvas.item(gate_row)
+                gate_block = gate_item.data(Qt.ItemDataRole.UserRole) if gate_item is not None else None
+                if (
+                    isinstance(gate_block, dict)
+                    and str(gate_block.get("type", "")).strip().lower() == "gate"
+                ):
+                    child_path = self._gate_child_path_from_flat_index(gate_block, child_row)
+                    if child_path is not None:
+                        selected_child = self._gate_child_at_path(gate_block, child_path)
+                        if (
+                            isinstance(selected_child, dict)
+                            and str(selected_child.get("type", "")).strip().lower() == "gate"
+                        ):
+                            self._add_palette_block_into_nested_gate(normalized_type, gate_row, child_row)
+                            return True
+        return False
 
     def _remove_selected_block(self) -> None:
         row = self.diagram_view.selected_index()
@@ -1204,6 +2925,7 @@ class AutomationTab(QWidget):
         self._remove_block_by_index(row)
 
     def _append_block_item(self, block: dict[str, object]) -> None:
+        self._ensure_block_id(block)
         label = self._block_label(block)
         item = QListWidgetItem(label)
         item.setData(Qt.ItemDataRole.UserRole, block)
@@ -1213,6 +2935,10 @@ class AutomationTab(QWidget):
 
     def _block_label(self, block: dict[str, object]) -> str:
         kind = str(block.get("type", "")).strip().lower()
+        if kind == "start":
+            return tr("Start")
+        if kind == "end":
+            return tr("End")
         if kind == "trigger":
             trigger_type = str(block.get("trigger_type", "measurement"))
             metric_key = str(block.get("metric_key", "")).strip()
@@ -1249,12 +2975,17 @@ class AutomationTab(QWidget):
         if kind == "gate":
             mode = str(block.get("mode", "and")).strip().lower() or "and"
             mode_label = tr("All conditions") if mode == "and" else tr("Any condition")
-            cond_count = len(block.get("conditions", [])) if isinstance(block.get("conditions", []), list) else 0
+            cond_count = len(self._gate_children(block))
             return tr("Gate: {mode} ({count})").format(mode=mode_label, count=cond_count)
         if kind == "delay":
             sec = float(block.get("seconds", 0.0) or 0.0)
             return tr("Delay: {seconds} sec").format(seconds=f"{sec:g}")
         if kind == "action":
+            action_type = str(block.get("action_type", "power")).strip().lower() or "power"
+            if action_type == "inverter_settings":
+                changes = block.get("changes", block.get("value", []))
+                count = len(changes) if isinstance(changes, list) else 0
+                return tr("Action: Inverter settings ({count})").format(count=count)
             state = tr("ON") if bool(block.get("value", False)) else tr("OFF")
             return tr("Action: Power {state}").format(state=state)
         return tr("Block")
@@ -1263,41 +2994,32 @@ class AutomationTab(QWidget):
         if self._syncing:
             return
         if row < 0 or row >= len(self._rules):
+            self._active_rule_id = None
+            self._update_rule_row_selection_state()
             return
         rule = self._rules[row]
         self._active_rule_id = rule.rule_id
+        self._update_rule_row_selection_state()
         self._populate_rule_details(rule)
-
-    def _on_rule_item_changed(self, item: QListWidgetItem) -> None:
-        if self._syncing:
-            return
-        row = self.rule_list.row(item)
-        if row < 0 or row >= len(self._rules):
-            return
-        rule = self._rules[row]
-        new_name = item.text().strip() or rule.name
-        item.setText(new_name)
-        rule.name = new_name
-        rule.enabled = item.checkState() == Qt.CheckState.Checked
-        rule.updated_at = _now_label()
-        rule.draft_version = max(1, int(rule.draft_version) + 1)
-        self.rules_changed.emit()
 
     def _refresh_rule_list(self, *, select_row: int | None = None, select_rule_id: str | None = None) -> None:
         self._syncing = True
+        self._rule_row_widgets.clear()
         self.rule_list.clear()
+        selected_rule: AutomationRule | None = None
         for rule in self._rules:
-            item = QListWidgetItem(rule.name)
+            item = QListWidgetItem("")
             item.setData(Qt.ItemDataRole.UserRole, rule.rule_id)
-            item.setFlags(
-                item.flags()
-                | Qt.ItemFlag.ItemIsEditable
-                | Qt.ItemFlag.ItemIsUserCheckable
-            )
-            item.setCheckState(Qt.CheckState.Checked if rule.enabled else Qt.CheckState.Unchecked)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
             state_label = tr("ACTIVE") if rule.active else tr("DRAFT")
             item.setToolTip(tr("State: {state}").format(state=state_label))
             self.rule_list.addItem(item)
+            row_widget = RuleListRowWidget(rule.rule_id, rule.name, rule.enabled)
+            row_widget.selected.connect(self._select_rule_by_id)
+            row_widget.toggled.connect(self._toggle_rule_enabled)
+            self._rule_row_widgets[rule.rule_id] = row_widget
+            self.rule_list.setItemWidget(item, row_widget)
+            item.setSizeHint(row_widget.sizeHint())
         target_row = 0
         if select_rule_id:
             for idx in range(self.rule_list.count()):
@@ -1305,11 +3027,26 @@ class AutomationTab(QWidget):
                 if item and item.data(Qt.ItemDataRole.UserRole) == select_rule_id:
                     target_row = idx
                     break
+        elif self._active_rule_id:
+            for idx in range(self.rule_list.count()):
+                item = self.rule_list.item(idx)
+                if item and item.data(Qt.ItemDataRole.UserRole) == self._active_rule_id:
+                    target_row = idx
+                    break
         elif select_row is not None:
             target_row = max(0, min(select_row, self.rule_list.count() - 1))
         if self.rule_list.count() > 0:
             self.rule_list.setCurrentRow(target_row)
+            current_item = self.rule_list.item(target_row)
+            if current_item is not None:
+                self._active_rule_id = str(current_item.data(Qt.ItemDataRole.UserRole) or "")
+            selected_rule = self._current_rule()
+        self._update_rule_row_selection_state()
         self._syncing = False
+        # During initial/refresh selection currentRowChanged is ignored because
+        # _syncing is True, so we must populate the selected rule explicitly.
+        if selected_rule is not None:
+            self._populate_rule_details(selected_rule)
 
     def _populate_rule_details(self, rule: AutomationRule) -> None:
         self._syncing = True
@@ -1319,9 +3056,27 @@ class AutomationTab(QWidget):
         flow_blocks = list(rule.flow_blocks)
         if not flow_blocks:
             flow_blocks = flow_blocks_from_graph(rule.flow_graph)
-        for block in (flow_blocks or [{"type": "trigger"}, {"type": "action"}]):
-            if isinstance(block, dict):
-                self._append_block_item(dict(block))
+        normalized_blocks: list[dict[str, object]] = []
+        start_added = False
+        for block in flow_blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type", "")).strip().lower()
+            if block_type == "start":
+                if start_added:
+                    continue
+                normalized_blocks.append(dict(block))
+                start_added = True
+                continue
+            normalized_blocks.append(dict(block))
+        if not start_added:
+            normalized_blocks.insert(0, {"type": "start"})
+        elif normalized_blocks and str(normalized_blocks[0].get("type", "")).strip().lower() != "start":
+            start_block = next((item for item in normalized_blocks if str(item.get("type", "")).strip().lower() == "start"), {"type": "start"})
+            normalized_blocks = [dict(start_block), *[item for item in normalized_blocks if str(item.get("type", "")).strip().lower() != "start"]]
+        flow_blocks = normalized_blocks
+        for block in flow_blocks:
+            self._append_block_item(dict(block))
         if self.canvas.count() > 0:
             self.canvas.setCurrentRow(0)
         self._sync_diagram_from_canvas()
@@ -1332,6 +3087,46 @@ class AutomationTab(QWidget):
         if row < 0 or row >= len(self._rules):
             return None
         return self._rules[row]
+
+    def _rule_by_id(self, rule_id: str | None) -> AutomationRule | None:
+        if not rule_id:
+            return None
+        normalized = str(rule_id).strip()
+        for rule in self._rules:
+            if rule.rule_id == normalized:
+                return rule
+        return None
+
+    def _row_for_rule_id(self, rule_id: str | None) -> int:
+        if not rule_id:
+            return -1
+        normalized = str(rule_id).strip()
+        for idx, rule in enumerate(self._rules):
+            if rule.rule_id == normalized:
+                return idx
+        return -1
+
+    def _select_rule_by_id(self, rule_id: str) -> None:
+        row = self._row_for_rule_id(rule_id)
+        if row < 0:
+            return
+        # Clicking the already-selected row does not emit currentRowChanged.
+        # Keep visual selection and editor state in sync explicitly.
+        if self.rule_list.currentRow() == row:
+            self._active_rule_id = self._rules[row].rule_id
+            self._update_rule_row_selection_state()
+            self._populate_rule_details(self._rules[row])
+            return
+        self.rule_list.setCurrentRow(row)
+
+    def _update_rule_row_selection_state(self) -> None:
+        current_rule_id = str(self._active_rule_id or "").strip()
+        if not current_rule_id:
+            current_row = self.rule_list.currentRow()
+            if 0 <= current_row < len(self._rules):
+                current_rule_id = self._rules[current_row].rule_id
+        for rule_id, row_widget in self._rule_row_widgets.items():
+            row_widget.set_selected(rule_id == current_rule_id)
 
     def _show_selected_block_editor(self, row: int) -> None:
         self._selected_nested_condition = None
@@ -1369,7 +3164,9 @@ class AutomationTab(QWidget):
         if current is None:
             return
         target = max(44, current.sizeHint().height())
-        self.block_editor.setFixedHeight(target)
+        self.block_editor.setMinimumHeight(target)
+        self.block_editor.setMaximumHeight(16_777_215)
+        self.block_editor.updateGeometry()
 
     def _load_trigger_block(self, block: dict[str, object]) -> None:
         idx = self.trigger_mode.findData(str(block.get("trigger_type", "measurement")))
@@ -1392,19 +3189,150 @@ class AutomationTab(QWidget):
 
     def _load_action_block(self, block: dict[str, object]) -> None:
         self._set_combo_by_data(self.action_device, block.get("device_id", ""))
-        self._set_combo_by_data(self.action_state, bool(block.get("value", False)))
+        action_type = str(block.get("action_type", "power")).strip().lower() or "power"
+        if action_type == "inverter_settings":
+            raw_changes = block.get("changes", block.get("value", []))
+            parsed_changes = raw_changes if isinstance(raw_changes, list) else []
+            self._load_inverter_action_rows(
+                [item for item in parsed_changes if isinstance(item, dict)]
+            )
+        else:
+            self._set_combo_by_data(self.action_state, bool(block.get("value", False)))
         self.action_retries.setValue(max(0, int(block.get("retries", 0) or 0)))
         self.action_retry_delay.setValue(float(block.get("retry_delay_sec", 1.0) or 1.0))
+        self._update_action_editor_mode()
 
     def _load_gate_block(self, block: dict[str, object]) -> None:
         mode = str(block.get("mode", "and")).strip().lower() or "and"
         self._set_combo_by_data(self.gate_mode, mode)
 
+    @staticmethod
+    def _ensure_block_id(block: dict[str, object]) -> str:
+        block_id = str(block.get("_id", "")).strip()
+        if block_id:
+            return block_id
+        new_id = uuid.uuid4().hex
+        block["_id"] = new_id
+        return new_id
+
+    @staticmethod
+    def _gate_children(block: dict[str, object]) -> list[dict[str, object]]:
+        raw = block.get("conditions", [])
+        if not isinstance(raw, list):
+            return []
+        normalized: list[dict[str, object]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            child_type = str(item.get("type", "")).strip().lower()
+            if child_type not in {"condition", "gate"}:
+                continue
+            normalized.append(dict(item))
+        return normalized
+
+    def _gate_child_at(self, gate_block: dict[str, object], child_index: int) -> dict[str, object] | None:
+        path = self._gate_child_path_from_flat_index(gate_block, child_index)
+        if path is None:
+            return None
+        return self._gate_child_at_path(gate_block, path)
+
+    def _set_gate_child_at(self, gate_block: dict[str, object], child_index: int, child_block: dict[str, object]) -> bool:
+        path = self._gate_child_path_from_flat_index(gate_block, child_index)
+        if path is None:
+            return False
+        return self._set_gate_child_at_path(gate_block, path, child_block)
+
+    @classmethod
+    def _gate_child_paths(cls, gate_block: dict[str, object], prefix: tuple[int, ...] = ()) -> list[tuple[int, ...]]:
+        paths: list[tuple[int, ...]] = []
+        children = cls._gate_children(gate_block)
+        for idx, child in enumerate(children):
+            path = prefix + (idx,)
+            paths.append(path)
+            if str(child.get("type", "")).strip().lower() == "gate":
+                paths.extend(cls._gate_child_paths(child, path))
+        return paths
+
+    @classmethod
+    def _gate_child_path_from_flat_index(cls, gate_block: dict[str, object], child_index: int) -> tuple[int, ...] | None:
+        paths = cls._gate_child_paths(gate_block)
+        if child_index < 0 or child_index >= len(paths):
+            return None
+        return paths[child_index]
+
+    @classmethod
+    def _gate_child_at_path(cls, gate_block: dict[str, object], path: tuple[int, ...]) -> dict[str, object] | None:
+        current = dict(gate_block)
+        for depth, idx in enumerate(path):
+            children = cls._gate_children(current)
+            if idx < 0 or idx >= len(children):
+                return None
+            child = dict(children[idx])
+            if depth == len(path) - 1:
+                return child
+            if str(child.get("type", "")).strip().lower() != "gate":
+                return None
+            current = child
+        return None
+
+    @classmethod
+    def _set_gate_child_at_path(cls, gate_block: dict[str, object], path: tuple[int, ...], child_block: dict[str, object]) -> bool:
+        if not path:
+            return False
+        children = cls._gate_children(gate_block)
+        index = path[0]
+        if index < 0 or index >= len(children):
+            return False
+        if len(path) == 1:
+            children[index] = dict(child_block)
+            gate_block["conditions"] = children
+            return True
+        parent_child = dict(children[index])
+        if str(parent_child.get("type", "")).strip().lower() != "gate":
+            return False
+        if not cls._set_gate_child_at_path(parent_child, path[1:], child_block):
+            return False
+        children[index] = parent_child
+        gate_block["conditions"] = children
+        return True
+
+    @classmethod
+    def _pop_gate_child_at_path(cls, gate_block: dict[str, object], path: tuple[int, ...]) -> dict[str, object] | None:
+        if not path:
+            return None
+        children = cls._gate_children(gate_block)
+        index = path[0]
+        if index < 0 or index >= len(children):
+            return None
+        if len(path) == 1:
+            child = dict(children.pop(index))
+            gate_block["conditions"] = children
+            return child
+        parent_child = dict(children[index])
+        if str(parent_child.get("type", "")).strip().lower() != "gate":
+            return None
+        removed = cls._pop_gate_child_at_path(parent_child, path[1:])
+        if removed is None:
+            return None
+        children[index] = parent_child
+        gate_block["conditions"] = children
+        return removed
+
+    @classmethod
+    def _append_child_to_gate_path(cls, gate_block: dict[str, object], gate_path: tuple[int, ...], child_block: dict[str, object]) -> bool:
+        target_gate = cls._gate_child_at_path(gate_block, gate_path)
+        if not isinstance(target_gate, dict) or str(target_gate.get("type", "")).strip().lower() != "gate":
+            return False
+        nested_children = cls._gate_children(target_gate)
+        nested_children.append(dict(child_block))
+        target_gate["conditions"] = nested_children
+        return cls._set_gate_child_at_path(gate_block, gate_path, target_gate)
+
     def _save_block_editor(self) -> None:
         if self._syncing:
             return
         if self._selected_nested_condition is not None:
-            gate_row, condition_row = self._selected_nested_condition
+            gate_row, child_row = self._selected_nested_condition
             if gate_row < 0 or gate_row >= self.canvas.count():
                 return
             gate_item = self.canvas.item(gate_row)
@@ -1413,23 +3341,33 @@ class AutomationTab(QWidget):
             gate_block = gate_item.data(Qt.ItemDataRole.UserRole)
             if not isinstance(gate_block, dict) or str(gate_block.get("type", "")).strip().lower() != "gate":
                 return
-            conditions = gate_block.get("conditions", [])
-            if not isinstance(conditions, list):
+            child_block = self._gate_child_at(gate_block, child_row)
+            if not isinstance(child_block, dict):
                 return
-            normalized: list[dict[str, object]] = [
-                dict(item)
-                for item in conditions
-                if isinstance(item, dict) and str(item.get("type", "")).strip().lower() == "condition"
-            ]
-            if condition_row < 0 or condition_row >= len(normalized):
+            child_type = str(child_block.get("type", "")).strip().lower()
+            if child_type == "condition":
+                child_block["device_id"] = self.condition_device.currentData() or ""
+                child_block["metric_key"] = self.condition_metric.currentData() or ""
+                child_block["operator"] = self.condition_operator.currentData() or ">="
+                child_block["value"] = float(self.condition_value.value())
+                child_block.pop("true_target_id", None)
+                child_block.pop("false_target_id", None)
+                child_block.pop("next_target_id", None)
+                child_block.pop("true_target_ids", None)
+                child_block.pop("false_target_ids", None)
+                child_block.pop("next_target_ids", None)
+            elif child_type == "gate":
+                child_block["mode"] = str(self.gate_mode.currentData() or "and")
+                child_block.pop("true_target_id", None)
+                child_block.pop("false_target_id", None)
+                child_block.pop("next_target_id", None)
+                child_block.pop("true_target_ids", None)
+                child_block.pop("false_target_ids", None)
+                child_block.pop("next_target_ids", None)
+            else:
                 return
-            block = normalized[condition_row]
-            block["device_id"] = self.condition_device.currentData() or ""
-            block["metric_key"] = self.condition_metric.currentData() or ""
-            block["operator"] = self.condition_operator.currentData() or ">="
-            block["value"] = float(self.condition_value.value())
-            normalized[condition_row] = block
-            gate_block["conditions"] = normalized
+            if not self._set_gate_child_at(gate_block, child_row, child_block):
+                return
             gate_item.setData(Qt.ItemDataRole.UserRole, gate_block)
             gate_item.setText(self._block_label(gate_block))
             self.canvas.setCurrentRow(gate_row)
@@ -1456,14 +3394,24 @@ class AutomationTab(QWidget):
             block["metric_key"] = self.condition_metric.currentData() or ""
             block["operator"] = self.condition_operator.currentData() or ">="
             block["value"] = float(self.condition_value.value())
+            block.pop("next_target_id", None)
+            block.pop("next_target_ids", None)
         elif kind == "gate":
             block["mode"] = str(self.gate_mode.currentData() or "and")
+            block.pop("next_target_id", None)
+            block.pop("next_target_ids", None)
         elif kind == "delay":
             block["seconds"] = float(self.delay_seconds.value())
         elif kind == "action":
             block["device_id"] = self.action_device.currentData() or ""
-            block["action_type"] = "power"
-            block["value"] = bool(self.action_state.currentData())
+            if str(block.get("device_id", "")).strip() == INVERTER_DEVICE_ID:
+                block["action_type"] = "inverter_settings"
+                block["changes"] = self._collect_inverter_action_changes()
+                block.pop("value", None)
+            else:
+                block["action_type"] = "power"
+                block["value"] = bool(self.action_state.currentData())
+                block.pop("changes", None)
             block["retries"] = int(self.action_retries.value())
             block["retry_delay_sec"] = float(self.action_retry_delay.value())
         item.setData(Qt.ItemDataRole.UserRole, block)
@@ -1478,17 +3426,25 @@ class AutomationTab(QWidget):
         rule = self._current_rule()
         if rule is None:
             return
-        item = self.rule_list.currentItem()
-        if item is not None:
-            name = item.text().strip() or rule.name
-            enabled = item.checkState() == Qt.CheckState.Checked
-        else:
-            name = rule.name
-            enabled = rule.enabled
+        name = rule.name
+        enabled = rule.enabled
         blocks: list[dict[str, object]] = []
         for idx in range(self.canvas.count()):
-            block = self.canvas.item(idx).data(Qt.ItemDataRole.UserRole)
+            item = self.canvas.item(idx)
+            if item is None:
+                continue
+            block = item.data(Qt.ItemDataRole.UserRole)
             if isinstance(block, dict):
+                self._ensure_block_id(block)
+                if str(block.get("type", "")).strip().lower() not in {"condition", "gate"}:
+                    block.pop("true_target_id", None)
+                    block.pop("false_target_id", None)
+                    block.pop("true_target_ids", None)
+                    block.pop("false_target_ids", None)
+                if str(block.get("type", "")).strip().lower() == "end":
+                    block.pop("next_target_id", None)
+                    block.pop("next_target_ids", None)
+                item.setData(Qt.ItemDataRole.UserRole, block)
                 blocks.append(dict(block))
         trigger = next((item for item in blocks if str(item.get("type", "")).strip().lower() == "trigger"), None)
         conditions = [
@@ -1499,12 +3455,7 @@ class AutomationTab(QWidget):
         for block in blocks:
             if str(block.get("type", "")).strip().lower() != "gate":
                 continue
-            embedded = block.get("conditions", [])
-            if not isinstance(embedded, list):
-                continue
-            for embedded_item in embedded:
-                if isinstance(embedded_item, dict) and str(embedded_item.get("type", "")).strip().lower() == "condition":
-                    conditions.append(dict(embedded_item))
+            conditions.extend(self._collect_conditions_from_gate(block))
         actions = [
             item
             for item in blocks
@@ -1518,11 +3469,7 @@ class AutomationTab(QWidget):
 
         rule.name = name
         rule.enabled = enabled
-        gate_modes = [
-            str(item.get("mode", "")).strip().lower()
-            for item in blocks
-            if str(item.get("type", "")).strip().lower() == "gate"
-        ]
+        gate_modes = self._collect_gate_modes(blocks)
         if "or" in gate_modes:
             rule.conditions_logic = "any"
         elif "and" in gate_modes:
@@ -1559,11 +3506,18 @@ class AutomationTab(QWidget):
 
         parsed_actions: list[AutomationAction] = []
         for block in actions:
+            action_type = str(block.get("action_type", "power")) or "power"
+            raw_value: object
+            if action_type.strip().lower() == "inverter_settings":
+                raw_changes = block.get("changes", [])
+                raw_value = [dict(item) for item in raw_changes] if isinstance(raw_changes, list) else []
+            else:
+                raw_value = bool(block.get("value", False))
             parsed_actions.append(
                 AutomationAction(
-                    action_type=str(block.get("action_type", "power")) or "power",
+                    action_type=action_type,
                     device_id=str(block.get("device_id", "")),
-                    value=bool(block.get("value", False)),
+                    value=raw_value,
                     retries=max(0, int(block.get("retries", 0) or 0)),
                     retry_delay_sec=max(0.0, float(block.get("retry_delay_sec", 1.0) or 1.0)),
                 )
@@ -1572,6 +3526,20 @@ class AutomationTab(QWidget):
 
         self._refresh_rule_list(select_rule_id=rule.rule_id)
         self.rules_changed.emit()
+
+    @staticmethod
+    def _expand_gate_children_for_graph(gate_block: dict[str, object]) -> list[dict[str, object]]:
+        expanded: list[dict[str, object]] = []
+        for child in AutomationTab._gate_children(gate_block):
+            child_type = str(child.get("type", "")).strip().lower()
+            if child_type == "gate":
+                expanded.extend(AutomationTab._expand_gate_children_for_graph(child))
+                gate_only = dict(child)
+                gate_only.pop("conditions", None)
+                expanded.append(gate_only)
+            elif child_type == "condition":
+                expanded.append(dict(child))
+        return expanded
 
     @staticmethod
     def _expand_blocks_for_graph(blocks: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -1583,18 +3551,35 @@ class AutomationTab(QWidget):
             if kind != "gate":
                 expanded.append(dict(block))
                 continue
-            embedded = block.get("conditions", [])
-            if isinstance(embedded, list):
-                for embedded_item in embedded:
-                    if not isinstance(embedded_item, dict):
-                        continue
-                    if str(embedded_item.get("type", "")).strip().lower() != "condition":
-                        continue
-                    expanded.append(dict(embedded_item))
+            expanded.extend(AutomationTab._expand_gate_children_for_graph(block))
             gate_only = dict(block)
             gate_only.pop("conditions", None)
             expanded.append(gate_only)
         return expanded
+
+    @staticmethod
+    def _collect_conditions_from_gate(gate_block: dict[str, object]) -> list[dict[str, object]]:
+        collected: list[dict[str, object]] = []
+        for child in AutomationTab._gate_children(gate_block):
+            child_type = str(child.get("type", "")).strip().lower()
+            if child_type == "condition":
+                collected.append(dict(child))
+            elif child_type == "gate":
+                collected.extend(AutomationTab._collect_conditions_from_gate(child))
+        return collected
+
+    @staticmethod
+    def _collect_gate_modes(blocks: list[dict[str, object]]) -> list[str]:
+        modes: list[str] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("type", "")).strip().lower() == "gate":
+                modes.append(str(block.get("mode", "")).strip().lower())
+                nested = AutomationTab._gate_children(block)
+                if nested:
+                    modes.extend(AutomationTab._collect_gate_modes(nested))
+        return modes
 
     @staticmethod
     def _set_combo_by_data(combo: QComboBox, value: object) -> None:
@@ -1610,6 +3595,22 @@ class AutomationTab(QWidget):
         for widget in widgets:
             widget.setMinimumWidth(0)
             widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    @staticmethod
+    def _ensure_combo_popup_width(combo: QComboBox) -> None:
+        if combo.count() <= 0:
+            return
+        view = combo.view()
+        if view is None:
+            return
+        metrics = QFontMetrics(combo.font())
+        longest = 0
+        for index in range(combo.count()):
+            text = combo.itemText(index)
+            if text:
+                longest = max(longest, metrics.horizontalAdvance(text))
+        padding = combo.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent) + 40
+        view.setMinimumWidth(max(combo.width(), longest + padding))
 
     def _refresh_trigger_metric_options(self) -> None:
         self._refresh_metric_combo_for(self.trigger_metric, self.trigger_device)
@@ -1638,6 +3639,7 @@ class AutomationTab(QWidget):
         index = metric_combo.findData(current)
         metric_combo.setCurrentIndex(index if index >= 0 and metric_combo.count() > 0 else 0)
         metric_combo.blockSignals(False)
+        self._ensure_combo_popup_width(metric_combo)
 
     def _metric_display_text(self, metric_key: str, *, include_code: bool = False) -> str:
         key = str(metric_key or "").strip().lower()
@@ -1836,34 +3838,41 @@ class AutomationTab(QWidget):
         gate_block = gate_item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(gate_block, dict) or str(gate_block.get("type", "")).strip().lower() != "gate":
             return
-        conditions = gate_block.get("conditions", [])
-        if not isinstance(conditions, list):
-            return
-        normalized: list[dict[str, object]] = [
-            dict(item)
-            for item in conditions
-            if isinstance(item, dict) and str(item.get("type", "")).strip().lower() == "condition"
-        ]
-        if condition_row < 0 or condition_row >= len(normalized):
+        child = self._gate_child_at(gate_block, condition_row)
+        if not isinstance(child, dict):
             return
         if self.canvas.currentRow() != gate_row:
             self.canvas.setCurrentRow(gate_row)
         self._selected_nested_condition = (gate_row, condition_row)
         self.diagram_view.set_selected_gate_condition(gate_row, condition_row)
         self._syncing = True
-        self.block_editor.setCurrentIndex(2)
-        self._load_condition_block(normalized[condition_row])
+        child_type = str(child.get("type", "")).strip().lower()
+        if child_type == "condition":
+            self.block_editor.setCurrentIndex(2)
+            self._load_condition_block(child)
+        elif child_type == "gate":
+            self.block_editor.setCurrentIndex(3)
+            self._load_gate_block(child)
         self._syncing = False
 
     def _apply_diagram_reorder(self, blocks: list[dict[str, object]]) -> None:
         if self._syncing:
             return
+        normalized_blocks = [dict(item) for item in blocks if isinstance(item, dict)]
+        start_block = None
+        rest_blocks: list[dict[str, object]] = []
+        for block in normalized_blocks:
+            if start_block is None and str(block.get("type", "")).strip().lower() == "start":
+                start_block = block
+                continue
+            rest_blocks.append(block)
+        if start_block is None:
+            start_block = {"type": "start"}
+        normalized_blocks = [start_block, *rest_blocks]
         self._syncing = True
         selected_row = self.diagram_view.selected_index()
         self.canvas.clear()
-        for block in blocks:
-            if not isinstance(block, dict):
-                continue
+        for block in normalized_blocks:
             item = QListWidgetItem(self._block_label(block))
             item.setData(Qt.ItemDataRole.UserRole, dict(block))
             self.canvas.addItem(item)
@@ -1876,12 +3885,154 @@ class AutomationTab(QWidget):
     def _remove_block_by_index(self, row: int) -> None:
         if row < 0 or row >= self.canvas.count():
             return
+        item = self.canvas.item(row)
+        if item is not None:
+            block = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(block, dict) and str(block.get("type", "")).strip().lower() == "start":
+                return
         self._selected_nested_condition = None
         self.canvas.takeItem(row)
         if self.canvas.count() > 0:
             self.canvas.setCurrentRow(max(0, row - 1))
         else:
             self.block_editor.setCurrentIndex(0)
+        self._save_current_rule()
+
+    @staticmethod
+    def _branch_keys(branch: str) -> tuple[str, str]:
+        if branch == "next":
+            return ("next_target_id", "next_target_ids")
+        if branch == "true":
+            return ("true_target_id", "true_target_ids")
+        return ("false_target_id", "false_target_ids")
+
+    def _get_branch_targets(self, block: dict[str, object], branch: str) -> list[str]:
+        single_key, list_key = self._branch_keys(branch)
+        targets: list[str] = []
+        raw_list = block.get(list_key, [])
+        if isinstance(raw_list, list):
+            for value in raw_list:
+                target_id = str(value).strip()
+                if target_id and target_id not in targets:
+                    targets.append(target_id)
+        raw_single = str(block.get(single_key, "")).strip()
+        if raw_single and raw_single not in targets:
+            targets.append(raw_single)
+        return targets
+
+    def _set_branch_targets(self, block: dict[str, object], branch: str, targets: list[str]) -> None:
+        single_key, list_key = self._branch_keys(branch)
+        normalized = [str(value).strip() for value in targets if str(value).strip()]
+        deduped: list[str] = []
+        for value in normalized:
+            if value not in deduped:
+                deduped.append(value)
+        if not deduped:
+            block.pop(single_key, None)
+            block.pop(list_key, None)
+            return
+        block[list_key] = deduped
+        block[single_key] = deduped[0]
+
+    def _target_has_opposite_conditional_branch(self, target_id: str, branch: str, source_row: int) -> bool:
+        opposite_branch = "false" if branch == "true" else "true"
+        for row in range(self.canvas.count()):
+            item = self.canvas.item(row)
+            if item is None:
+                continue
+            block = item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(block, dict):
+                continue
+            source_type = str(block.get("type", "")).strip().lower()
+            if source_type not in {"condition", "gate"}:
+                continue
+            if row == source_row:
+                continue
+            if target_id in self._get_branch_targets(block, opposite_branch):
+                return True
+        return False
+
+    def _set_branch_connection_from_diagram(self, source_row: int, branch: str, target_row: int) -> None:
+        if source_row < 0 or target_row < 0:
+            return
+        if source_row >= self.canvas.count() or target_row >= self.canvas.count() or source_row == target_row:
+            return
+        source_item = self.canvas.item(source_row)
+        target_item = self.canvas.item(target_row)
+        if source_item is None or target_item is None:
+            return
+        source_block = source_item.data(Qt.ItemDataRole.UserRole)
+        target_block = target_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(source_block, dict) or not isinstance(target_block, dict):
+            return
+        source_type = str(source_block.get("type", "")).strip().lower()
+        if source_type == "end":
+            return
+        if branch not in {"true", "false", "next"}:
+            return
+        if source_type in {"condition", "gate"}:
+            if branch not in {"true", "false"}:
+                return
+        else:
+            if branch != "next":
+                return
+        target_id = self._ensure_block_id(target_block)
+        self._ensure_block_id(source_block)
+        if branch in {"true", "false"}:
+            opposite_branch = "false" if branch == "true" else "true"
+            if target_id in self._get_branch_targets(source_block, opposite_branch):
+                return
+            if self._target_has_opposite_conditional_branch(target_id, branch, source_row):
+                return
+        targets = self._get_branch_targets(source_block, branch)
+        if target_id not in targets:
+            targets.append(target_id)
+        self._set_branch_targets(source_block, branch, targets)
+        source_item.setData(Qt.ItemDataRole.UserRole, source_block)
+        target_item.setData(Qt.ItemDataRole.UserRole, target_block)
+        source_item.setText(self._block_label(source_block))
+        self.canvas.setCurrentRow(source_row)
+        self._sync_diagram_from_canvas()
+        self._save_current_rule()
+
+    def _clear_branch_connection_from_diagram(self, source_row: int, branch: str, target_row: int) -> None:
+        if source_row < 0 or source_row >= self.canvas.count():
+            return
+        source_item = self.canvas.item(source_row)
+        if source_item is None:
+            return
+        source_block = source_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(source_block, dict):
+            return
+        source_type = str(source_block.get("type", "")).strip().lower()
+        if source_type == "end":
+            return
+        if branch not in {"true", "false", "next"}:
+            return
+        if source_type in {"condition", "gate"} and branch not in {"true", "false"}:
+            return
+        if source_type not in {"condition", "gate"} and branch != "next":
+            return
+        target_id = ""
+        if 0 <= target_row < self.canvas.count():
+            target_item = self.canvas.item(target_row)
+            if target_item is not None:
+                target_block = target_item.data(Qt.ItemDataRole.UserRole)
+                if isinstance(target_block, dict):
+                    target_id = self._ensure_block_id(target_block)
+                    target_item.setData(Qt.ItemDataRole.UserRole, target_block)
+        targets = self._get_branch_targets(source_block, branch)
+        if not targets:
+            return
+        if target_id:
+            targets = [value for value in targets if value != target_id]
+        else:
+            targets = []
+        self._set_branch_targets(source_block, branch, targets)
+        source_item.setData(Qt.ItemDataRole.UserRole, source_block)
+        source_item.setText(self._block_label(source_block))
+        self.canvas.setCurrentRow(source_row)
+        self._sync_diagram_from_canvas()
         self._save_current_rule()
 
     def _move_condition_into_gate_from_diagram(self, source_row: int, gate_row: int) -> None:
@@ -1897,21 +4048,16 @@ class AutomationTab(QWidget):
         gate_block = gate_item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(source_block, dict) or not isinstance(gate_block, dict):
             return
-        if str(source_block.get("type", "")).strip().lower() != "condition":
+        source_type = str(source_block.get("type", "")).strip().lower()
+        if source_type not in {"condition", "gate"}:
             return
         if str(gate_block.get("type", "")).strip().lower() != "gate":
             return
 
-        condition = dict(source_block)
-        condition["type"] = "condition"
-        conditions = gate_block.get("conditions", [])
-        normalized: list[dict[str, object]] = []
-        if isinstance(conditions, list):
-            for item in conditions:
-                if isinstance(item, dict) and str(item.get("type", "")).strip().lower() == "condition":
-                    normalized.append(dict(item))
-
-        normalized.append(condition)
+        child_block = dict(source_block)
+        child_block["type"] = source_type
+        normalized = self._gate_children(gate_block)
+        normalized.append(child_block)
         gate_block["conditions"] = normalized
         gate_item.setData(Qt.ItemDataRole.UserRole, gate_block)
         gate_item.setText(self._block_label(gate_block))
@@ -1920,6 +4066,111 @@ class AutomationTab(QWidget):
         updated_gate_row = gate_row - 1 if source_row < gate_row else gate_row
         if 0 <= updated_gate_row < self.canvas.count():
             self.canvas.setCurrentRow(updated_gate_row)
+        self._selected_nested_condition = None
+        self._sync_diagram_from_canvas()
+        self._save_current_rule()
+
+    def _move_condition_into_nested_gate_from_diagram(self, source_row: int, gate_row: int, child_row: int) -> None:
+        if source_row < 0 or gate_row < 0 or source_row >= self.canvas.count() or gate_row >= self.canvas.count():
+            return
+        if source_row == gate_row:
+            return
+        source_item = self.canvas.item(source_row)
+        gate_item = self.canvas.item(gate_row)
+        if source_item is None or gate_item is None:
+            return
+        source_block = source_item.data(Qt.ItemDataRole.UserRole)
+        gate_block = gate_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(source_block, dict) or not isinstance(gate_block, dict):
+            return
+        source_type = str(source_block.get("type", "")).strip().lower()
+        if source_type not in {"condition", "gate"}:
+            return
+        if str(gate_block.get("type", "")).strip().lower() != "gate":
+            return
+        target_path = self._gate_child_path_from_flat_index(gate_block, child_row)
+        if target_path is None:
+            return
+        target_child = self._gate_child_at_path(gate_block, target_path)
+        if not isinstance(target_child, dict) or str(target_child.get("type", "")).strip().lower() != "gate":
+            return
+        if not self._append_child_to_gate_path(gate_block, target_path, dict(source_block)):
+            return
+        gate_item.setData(Qt.ItemDataRole.UserRole, gate_block)
+        gate_item.setText(self._block_label(gate_block))
+
+        self.canvas.takeItem(source_row)
+        updated_gate_row = gate_row - 1 if source_row < gate_row else gate_row
+        if 0 <= updated_gate_row < self.canvas.count():
+            self.canvas.setCurrentRow(updated_gate_row)
+        self._selected_nested_condition = None
+        self._sync_diagram_from_canvas()
+        self._save_current_rule()
+
+    def _move_gate_child_into_nested_gate_in_diagram(self, gate_row: int, source_child_row: int, target_gate_child_row: int) -> None:
+        if gate_row < 0 or gate_row >= self.canvas.count():
+            return
+        gate_item = self.canvas.item(gate_row)
+        if gate_item is None:
+            return
+        gate_block = gate_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(gate_block, dict) or str(gate_block.get("type", "")).strip().lower() != "gate":
+            return
+        source_path = self._gate_child_path_from_flat_index(gate_block, source_child_row)
+        target_path = self._gate_child_path_from_flat_index(gate_block, target_gate_child_row)
+        if source_path is None or target_path is None or source_path == target_path:
+            return
+        source_child = self._gate_child_at_path(gate_block, source_path)
+        if not isinstance(source_child, dict):
+            return
+        source_type = str(source_child.get("type", "")).strip().lower()
+        if source_type not in {"condition", "gate"}:
+            return
+        target_child = self._gate_child_at_path(gate_block, target_path)
+        if not isinstance(target_child, dict) or str(target_child.get("type", "")).strip().lower() != "gate":
+            return
+        if source_type == "gate" and len(target_path) >= len(source_path) and target_path[: len(source_path)] == source_path:
+            return
+
+        removed = self._pop_gate_child_at_path(gate_block, source_path)
+        if removed is None:
+            return
+        adjusted_target_path = target_path
+        if len(source_path) == len(target_path) and source_path[:-1] == target_path[:-1] and source_path[-1] < target_path[-1]:
+            adjusted_target_path = target_path[:-1] + (target_path[-1] - 1,)
+        if not self._append_child_to_gate_path(gate_block, adjusted_target_path, removed):
+            return
+        gate_item.setData(Qt.ItemDataRole.UserRole, gate_block)
+        gate_item.setText(self._block_label(gate_block))
+        self.canvas.setCurrentRow(gate_row)
+        self._selected_nested_condition = None
+        self._sync_diagram_from_canvas()
+        self._save_current_rule()
+
+    def _move_gate_child_into_parent_gate_in_diagram(self, gate_row: int, source_child_row: int) -> None:
+        if gate_row < 0 or gate_row >= self.canvas.count():
+            return
+        gate_item = self.canvas.item(gate_row)
+        if gate_item is None:
+            return
+        gate_block = gate_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(gate_block, dict) or str(gate_block.get("type", "")).strip().lower() != "gate":
+            return
+        source_path = self._gate_child_path_from_flat_index(gate_block, source_child_row)
+        if source_path is None:
+            return
+        # Already at parent level; no move needed.
+        if len(source_path) <= 1:
+            return
+        moved_child = self._pop_gate_child_at_path(gate_block, source_path)
+        if not isinstance(moved_child, dict):
+            return
+        parent_children = self._gate_children(gate_block)
+        parent_children.append(moved_child)
+        gate_block["conditions"] = parent_children
+        gate_item.setData(Qt.ItemDataRole.UserRole, gate_block)
+        gate_item.setText(self._block_label(gate_block))
+        self.canvas.setCurrentRow(gate_row)
         self._selected_nested_condition = None
         self._sync_diagram_from_canvas()
         self._save_current_rule()
@@ -1933,18 +4184,12 @@ class AutomationTab(QWidget):
         gate_block = gate_item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(gate_block, dict) or str(gate_block.get("type", "")).strip().lower() != "gate":
             return
-        conditions = gate_block.get("conditions", [])
-        if not isinstance(conditions, list):
+        target_path = self._gate_child_path_from_flat_index(gate_block, condition_row)
+        if target_path is None:
             return
-        normalized: list[dict[str, object]] = [
-            dict(item)
-            for item in conditions
-            if isinstance(item, dict) and str(item.get("type", "")).strip().lower() == "condition"
-        ]
-        if condition_row < 0 or condition_row >= len(normalized):
+        removed = self._pop_gate_child_at_path(gate_block, target_path)
+        if removed is None:
             return
-        normalized.pop(condition_row)
-        gate_block["conditions"] = normalized
         gate_item.setData(Qt.ItemDataRole.UserRole, gate_block)
         gate_item.setText(self._block_label(gate_block))
         self.canvas.setCurrentRow(gate_row)
@@ -1961,30 +4206,45 @@ class AutomationTab(QWidget):
         gate_block = gate_item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(gate_block, dict) or str(gate_block.get("type", "")).strip().lower() != "gate":
             return
-        conditions = gate_block.get("conditions", [])
-        if not isinstance(conditions, list):
+        source_path = self._gate_child_path_from_flat_index(gate_block, condition_row)
+        if source_path is None:
             return
-        normalized: list[dict[str, object]] = [
-            dict(item)
-            for item in conditions
-            if isinstance(item, dict) and str(item.get("type", "")).strip().lower() == "condition"
-        ]
-        if condition_row < 0 or condition_row >= len(normalized):
+        if not source_path:
             return
-        target = condition_row + delta
-        if target < 0 or target >= len(normalized):
+        parent_path = source_path[:-1]
+        source_idx = source_path[-1]
+        if parent_path:
+            parent_gate = self._gate_child_at_path(gate_block, parent_path)
+            if not isinstance(parent_gate, dict) or str(parent_gate.get("type", "")).strip().lower() != "gate":
+                return
+        else:
+            parent_gate = gate_block
+        siblings = self._gate_children(parent_gate)
+        if source_idx < 0 or source_idx >= len(siblings):
             return
-        normalized[condition_row], normalized[target] = normalized[target], normalized[condition_row]
-        gate_block["conditions"] = normalized
+        target_idx = source_idx + delta
+        if target_idx < 0 or target_idx >= len(siblings):
+            return
+        siblings[source_idx], siblings[target_idx] = siblings[target_idx], siblings[source_idx]
+        if parent_path:
+            parent_gate["conditions"] = siblings
+            if not self._set_gate_child_at_path(gate_block, parent_path, parent_gate):
+                return
+        else:
+            gate_block["conditions"] = siblings
         gate_item.setData(Qt.ItemDataRole.UserRole, gate_block)
         gate_item.setText(self._block_label(gate_block))
         self.canvas.setCurrentRow(gate_row)
-        self._selected_nested_condition = (gate_row, target)
+        paths = self._gate_child_paths(gate_block)
+        new_path = parent_path + (target_idx,)
+        new_flat = next((idx for idx, path in enumerate(paths) if path == new_path), -1)
+        self._selected_nested_condition = (gate_row, new_flat) if new_flat >= 0 else None
         self._sync_diagram_from_canvas()
         self._save_current_rule()
 
     def _add_palette_block_into_gate(self, block_type: str, gate_row: int) -> None:
-        if str(block_type).strip().lower() != "condition":
+        normalized_type = str(block_type).strip().lower()
+        if normalized_type not in {"condition", "gate"}:
             self._add_block(block_type)
             return
         if gate_row < 0 or gate_row >= self.canvas.count():
@@ -1996,15 +4256,45 @@ class AutomationTab(QWidget):
         if not isinstance(gate_block, dict) or str(gate_block.get("type", "")).strip().lower() != "gate":
             return
 
-        new_condition: dict[str, object] = {"type": "condition", "operator": ">=", "value": 0.0}
-        conditions = gate_block.get("conditions", [])
-        normalized: list[dict[str, object]] = []
-        if isinstance(conditions, list):
-            for item in conditions:
-                if isinstance(item, dict) and str(item.get("type", "")).strip().lower() == "condition":
-                    normalized.append(dict(item))
-        normalized.append(new_condition)
+        if normalized_type == "gate":
+            new_child: dict[str, object] = {"type": "gate", "mode": "and", "conditions": []}
+        else:
+            new_child = {"type": "condition", "operator": ">=", "value": 0.0}
+        normalized = self._gate_children(gate_block)
+        normalized.append(new_child)
         gate_block["conditions"] = normalized
+        gate_item.setData(Qt.ItemDataRole.UserRole, gate_block)
+        gate_item.setText(self._block_label(gate_block))
+        self.canvas.setCurrentRow(gate_row)
+        self._selected_nested_condition = None
+        self._sync_diagram_from_canvas()
+        self._save_current_rule()
+
+    def _add_palette_block_into_nested_gate(self, block_type: str, gate_row: int, child_row: int) -> None:
+        normalized_type = str(block_type).strip().lower()
+        if normalized_type not in {"condition", "gate"}:
+            self._add_block(block_type)
+            return
+        if gate_row < 0 or gate_row >= self.canvas.count():
+            return
+        gate_item = self.canvas.item(gate_row)
+        if gate_item is None:
+            return
+        gate_block = gate_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(gate_block, dict) or str(gate_block.get("type", "")).strip().lower() != "gate":
+            return
+        target_path = self._gate_child_path_from_flat_index(gate_block, child_row)
+        if target_path is None:
+            return
+        target_child = self._gate_child_at_path(gate_block, target_path)
+        if not isinstance(target_child, dict) or str(target_child.get("type", "")).strip().lower() != "gate":
+            return
+        if normalized_type == "gate":
+            new_child: dict[str, object] = {"type": "gate", "mode": "and", "conditions": []}
+        else:
+            new_child = {"type": "condition", "operator": ">=", "value": 0.0}
+        if not self._append_child_to_gate_path(gate_block, target_path, new_child):
+            return
         gate_item.setData(Qt.ItemDataRole.UserRole, gate_block)
         gate_item.setText(self._block_label(gate_block))
         self.canvas.setCurrentRow(gate_row)
@@ -2021,18 +4311,12 @@ class AutomationTab(QWidget):
         gate_block = gate_item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(gate_block, dict) or str(gate_block.get("type", "")).strip().lower() != "gate":
             return
-        conditions = gate_block.get("conditions", [])
-        if not isinstance(conditions, list):
+        target_path = self._gate_child_path_from_flat_index(gate_block, condition_row)
+        if target_path is None:
             return
-        normalized: list[dict[str, object]] = [
-            dict(item)
-            for item in conditions
-            if isinstance(item, dict) and str(item.get("type", "")).strip().lower() == "condition"
-        ]
-        if condition_row < 0 or condition_row >= len(normalized):
+        condition = self._pop_gate_child_at_path(gate_block, target_path)
+        if not isinstance(condition, dict):
             return
-        condition = dict(normalized.pop(condition_row))
-        gate_block["conditions"] = normalized
         gate_item.setData(Qt.ItemDataRole.UserRole, gate_block)
         gate_item.setText(self._block_label(gate_block))
 
@@ -2046,7 +4330,9 @@ class AutomationTab(QWidget):
         self._save_current_rule()
 
     def _sync_diagram_geometry(self) -> None:
-        return
+        target = max(220, int(self.diagram_view.content_height()))
+        self.diagram_view.setMinimumHeight(target)
+        self.diagram_view.updateGeometry()
 
 
 def _now_label() -> str:

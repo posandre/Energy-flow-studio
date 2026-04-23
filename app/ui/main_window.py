@@ -51,6 +51,7 @@ from app.services.dessmonitor_api import (
     DeviceControlField,
     fetch_device_control_fields,
     fetch_device_control_value,
+    set_device_control_values,
     fetch_device_location,
     humanize_error_text,
     InverterSetting,
@@ -1851,6 +1852,42 @@ class MainWindow(QMainWindow):
         normalized_map = {key: sorted(values) for key, values in measurement_keys_by_device.items()}
         self.automation_tab.set_devices(device_options)
         self.automation_tab.set_measurements_by_device(normalized_map)
+        self.automation_tab.set_inverter_control_fields(self._automation_inverter_control_fields())
+
+    def _automation_inverter_control_fields(self) -> list[dict[str, object]]:
+        merged: dict[str, dict[str, object]] = {}
+        profile = self.active_device_profile
+        if profile is not None:
+            for field in profile.resolved_inverter_control_fields():
+                field_id = field.field_id.strip()
+                if not field_id:
+                    continue
+                merged[field_id] = {
+                    "field_id": field_id,
+                    "label": field.display_name().strip() or field.name.strip() or field_id,
+                    "unit": field.unit.strip(),
+                    "options": [[str(value).strip(), str(label).strip()] for value, label in (field.options or [])],
+                }
+
+        if self._latest_inverter_settings_key == self._active_profile_key():
+            for setting in self._latest_inverter_settings:
+                field_id = setting.field_id.strip()
+                if not field_id:
+                    continue
+                current = merged.get(field_id, {"field_id": field_id, "label": field_id, "unit": "", "options": []})
+                display_name = setting.display_name.strip() or setting.name.strip() or setting.raw_name.strip() or field_id
+                if display_name:
+                    current["label"] = display_name
+                if setting.unit.strip():
+                    current["unit"] = setting.unit.strip()
+                if setting.options:
+                    current["options"] = [[str(value).strip(), str(label).strip()] for value, label in setting.options]
+                merged[field_id] = current
+
+        return sorted(
+            merged.values(),
+            key=lambda item: str(item.get("label", "")).lower(),
+        )
 
     def _handle_automation_rules_changed(self) -> None:
         self._save_profile_automations_from_tab()
@@ -1885,6 +1922,14 @@ class MainWindow(QMainWindow):
             rule,
             tr("Simulation completed: conditions {status}.").format(status=status),
         )
+
+    def _handle_clear_automation_logs(self) -> None:
+        self._automation_logs = []
+        profile_name = self.active_device_profile.profile_name if self.active_device_profile is not None else ""
+        save_profile_automation_logs(profile_name, self._automation_logs)
+        if hasattr(self, "automation_tab"):
+            self.automation_tab.set_logs(self._automation_logs)
+            self.automation_tab.set_analytics(analytics_from_logs(self._automation_logs))
 
     def _evaluate_automations_cycle(self) -> None:
         if self._automation_inflight_cycle or self._close_requested:
@@ -1961,7 +2006,6 @@ class MainWindow(QMainWindow):
 
             action_type = str(step.payload.get("action_type", "power")).strip() or "power"
             action_device_id = str(step.payload.get("device_id", "")).strip()
-            action_value = bool(step.payload.get("value", False))
             try:
                 action_retries = max(0, int(float(step.payload.get("retries", 0) or 0)))
             except (TypeError, ValueError):
@@ -1971,32 +2015,50 @@ class MainWindow(QMainWindow):
             except (TypeError, ValueError):
                 action_retry_delay_sec = 1.0
 
-            if action_type != "power":
-                self._append_automation_log(
-                    "error",
-                    rule,
-                    tr("Unsupported action type: {action_type}").format(action_type=action_type),
-                )
-                continue
-            if not action_device_id:
-                self._append_automation_log("error", rule, tr("Action skipped: no device selected."))
-                continue
             attempt = 0
             max_attempts = max(1, action_retries + 1)
             success = False
+            action_target_label = action_device_id or tr("Inverter")
             while attempt < max_attempts:
                 attempt += 1
-                ok, details = self._execute_automation_power_action(action_device_id, action_value)
+                ok = False
+                details = "unknown"
+                success_message = ""
+                if action_type == "power":
+                    action_value = bool(step.payload.get("value", False))
+                    if not action_device_id:
+                        self._append_automation_log("error", rule, tr("Action skipped: no device selected."))
+                        break
+                    ok, details = self._execute_automation_power_action(action_device_id, action_value)
+                    success_message = tr("Power {state} -> {device_id} (attempt {attempt}/{max_attempts}).").format(
+                        state=(tr("ON") if action_value else tr("OFF")),
+                        device_id=action_device_id,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                    )
+                elif action_type == "inverter_settings":
+                    changes_raw = step.payload.get("changes", step.payload.get("value", []))
+                    ok, details = self._execute_automation_inverter_settings_action(changes_raw)
+                    changes_count = len(changes_raw) if isinstance(changes_raw, list) else 0
+                    success_message = tr(
+                        "Inverter settings updated ({count}) (attempt {attempt}/{max_attempts})."
+                    ).format(
+                        count=changes_count,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                    )
+                else:
+                    self._append_automation_log(
+                        "error",
+                        rule,
+                        tr("Unsupported action type: {action_type}").format(action_type=action_type),
+                    )
+                    break
                 if ok:
                     self._append_automation_log(
                         "ok",
                         rule,
-                        tr("Power {state} -> {device_id} (attempt {attempt}/{max_attempts}).").format(
-                            state=(tr("ON") if action_value else tr("OFF")),
-                            device_id=action_device_id,
-                            attempt=attempt,
-                            max_attempts=max_attempts,
-                        ),
+                        success_message,
                     )
                     success = True
                     break
@@ -2004,7 +2066,7 @@ class MainWindow(QMainWindow):
                     "error",
                     rule,
                     tr("Action failed for {device_id} (attempt {attempt}/{max_attempts}): {details}").format(
-                        device_id=action_device_id,
+                        device_id=action_target_label,
                         attempt=attempt,
                         max_attempts=max_attempts,
                         details=details,
@@ -2016,7 +2078,7 @@ class MainWindow(QMainWindow):
                 self._append_automation_log(
                     "error",
                     rule,
-                    tr("Action exhausted retries for {device_id}.").format(device_id=action_device_id),
+                    tr("Action exhausted retries for {device_id}.").format(device_id=action_target_label),
                 )
 
         if action_steps:
@@ -2041,6 +2103,72 @@ class MainWindow(QMainWindow):
             normalized_device_id,
             {"ok": True, "device": updated_device, "target": turn_on},
         )
+        return True, "ok"
+
+    def _execute_automation_inverter_settings_action(self, raw_changes: object) -> tuple[bool, str]:
+        if not isinstance(raw_changes, list):
+            return False, tr("No inverter settings were configured for this action.")
+        deduplicated_updates: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for item in raw_changes:
+            if not isinstance(item, dict):
+                continue
+            field_id = str(item.get("field_id", "")).strip()
+            if not field_id:
+                continue
+            value = str(item.get("value", "")).strip()
+            if field_id in seen:
+                continue
+            seen.add(field_id)
+            deduplicated_updates.append((field_id, value))
+        if not deduplicated_updates:
+            return False, tr("No inverter settings were configured for this action.")
+
+        # Skip updates that already match the local cached value to reduce API calls.
+        latest_by_field: dict[str, InverterSetting] = {}
+        if self._latest_inverter_settings_key == self._active_profile_key():
+            latest_by_field = {item.field_id.strip(): item for item in self._latest_inverter_settings if item.field_id.strip()}
+        updates: list[tuple[str, str]] = []
+        for field_id, value in deduplicated_updates:
+            current = latest_by_field.get(field_id)
+            current_value = str(current.raw_value).strip() if current is not None and current.raw_value is not None else None
+            if current_value is not None and current_value == value:
+                continue
+            updates.append((field_id, value))
+        if not updates:
+            return True, tr("All selected inverter settings are already up to date.")
+
+        try:
+            config = self._build_inverter_settings_config()
+            set_device_control_values(config, updates)
+        except Exception as exc:
+            return False, str(exc)
+
+        if self._latest_inverter_settings_key == self._active_profile_key():
+            loaded_at = pd.Timestamp.now().strftime("%d.%m.%Y %H:%M")
+            for field_id, value in updates:
+                for idx, current in enumerate(self._latest_inverter_settings):
+                    if current.field_id.strip() != field_id:
+                        continue
+                    self._latest_inverter_settings[idx] = InverterSetting(
+                        field_id=current.field_id,
+                        name=current.name,
+                        display_name=current.display_name,
+                        raw_value=value,
+                        display_value=self._format_setting_value(value, current.options),
+                        unit=current.unit,
+                        category=current.category,
+                        writable=current.writable,
+                        options=current.options,
+                        hint=current.hint,
+                        raw_name=current.raw_name,
+                    )
+                    break
+            active_key = self._active_profile_key()
+            if active_key is not None:
+                self._inverter_settings_cache[active_key] = (list(self._latest_inverter_settings), loaded_at)
+                if self.active_device_profile is not None:
+                    self._persist_inverter_settings_cache(self.active_device_profile, list(self._latest_inverter_settings), loaded_at)
         return True, "ok"
 
     def _append_automation_log(self, level: str, rule: AutomationRule, message: str) -> None:
@@ -3272,6 +3400,7 @@ class MainWindow(QMainWindow):
         self.automation_tab.rules_changed.connect(self._handle_automation_rules_changed)
         self.automation_tab.manual_run_requested.connect(self._handle_manual_automation_run)
         self.automation_tab.simulate_requested.connect(self._handle_simulate_automation_run)
+        self.automation_tab.logs_clear_requested.connect(self._handle_clear_automation_logs)
 
         self.tuya_tab = QWidget()
         tuya_layout = QVBoxLayout(self.tuya_tab)
@@ -3668,6 +3797,48 @@ class MainWindow(QMainWindow):
                 border-color: #20344a;
                 background: rgba(7, 16, 30, 0.85);
             }
+            QPushButton#AutomationHeaderPlusButton,
+            QPushButton#AutomationHeaderIconButton {
+                min-width: 22px;
+                max-width: 22px;
+                min-height: 22px;
+                max-height: 22px;
+                border: 1px solid #2a4766;
+                border-radius: 7px;
+                background: rgba(7, 20, 42, 0.92);
+                color: #b7cbdf;
+                padding: 0;
+            }
+            QPushButton#AutomationHeaderPlusButton {
+                font-size: 18px;
+                font-weight: 700;
+            }
+            QPushButton#AutomationHeaderIconButton {
+                font-size: 12px;
+                font-weight: 700;
+            }
+            QPushButton#AutomationHeaderPlusButton:hover,
+            QPushButton#AutomationHeaderIconButton:hover {
+                border-color: #22d3ee;
+                color: #e6f9ff;
+                background: rgba(8, 27, 54, 0.98);
+            }
+            QPushButton#AutomationHeaderPlusButton:pressed,
+            QPushButton#AutomationHeaderIconButton:pressed {
+                border-color: #06b6d4;
+                color: #67e8f9;
+            }
+            /*
+             * Legacy override removed: keep plus button in the same style as other header icon buttons.
+             */
+            QPushButton#AutomationHeaderPlusButton_legacy {
+                background: transparent;
+                border: none;
+                color: #22d3ee;
+                font-size: 26px;
+                font-weight: 600;
+                padding: 0;
+            }
             QListWidget#AutomationList,
             QTextBrowser#AutomationText {
                 background: rgba(8, 15, 30, 0.82);
@@ -3692,16 +3863,80 @@ class MainWindow(QMainWindow):
                 border: none;
             }
             QListWidget#AutomationList::item {
-                min-height: 26px;
-                padding: 3px 8px;
+                min-height: 34px;
+                padding: 2px 4px;
                 border-radius: 8px;
             }
             QListWidget#AutomationList::item:selected {
-                background: rgba(14, 165, 233, 0.18);
+                background: transparent;
                 color: #f0f9ff;
             }
             QListWidget#AutomationList::item:hover:!selected {
-                background: rgba(56, 189, 248, 0.08);
+                background: transparent;
+            }
+            QWidget#AutomationRuleRow {
+                background: transparent;
+                border: 1px solid transparent;
+                border-radius: 10px;
+            }
+            QWidget#AutomationRuleRow[selected="true"] {
+                background: rgba(14, 165, 233, 0.3);
+                border: 2px solid rgba(34, 211, 238, 0.9);
+            }
+            QLabel#AutomationRuleName {
+                color: #dbeafe;
+                font-size: 14px;
+                font-weight: 600;
+                background: transparent;
+            }
+            QWidget#AutomationRuleRow[selected="true"] QLabel#AutomationRuleName {
+                color: #ecfeff;
+                font-weight: 700;
+            }
+            QLabel#AutomationInlineLink {
+                color: #22d3ee;
+                font-size: 12px;
+                font-weight: 700;
+                background: transparent;
+                border: none;
+                padding: 0;
+            }
+            QLabel#AutomationInlineLink:hover {
+                color: #67e8f9;
+                background: transparent;
+            }
+            QLabel#AutomationInlineLink:pressed {
+                color: #06b6d4;
+                background: transparent;
+            }
+            QWidget#AutomationPaletteTiles {
+                background: transparent;
+            }
+            QToolButton#AutomationPaletteTile {
+                min-width: 86px;
+                max-width: 96px;
+                min-height: 58px;
+                border-radius: 12px;
+                border: 1px solid #224163;
+                background: rgba(7, 20, 42, 0.9);
+                color: #dbeafe;
+                font-size: 12px;
+                font-weight: 700;
+                padding: 6px 8px;
+                text-align: center;
+            }
+            QToolButton#AutomationPaletteTile::menu-indicator {
+                image: none;
+                width: 0px;
+            }
+            QToolButton#AutomationPaletteTile:hover {
+                border-color: #22d3ee;
+                background: rgba(8, 27, 54, 0.98);
+                color: #eff6ff;
+            }
+            QToolButton#AutomationPaletteTile:pressed {
+                border-color: #06b6d4;
+                background: rgba(7, 20, 42, 1);
             }
             #EnergyFlowStatus {
                 color: #94a3b8;
@@ -3787,6 +4022,14 @@ class MainWindow(QMainWindow):
             #SidebarTree::item:selected {
                 background: rgba(56, 189, 248, 0.10);
                 color: #f8fafc;
+            }
+            QToolTip {
+                background: rgba(8, 15, 30, 0.98);
+                color: #dbeafe;
+                border: 1px solid #2f6b9a;
+                border-radius: 8px;
+                padding: 3px 5px;
+                font-size: 12px;
             }
             QFrame#DeviceProfileButton {
                 min-height: 88px;
@@ -7818,8 +8061,6 @@ class MainWindow(QMainWindow):
         """Toggle shared backdrop and optional background input blocking."""
         if self._popup_backdrop is None:
             return
-        if self._popup_block_target is not None:
-            self._popup_block_target.setEnabled(not visible)
         current_visible = self._popup_backdrop.isVisible()
         if current_visible == visible:
             return

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from app.services.logging_utils import get_logger
-from PySide6.QtCore import QEventLoop, Qt
-from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtCore import QEventLoop, Qt, QTimer
+from PySide6.QtWidgets import QApplication, QDialog, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from app.services.i18n import tr
 from app.ui.design_system import compose_styles
@@ -147,6 +147,7 @@ class CompactMessageDialog(QDialog):
         self.setWindowTitle(title)
         self.setModal(True)
         self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setObjectName("CompactMessageDialog")
         self.setMinimumWidth(420)
         self.setMaximumWidth(520)
@@ -179,6 +180,8 @@ class CompactMessageDialog(QDialog):
 
         self.accept_button = QPushButton(accept_text)
         self.accept_button.setObjectName("DangerButton" if destructive else "PrimaryActionButton")
+        self.accept_button.setAutoDefault(True)
+        self.accept_button.setDefault(True)
         self.accept_button.clicked.connect(self.accept)
 
         buttons_layout = QHBoxLayout()
@@ -186,6 +189,7 @@ class CompactMessageDialog(QDialog):
         if reject_text:
             self.reject_button = QPushButton(reject_text)
             self.reject_button.setObjectName("SecondaryActionButton")
+            self.reject_button.setAutoDefault(True)
             self.reject_button.clicked.connect(self.reject)
             buttons_layout.addWidget(self.reject_button)
         else:
@@ -207,6 +211,26 @@ class CompactMessageDialog(QDialog):
                 NEON_HEADER_BAR_STYLE,
             )
         )
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._ensure_dialog_focus()
+        QTimer.singleShot(0, self._ensure_dialog_focus)
+        QTimer.singleShot(60, self._ensure_dialog_focus)
+
+    def _ensure_dialog_focus(self) -> None:
+        if not self.isVisible():
+            return
+        target = self.reject_button if self.reject_button is not None else self.accept_button
+        if target is None:
+            return
+        window_handle = self.windowHandle()
+        if window_handle is not None:
+            window_handle.requestActivate()
+        QApplication.setActiveWindow(self)
+        self.raise_()
+        self.activateWindow()
+        target.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
 
 
 def prepare_modal_dialog(

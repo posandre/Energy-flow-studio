@@ -130,15 +130,18 @@ class AutomationRule:
 
         flow_blocks = payload.get("flow_blocks", [])
         blocks = list(flow_blocks) if isinstance(flow_blocks, list) else []
+        has_explicit_flow_payload = ("flow_blocks" in payload) or ("flow_graph" in payload)
 
         flow_graph_raw = payload.get("flow_graph", {})
         graph = normalize_flow_graph(flow_graph_raw if isinstance(flow_graph_raw, dict) else {})
         if not graph.get("nodes"):
             if blocks:
                 graph = build_flow_graph_from_blocks(blocks)
+            elif has_explicit_flow_payload:
+                graph = normalize_flow_graph({})
             else:
                 graph = build_flow_graph_from_legacy_fields(payload)
-        if not blocks:
+        if not blocks and graph.get("nodes"):
             blocks = flow_blocks_from_graph(graph)
 
         return cls(
@@ -205,6 +208,13 @@ class AutomationFlowRun:
     steps: list[AutomationRunStep]
 
 
+def _normalize_edge_branch(value: object) -> str:
+    branch = str(value or "").strip().lower()
+    if branch in {"true", "false"}:
+        return branch
+    return "any"
+
+
 def normalize_flow_graph(payload: dict[str, object]) -> dict[str, object]:
     version = max(1, int(_to_float(payload.get("version", FLOW_SCHEMA_VERSION))))
     nodes_in = payload.get("nodes", [])
@@ -229,22 +239,26 @@ def normalize_flow_graph(payload: dict[str, object]) -> dict[str, object]:
 
     valid_ids = {str(item["id"]) for item in nodes}
     edges: list[dict[str, str]] = []
-    seen_edges: set[tuple[str, str]] = set()
+    seen_edges: set[tuple[str, str, str]] = set()
     if isinstance(edges_in, list):
         for item in edges_in:
             if not isinstance(item, dict):
                 continue
             source = str(item.get("source", "")).strip()
             target = str(item.get("target", "")).strip()
+            branch = _normalize_edge_branch(item.get("branch", "any"))
             if not source or not target:
                 continue
             if source not in valid_ids or target not in valid_ids:
                 continue
-            key = (source, target)
+            key = (source, target, branch)
             if key in seen_edges:
                 continue
             seen_edges.add(key)
-            edges.append({"source": source, "target": target})
+            if branch == "any":
+                edges.append({"source": source, "target": target})
+            else:
+                edges.append({"source": source, "target": target, "branch": branch})
 
     return {"version": version, "nodes": nodes, "edges": edges}
 
@@ -252,19 +266,58 @@ def normalize_flow_graph(payload: dict[str, object]) -> dict[str, object]:
 def build_flow_graph_from_blocks(blocks: list[dict[str, object]]) -> dict[str, object]:
     nodes: list[dict[str, object]] = []
     edges: list[dict[str, str]] = []
-    prev_id = ""
+    ordered_ids: list[str] = []
+    id_set: set[str] = set()
     for idx, block in enumerate(blocks):
         if not isinstance(block, dict):
             continue
         block_type = str(block.get("type", "")).strip().lower()
         if not block_type:
             continue
-        node_id = f"n{len(nodes) + 1}"
-        params = {str(key): value for key, value in block.items() if str(key) != "type"}
+        raw_block_id = str(block.get("_id", "")).strip()
+        node_id = raw_block_id or f"n{len(nodes) + 1}"
+        if node_id in id_set:
+            node_id = f"n{len(nodes) + 1}"
+        id_set.add(node_id)
+        ordered_ids.append(node_id)
+        params = {
+            str(key): value
+            for key, value in block.items()
+            if str(key) != "type" and not str(key).startswith("_")
+        }
         nodes.append({"id": node_id, "type": block_type, "params": params})
-        if prev_id:
-            edges.append({"source": prev_id, "target": node_id})
-        prev_id = node_id
+    if nodes:
+        node_types = {str(item["id"]): str(item.get("type", "")).strip().lower() for item in nodes}
+        node_params = {
+            str(item["id"]): dict(item.get("params", {})) if isinstance(item.get("params", {}), dict) else {}
+            for item in nodes
+        }
+        for source_id in ordered_ids:
+            source_type = node_types.get(source_id, "")
+            params = node_params.get(source_id, {})
+            def _targets(single_key: str, list_key: str) -> list[str]:
+                result: list[str] = []
+                raw_list = params.get(list_key, [])
+                if isinstance(raw_list, list):
+                    for value in raw_list:
+                        target_id = str(value).strip()
+                        if target_id and target_id not in result:
+                            result.append(target_id)
+                raw_single = str(params.get(single_key, "")).strip()
+                if raw_single and raw_single not in result:
+                    result.append(raw_single)
+                return result
+            if source_type in {"condition", "gate"}:
+                for true_target in _targets("true_target_id", "true_target_ids"):
+                    if true_target and true_target in id_set and true_target != source_id:
+                        edges.append({"source": source_id, "target": true_target, "branch": "true"})
+                for false_target in _targets("false_target_id", "false_target_ids"):
+                    if false_target and false_target in id_set and false_target != source_id:
+                        edges.append({"source": source_id, "target": false_target, "branch": "false"})
+                continue
+            for explicit_next in _targets("next_target_id", "next_target_ids"):
+                if explicit_next and explicit_next in id_set and explicit_next != source_id:
+                    edges.append({"source": source_id, "target": explicit_next})
     return normalize_flow_graph({"version": FLOW_SCHEMA_VERSION, "nodes": nodes, "edges": edges})
 
 
@@ -273,14 +326,59 @@ def flow_blocks_from_graph(graph: dict[str, object]) -> list[dict[str, object]]:
     nodes, adjacency, indegree = _graph_maps(normalized)
     order = _topological_order(nodes, adjacency, indegree)
     blocks: list[dict[str, object]] = []
+    blocks_by_id: dict[str, dict[str, object]] = {}
     for node_id in order:
         node = nodes[node_id]
-        block: dict[str, object] = {"type": str(node.get("type", ""))}
+        block: dict[str, object] = {"type": str(node.get("type", "")), "_id": node_id}
         params = node.get("params", {})
         if isinstance(params, dict):
             for key, value in params.items():
                 block[str(key)] = value
         blocks.append(block)
+        blocks_by_id[node_id] = block
+    edges_in = normalized.get("edges", [])
+    if isinstance(edges_in, list):
+        collected_targets: dict[tuple[str, str], list[str]] = {}
+        for edge in edges_in:
+            if not isinstance(edge, dict):
+                continue
+            source = str(edge.get("source", "")).strip()
+            target = str(edge.get("target", "")).strip()
+            if source not in blocks_by_id or target not in blocks_by_id:
+                continue
+            source_block = blocks_by_id[source]
+            source_type = str(source_block.get("type", "")).strip().lower()
+            if source_type not in {"condition", "gate"}:
+                collected_targets.setdefault((source, "next"), [])
+                if target not in collected_targets[(source, "next")]:
+                    collected_targets[(source, "next")].append(target)
+                continue
+            branch = _normalize_edge_branch(edge.get("branch", "any"))
+            if branch == "false":
+                collected_targets.setdefault((source, "false"), [])
+                if target not in collected_targets[(source, "false")]:
+                    collected_targets[(source, "false")].append(target)
+            elif branch == "true":
+                collected_targets.setdefault((source, "true"), [])
+                if target not in collected_targets[(source, "true")]:
+                    collected_targets[(source, "true")].append(target)
+            elif branch == "any":
+                collected_targets.setdefault((source, "true"), [])
+                if target not in collected_targets[(source, "true")]:
+                    collected_targets[(source, "true")].append(target)
+        for (source, branch), targets in collected_targets.items():
+            source_block = blocks_by_id.get(source)
+            if not isinstance(source_block, dict) or not targets:
+                continue
+            if branch == "next":
+                source_block["next_target_ids"] = targets
+                source_block["next_target_id"] = targets[0]
+            elif branch == "true":
+                source_block["true_target_ids"] = targets
+                source_block["true_target_id"] = targets[0]
+            elif branch == "false":
+                source_block["false_target_ids"] = targets
+                source_block["false_target_id"] = targets[0]
     return blocks
 
 
@@ -502,6 +600,19 @@ class AutomationEngine:
 
         graph = self._rule_graph(rule)
         nodes, adjacency, indegree = _graph_maps(graph)
+        incoming_edges: dict[str, list[tuple[str, str]]] = {}
+        raw_edges = graph.get("edges", [])
+        if isinstance(raw_edges, list):
+            for edge in raw_edges:
+                if not isinstance(edge, dict):
+                    continue
+                source = str(edge.get("source", "")).strip()
+                target = str(edge.get("target", "")).strip()
+                if not source or not target:
+                    continue
+                incoming_edges.setdefault(target, []).append(
+                    (source, _normalize_edge_branch(edge.get("branch", "any")))
+                )
         order = _topological_order(nodes, adjacency, indegree)
         order_set = set(order)
 
@@ -526,9 +637,20 @@ class AutomationEngine:
             node_type = str(node.get("type", "")).strip().lower()
             params = node.get("params", {})
             params = dict(params) if isinstance(params, dict) else {}
-            parents = [src for src, targets in adjacency.items() if node_id in targets]
-            parent_states = [result_map[parent].status == "success" for parent in parents if parent in result_map]
-            parent_active = any(parent_states) if parents else True
+            parent_edges = incoming_edges.get(node_id)
+            if not parent_edges:
+                parent_edges = [(src, "any") for src, targets in adjacency.items() if node_id in targets]
+            parent_active = False if parent_edges else True
+            parent_values: list[bool] = []
+            for parent_id, branch in parent_edges:
+                active, value = _edge_is_active_for_parent(
+                    parent_result=result_map.get(parent_id),
+                    branch=branch,
+                )
+                if not active:
+                    continue
+                parent_active = True
+                parent_values.append(value)
 
             status = "skipped"
             reason = "upstream_blocked"
@@ -541,13 +663,22 @@ class AutomationEngine:
                     ok = self._evaluate_trigger_node(rule.rule_id, node_id, params, numeric_measurements, now, update_state=False)
                     status = "success" if ok else "fail"
                     reason = "trigger_true" if ok else "trigger_false"
+            elif node_type == "start":
+                status = "success"
+                reason = "start_ready"
+            elif node_type == "end":
+                status = "success"
+                reason = "end_reached"
             elif node_type == "gate":
-                if not parents:
+                if not parent_edges:
                     status = "fail"
                     reason = "gate_no_inputs"
+                elif not parent_values:
+                    status = "skipped"
+                    reason = "upstream_blocked"
                 else:
                     mode = str(params.get("mode", "and")).strip().lower() or "and"
-                    passed = all(parent_states) if mode == "and" else any(parent_states)
+                    passed = all(parent_values) if mode == "and" else any(parent_values)
                     status = "success" if passed else "fail"
                     reason = f"gate_{mode}_{'passed' if passed else 'failed'}"
             elif not parent_active:
@@ -803,3 +934,25 @@ def _to_float(value: object) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _edge_is_active_for_parent(
+    *,
+    parent_result: AutomationNodeResult | None,
+    branch: str,
+) -> tuple[bool, bool]:
+    if parent_result is None:
+        return False, False
+    parent_success = parent_result.status == "success"
+    normalized = _normalize_edge_branch(branch)
+    if normalized == "false":
+        if parent_result.status != "fail":
+            return False, False
+        return True, False
+    if normalized == "true":
+        if not parent_success:
+            return False, False
+        return True, True
+    if parent_success:
+        return True, True
+    return False, False
