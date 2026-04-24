@@ -452,6 +452,7 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "No selected rule.": "Правило не вибрано.",
         "Success: {ok}  Error: {error}  Info: {info}": "Успіх: {ok}  Помилка: {error}  Інфо: {info}",
         "Select a block to edit.": "Виберіть блок для редагування.",
+        "No editable fields for this block.": "Для цього блоку немає полів редагування.",
         "Measurement": "Вимір",
         "Schedule": "Розклад",
         "Manual": "Вручну",

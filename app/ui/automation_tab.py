@@ -7,7 +7,7 @@ import uuid
 from typing import Iterable
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal, QTimer, QLineF
-from PySide6.QtGui import QColor, QDrag, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtGui import QColor, QCursor, QDrag, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtCore import QMimeData
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -233,6 +233,7 @@ class FlowDiagramView(QWidget):
         self._nested_drag_reorder_target = -1
         self._drag_nested_gate_target: tuple[int, int] | None = None
         self._drag_hover_block_index = -1
+        self._drag_side_target_index = -1
         self._dash_phase = 0.0
         self._dash_timer = QTimer(self)
         self._dash_timer.setInterval(60)
@@ -281,6 +282,7 @@ class FlowDiagramView(QWidget):
 
     def set_blocks(self, blocks: list[dict[str, object]], labels: list[str]) -> None:
         self._blocks = [dict(item) for item in blocks]
+        self._normalize_row_groups()
         self._labels = [str(item) for item in labels]
         if self._selected_index >= len(self._blocks):
             self._selected_index = len(self._blocks) - 1
@@ -555,6 +557,9 @@ class FlowDiagramView(QWidget):
         self._drag_active = False
         self._nested_drag_active = False
         self._selected_gate_condition = None
+        self._selected_index = -1
+        self.block_selected.emit(-1)
+        self.update()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
@@ -565,7 +570,13 @@ class FlowDiagramView(QWidget):
                 super().mouseMoveEvent(event)
                 return
             canvas_width = self._canvas_inner_width()
-            if self._resize_drag_side == "left":
+            block = self._blocks[self._resize_drag_index] if 0 <= self._resize_drag_index < len(self._blocks) else {}
+            block_align = self._block_align(block) if isinstance(block, dict) else "left"
+            if block_align == "center":
+                center_x = source_rect.center().x()
+                new_width = self._clamp(abs(point.x() - center_x) * 2.0, canvas_width * 0.35, canvas_width)
+                changed = self._set_block_layout(self._resize_drag_index, width_ratio=(new_width / canvas_width), align="center")
+            elif self._resize_drag_side == "left":
                 new_width = self._clamp(self._resize_anchor_x - point.x(), canvas_width * 0.35, canvas_width)
                 changed = self._set_block_layout(self._resize_drag_index, width_ratio=(new_width / canvas_width), align="right")
             else:
@@ -589,8 +600,15 @@ class FlowDiagramView(QWidget):
         if self._align_drag_active and self._align_drag_index >= 0:
             block = self._blocks[self._align_drag_index] if 0 <= self._align_drag_index < len(self._blocks) else {}
             if isinstance(block, dict) and self._block_width_ratio(block) < 0.999:
-                canvas_mid_x = 16.0 + (self._canvas_inner_width() / 2.0)
-                preview_align = "left" if point.x() <= canvas_mid_x else "right"
+                canvas_left = 16.0
+                canvas_width = self._canvas_inner_width()
+                relative_x = self._clamp((point.x() - canvas_left) / canvas_width, 0.0, 1.0)
+                if relative_x < 0.34:
+                    preview_align = "left"
+                elif relative_x > 0.66:
+                    preview_align = "right"
+                else:
+                    preview_align = "center"
                 if self._set_block_layout(self._align_drag_index, align=preview_align):
                     self._align_drag_changed = True
                     self.update()
@@ -653,6 +671,7 @@ class FlowDiagramView(QWidget):
             self._ensure_dash_animation(False)
             self._drag_hover_block_index = -1
             self._drag_nested_gate_target = None
+            self._drag_side_target_index = -1
             super().mouseMoveEvent(event)
             return
         nested_target = self._nested_gate_drop_target_for_point(point)
@@ -672,6 +691,17 @@ class FlowDiagramView(QWidget):
             gate_target = self._gate_drop_target_at(point, self._drag_origin_index)
             self._drag_hover_block_index = gate_target if gate_target >= 0 else -1
             self._ensure_dash_animation(gate_target >= 0)
+        side_target = self._side_slot_target_for_point(point, self._drag_origin_index)
+        if side_target >= 0:
+            self._drag_side_target_index = side_target
+            self._drag_hover_block_index = -1
+            self._drag_gate_target_index = -1
+            self._drag_insert_index = side_target + 1
+            self._ensure_dash_animation(True)
+            self.update()
+            super().mouseMoveEvent(event)
+            return
+        self._drag_side_target_index = -1
         self._drag_gate_target_index = self._drag_hover_block_index
         insert_index = len(self._hit_areas)
         for idx, rect in enumerate(self._hit_areas):
@@ -691,6 +721,7 @@ class FlowDiagramView(QWidget):
             self._resize_anchor_x = 0.0
             self._drag_origin_index = -1
             self._drag_insert_index = -1
+            self._normalize_row_groups()
             self.blocks_reordered.emit([dict(item) for item in self._blocks if isinstance(item, dict)])
             self._update_hover_cursor(drop_point)
             self.update()
@@ -705,6 +736,7 @@ class FlowDiagramView(QWidget):
             self._drag_origin_index = -1
             self._drag_insert_index = -1
             if changed:
+                self._normalize_row_groups()
                 self.blocks_reordered.emit([dict(item) for item in self._blocks if isinstance(item, dict)])
             self._update_hover_cursor(drop_point)
             self.update()
@@ -718,6 +750,7 @@ class FlowDiagramView(QWidget):
             self._drag_origin_index = -1
             self._drag_insert_index = -1
             if changed:
+                self._normalize_row_groups()
                 self.blocks_reordered.emit([dict(item) for item in self._blocks if isinstance(item, dict)])
             self._update_hover_cursor(drop_point)
             self.update()
@@ -740,6 +773,7 @@ class FlowDiagramView(QWidget):
             self._connection_drag_changed = False
             self._connection_drag_from_label = False
             self._ensure_dash_animation(False)
+            self._drag_side_target_index = -1
             self._update_hover_cursor(drop_point)
             self.update()
             super().mouseReleaseEvent(event)
@@ -902,6 +936,7 @@ class FlowDiagramView(QWidget):
                 self._drag_gate_target_index = -1
                 self._drag_active = False
                 self._drag_nested_gate_target = None
+                self._drag_side_target_index = -1
                 self._update_hover_cursor(drop_point)
                 self._drag_hover_block_index = -1
                 self._ensure_dash_animation(False)
@@ -917,6 +952,7 @@ class FlowDiagramView(QWidget):
                 self._drag_gate_target_index = -1
                 self._drag_active = False
                 self._drag_nested_gate_target = None
+                self._drag_side_target_index = -1
                 self._update_hover_cursor(drop_point)
                 self._drag_hover_block_index = -1
                 self._ensure_dash_animation(False)
@@ -925,18 +961,37 @@ class FlowDiagramView(QWidget):
                 return
             block = self._blocks.pop(self._drag_origin_index)
             label = self._labels.pop(self._drag_origin_index)
-            target_index = self._drag_insert_index
-            if target_index > self._drag_origin_index:
-                target_index -= 1
-            target_index = min(max(0, target_index), len(self._blocks))
+            if self._drag_side_target_index >= 0:
+                target_index = self._drag_side_target_index
+                if target_index > self._drag_origin_index:
+                    target_index -= 1
+                target_index = min(max(0, target_index + 1), len(self._blocks))
+                if 0 <= target_index - 1 < len(self._blocks):
+                    anchor = self._blocks[target_index - 1]
+                    if isinstance(anchor, dict):
+                        anchor_ratio = self._block_width_ratio(anchor)
+                        block["ui_width_ratio"] = anchor_ratio
+                        anchor_align = self._block_align(anchor)
+                        block["ui_align"] = "right" if anchor_align != "right" else "left"
+            else:
+                target_index = self._drag_insert_index
+                if target_index > self._drag_origin_index:
+                    target_index -= 1
+                target_index = min(max(0, target_index), len(self._blocks))
             self._blocks.insert(target_index, block)
             self._labels.insert(target_index, label)
+            if self._drag_side_target_index >= 0:
+                anchor_idx = target_index - 1
+                if 0 <= anchor_idx < len(self._blocks):
+                    self._pair_blocks_in_row(anchor_idx, target_index)
+            self._normalize_row_groups()
             self._selected_index = target_index
             if target_index != self._drag_origin_index:
                 self.blocks_reordered.emit([dict(item) for item in self._blocks])
         self._drag_origin_index = -1
         self._drag_insert_index = -1
         self._drag_gate_target_index = -1
+        self._drag_side_target_index = -1
         self._drag_active = False
         self._nested_drag_active = False
         self._nested_drag_gate_index = -1
@@ -955,6 +1010,7 @@ class FlowDiagramView(QWidget):
             self.unsetCursor()
         self._drag_hover_block_index = -1
         self._drag_nested_gate_target = None
+        self._drag_side_target_index = -1
         self._connection_hover = None
         self._ensure_dash_animation(False)
         super().leaveEvent(event)
@@ -998,28 +1054,42 @@ class FlowDiagramView(QWidget):
         current_top = top
 
         connectivity = self._connectivity_state()
+        hover_point = self.mapFromGlobal(QCursor.pos())
+        hover_pointf = QPointF(float(hover_point.x()), float(hover_point.y()))
         for idx, block in enumerate(self._blocks):
             block_height = float(self._block_height(block))
             block_type = str(block.get("type", "")).strip().lower()
-            immutable_start = block_type == "start"
+            immutable_controls = block_type in {"start", "end"}
             block_ratio = self._block_width_ratio(block)
             block_width = width * block_ratio
             block_align = self._block_align(block)
-            block_left = margin_x if block_align != "right" or block_ratio >= 0.999 else margin_x + (width - block_width)
+            if (
+                idx > 0
+                and self._blocks_share_row(self._blocks[idx - 1], block)
+                and abs(self._hit_areas[idx - 1].top() - current_top) > 0.1
+            ):
+                current_top = self._hit_areas[idx - 1].top()
+            if block_ratio >= 0.999:
+                block_left = margin_x
+            elif block_align == "right":
+                block_left = margin_x + (width - block_width)
+            elif block_align == "center":
+                block_left = margin_x + ((width - block_width) / 2.0)
+            else:
+                block_left = margin_x
             rect = QRectF(block_left, current_top, block_width, block_height)
             self._hit_areas.append(rect)
             move_rect = QRectF()
             delete_rect = QRectF()
-            if not immutable_start:
+            if not immutable_controls:
                 move_rect = QRectF(rect.right() - 54.0, rect.top() + 6.0, 20.0, 20.0)
                 delete_rect = QRectF(rect.right() - 28.0, rect.top() + 6.0, 20.0, 20.0)
             self._move_hit_areas.append(move_rect)
             self._delete_hit_areas.append(delete_rect)
             left_resize_rect = QRectF()
             right_resize_rect = QRectF()
-            if not immutable_start:
-                left_resize_rect = QRectF(rect.left() - 4.0, rect.center().y() - 12.0, 8.0, 24.0)
-                right_resize_rect = QRectF(rect.right() - 4.0, rect.center().y() - 12.0, 8.0, 24.0)
+            left_resize_rect = QRectF(rect.left() - 4.0, rect.center().y() - 12.0, 8.0, 24.0)
+            right_resize_rect = QRectF(rect.right() - 4.0, rect.center().y() - 12.0, 8.0, 24.0)
             self._resize_left_hit_areas.append((idx, left_resize_rect))
             self._resize_right_hit_areas.append((idx, right_resize_rect))
 
@@ -1057,18 +1127,39 @@ class FlowDiagramView(QWidget):
                 painter.setPen(dash_pen)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRoundedRect(rect.adjusted(1.5, 1.5, -1.5, -1.5), 12.0, 12.0)
+            if idx == self._drag_side_target_index and self._drag_active:
+                side_rect = self._paired_slot_rect_for_index(idx)
+                if side_rect.isValid():
+                    dash_pen = QPen(QColor(34, 211, 238), 1.8)
+                    dash_pen.setStyle(Qt.PenStyle.CustomDashLine)
+                    dash_pen.setDashPattern([5.0, 3.5])
+                    dash_pen.setDashOffset(self._dash_phase)
+                    painter.setPen(dash_pen)
+                    painter.setBrush(QColor(9, 22, 40, 110))
+                    painter.drawRoundedRect(side_rect.adjusted(1.5, 1.5, -1.5, -1.5), 12.0, 12.0)
             if self._align_drag_active and idx == self._align_drag_index and block_ratio < 0.999:
                 preview_align = self._block_align(block)
-                marker_x = rect.left() + 6.0 if preview_align == "left" else rect.right() - 6.0
+                if preview_align == "right":
+                    marker_x = rect.right() - 6.0
+                elif preview_align == "center":
+                    marker_x = rect.center().x()
+                else:
+                    marker_x = rect.left() + 6.0
                 painter.setPen(QPen(QColor(34, 211, 238), 2.0))
                 painter.drawLine(QPointF(marker_x, rect.top() + 6.0), QPointF(marker_x, rect.bottom() - 6.0))
 
-            if not immutable_start:
-                painter.setPen(QPen(QColor(56, 92, 130), 1.2))
-                painter.setBrush(QColor(10, 28, 50, 240))
-                painter.drawRoundedRect(left_resize_rect, 3.0, 3.0)
-                painter.drawRoundedRect(right_resize_rect, 3.0, 3.0)
+            left_hover = left_resize_rect.contains(hover_pointf)
+            right_hover = right_resize_rect.contains(hover_pointf)
+            if left_hover or right_hover:
+                glow_pen = QPen(QColor(34, 211, 238), 1.8)
+            else:
+                glow_pen = QPen(QColor(56, 92, 130), 1.2)
+            painter.setPen(glow_pen)
+            painter.setBrush(QColor(10, 28, 50, 240))
+            painter.drawRoundedRect(left_resize_rect, 3.0, 3.0)
+            painter.drawRoundedRect(right_resize_rect, 3.0, 3.0)
 
+            if not immutable_controls:
                 painter.setPen(QPen(QColor(48, 83, 118), 1.2))
                 painter.setBrush(QColor(9, 24, 45, 180 if is_dragged_block else 230))
                 painter.drawRoundedRect(move_rect, 6.0, 6.0)
@@ -1081,7 +1172,7 @@ class FlowDiagramView(QWidget):
                 painter.setPen(QColor(188, 202, 220) if is_dragged_block else QColor(227, 240, 252))
                 painter.drawText(delete_rect, Qt.AlignmentFlag.AlignCenter, "✕")
 
-            if not immutable_start:
+            if block_type != "start":
                 input_center = self._socket_center(rect, block, "input")
                 input_rect = QRectF(input_center.x() - 6.0, input_center.y() - 6.0, 12.0, 12.0)
                 input_label_rect = QRectF(input_rect.left() - 48.0, input_rect.top() - 1.0, 42.0, 14.0)
@@ -1212,7 +1303,135 @@ class FlowDiagramView(QWidget):
     @staticmethod
     def _block_align(block: dict[str, object]) -> str:
         align = str(block.get("ui_align", "left")).strip().lower()
-        return "right" if align == "right" else "left"
+        if align == "right":
+            return "right"
+        if align == "center":
+            return "center"
+        return "left"
+
+    @staticmethod
+    def _row_id(block: dict[str, object]) -> str:
+        return str(block.get("ui_row_id", "")).strip()
+
+    @staticmethod
+    def _clear_row_id(block: dict[str, object]) -> None:
+        block.pop("ui_row_id", None)
+
+    def _normalize_row_groups(self) -> None:
+        grouped: dict[str, list[int]] = {}
+        for idx, block in enumerate(self._blocks):
+            if not isinstance(block, dict):
+                continue
+            row_id = self._row_id(block)
+            if row_id:
+                grouped.setdefault(row_id, []).append(idx)
+        for row_id, indices in grouped.items():
+            if len(indices) != 2:
+                for idx in indices:
+                    if 0 <= idx < len(self._blocks) and isinstance(self._blocks[idx], dict):
+                        self._clear_row_id(self._blocks[idx])
+                continue
+            left_idx, right_idx = sorted(indices)
+            left_block = self._blocks[left_idx]
+            right_block = self._blocks[right_idx]
+            if not isinstance(left_block, dict) or not isinstance(right_block, dict):
+                continue
+            valid = (
+                right_idx == left_idx + 1
+                and self._block_width_ratio(left_block) < 0.999
+                and self._block_width_ratio(right_block) < 0.999
+                and self._block_align(left_block) in {"left", "right"}
+                and self._block_align(right_block) in {"left", "right"}
+                and self._block_align(left_block) != self._block_align(right_block)
+            )
+            if not valid:
+                self._clear_row_id(left_block)
+                self._clear_row_id(right_block)
+
+    def _pair_blocks_in_row(self, first_index: int, second_index: int) -> None:
+        if first_index == second_index:
+            return
+        if not (0 <= first_index < len(self._blocks) and 0 <= second_index < len(self._blocks)):
+            return
+        first = self._blocks[first_index]
+        second = self._blocks[second_index]
+        if not isinstance(first, dict) or not isinstance(second, dict):
+            return
+        row_id = uuid.uuid4().hex
+        first["ui_row_id"] = row_id
+        second["ui_row_id"] = row_id
+        self._normalize_row_groups()
+
+    def _blocks_share_row(self, left: dict[str, object], right: dict[str, object]) -> bool:
+        left_row_id = self._row_id(left)
+        right_row_id = self._row_id(right)
+        if not left_row_id or not right_row_id or left_row_id != right_row_id:
+            return False
+        left_ratio = self._block_width_ratio(left)
+        right_ratio = self._block_width_ratio(right)
+        if left_ratio >= 0.999 or right_ratio >= 0.999:
+            return False
+        return self._block_align(left) != self._block_align(right)
+
+    def _row_partner_index(self, index: int) -> int:
+        if index < 0 or index >= len(self._blocks):
+            return -1
+        own = self._blocks[index]
+        if not isinstance(own, dict):
+            return -1
+        if index + 1 < len(self._blocks):
+            other = self._blocks[index + 1]
+            if isinstance(other, dict) and self._blocks_share_row(own, other):
+                return index + 1
+        if index - 1 >= 0:
+            other = self._blocks[index - 1]
+            if isinstance(other, dict) and self._blocks_share_row(other, own):
+                return index - 1
+        return -1
+
+    def _paired_slot_rect_for_index(self, index: int) -> QRectF:
+        if index < 0 or index >= len(self._hit_areas):
+            return QRectF()
+        if self._row_partner_index(index) >= 0:
+            return QRectF()
+        rect = self._hit_areas[index]
+        block = self._blocks[index] if 0 <= index < len(self._blocks) else {}
+        if not isinstance(block, dict):
+            return QRectF()
+        ratio = self._block_width_ratio(block)
+        if ratio >= 0.999:
+            return QRectF()
+        if self._block_align(block) == "center":
+            return QRectF()
+        canvas_width = self._canvas_inner_width()
+        slot_width = canvas_width * ratio
+        margin_x = 16.0
+        slot_align = "right" if self._block_align(block) == "left" else "left"
+        slot_left = margin_x if slot_align == "left" else margin_x + (canvas_width - slot_width)
+        return QRectF(slot_left, rect.top(), slot_width, rect.height())
+
+    def _side_slot_target_for_point(self, point: QPointF, source_index: int) -> int:
+        if source_index < 0:
+            return -1
+        source_block = self._blocks[source_index] if 0 <= source_index < len(self._blocks) else {}
+        if not isinstance(source_block, dict):
+            return -1
+        if self._block_width_ratio(source_block) >= 0.999:
+            return -1
+        for idx, _rect in enumerate(self._hit_areas):
+            if idx == source_index:
+                continue
+            block = self._blocks[idx] if 0 <= idx < len(self._blocks) else {}
+            if not isinstance(block, dict):
+                continue
+            if self._block_width_ratio(block) >= 0.999:
+                continue
+            if self._row_partner_index(idx) >= 0:
+                continue
+            slot_rect = self._paired_slot_rect_for_index(idx)
+            if slot_rect.isValid() and slot_rect.contains(point):
+                return idx
+        return -1
 
     def _set_block_layout(self, index: int, *, width_ratio: float | None = None, align: str | None = None) -> bool:
         if index < 0 or index >= len(self._blocks):
@@ -1225,11 +1444,23 @@ class FlowDiagramView(QWidget):
             normalized = self._clamp(float(width_ratio), 0.35, 1.0)
             if abs(float(block.get("ui_width_ratio", 1.0) or 1.0) - normalized) > 1e-4:
                 block["ui_width_ratio"] = normalized
+                self._clear_row_id(block)
                 changed = True
         if align is not None:
-            normalized_align = "right" if str(align).strip().lower() == "right" else "left"
+            requested_align = str(align).strip().lower()
+            if requested_align == "right":
+                normalized_align = "right"
+            elif requested_align == "center":
+                normalized_align = "center"
+            else:
+                normalized_align = "left"
             if str(block.get("ui_align", "left")).strip().lower() != normalized_align:
                 block["ui_align"] = normalized_align
+                self._clear_row_id(block)
+                changed = True
+        if self._block_width_ratio(block) >= 0.999:
+            if self._row_id(block):
+                self._clear_row_id(block)
                 changed = True
         return changed
 
@@ -2026,6 +2257,7 @@ class AutomationTab(QWidget):
         self._selected_nested_condition: tuple[int, int] | None = None
         self._rule_row_widgets: dict[str, RuleListRowWidget] = {}
         self._palette_tile_by_type: dict[str, PaletteTileButton] = {}
+        self._global_rule_cooldown_sec = 60
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -2071,10 +2303,6 @@ class AutomationTab(QWidget):
         self.diagram_scroll.setWidget(self.diagram_view)
         self.diagram_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
 
-        self.rule_cooldown = QSpinBox()
-        self.rule_cooldown.setRange(0, 3600)
-        self.rule_cooldown.setSuffix(" sec")
-
         self.block_editor = QStackedWidget()
         self.block_editor.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.block_editor.addWidget(self._build_empty_editor())
@@ -2096,14 +2324,6 @@ class AutomationTab(QWidget):
         self.analytics_label = QLabel(tr("No executions yet."))
         self.analytics_label.setObjectName("SidebarMeta")
         self.analytics_label.setWordWrap(True)
-
-        meta_panel = QWidget()
-        meta_form = QVBoxLayout(meta_panel)
-        meta_form.setContentsMargins(0, 0, 0, 0)
-        meta_form.setSpacing(12)
-        meta_form.addWidget(QLabel(tr("Cooldown")))
-        meta_form.addWidget(self.rule_cooldown)
-        self._expand_fields(self.rule_cooldown)
 
         left = QVBoxLayout()
         rules_header = QHBoxLayout()
@@ -2170,7 +2390,6 @@ class AutomationTab(QWidget):
             ("gate", "⊞", tr("Gate")),
             ("delay", "⏱", tr("Delay")),
             ("action", "⚙", tr("Action")),
-            ("end", "◍", tr("End")),
         ]
         for block_type, icon, title_text in tile_specs:
             tile = PaletteTileButton(
@@ -2192,7 +2411,6 @@ class AutomationTab(QWidget):
         right_fields.setContentsMargins(14, 14, 14, 14)
         right_fields.setSpacing(16)
         right_fields.setAlignment(Qt.AlignmentFlag.AlignTop)
-        right_fields.addWidget(meta_panel)
         self.selected_block_title = QLabel("")
         self.selected_block_title.setObjectName("ChartSectionTitle")
         self.selected_block_title.setWordWrap(True)
@@ -2251,8 +2469,6 @@ class AutomationTab(QWidget):
         self.diagram_view.gate_condition_dropped_to_parent_gate.connect(self._move_gate_child_into_parent_gate_in_diagram)
         self.diagram_view.branch_connected.connect(self._set_branch_connection_from_diagram)
         self.diagram_view.branch_deleted.connect(self._clear_branch_connection_from_diagram)
-
-        self.rule_cooldown.valueChanged.connect(lambda *_args: self._save_current_rule())
 
         self._connect_block_editors()
         self._add_rule()
@@ -2364,9 +2580,20 @@ class AutomationTab(QWidget):
             self._action_form.setRowVisible(self.action_state, not inverter_mode)
             self._action_form.setRowVisible(self.action_inverter_editor, inverter_mode)
         if inverter_mode:
+            if hasattr(self, "action_inverter_hint") and isinstance(self.action_inverter_hint, QLabel):
+                if self._inverter_setting_options:
+                    self.action_inverter_hint.setText(
+                        tr("Add inverter setting changes. Each field can be selected once.")
+                    )
+                else:
+                    self.action_inverter_hint.setText(tr("No available inverter setting fields."))
             if not self._action_inverter_rows and self._inverter_setting_options:
                 self._add_inverter_action_row()
             self._refresh_inverter_action_field_combos()
+        elif hasattr(self, "action_inverter_hint") and isinstance(self.action_inverter_hint, QLabel):
+            self.action_inverter_hint.setText(
+                tr("Add inverter setting changes. Each field can be selected once.")
+            )
         self._update_block_editor_height()
         self._save_block_editor()
 
@@ -2664,7 +2891,18 @@ class AutomationTab(QWidget):
 
     def set_rules(self, rules: list[AutomationRule]) -> None:
         self._rules = [replace(item) for item in rules]
+        for rule in self._rules:
+            rule.cooldown_sec = int(self._global_rule_cooldown_sec)
         self._refresh_rule_list()
+
+    def set_global_cooldown_sec(self, seconds: int) -> None:
+        normalized = max(0, int(seconds))
+        if self._global_rule_cooldown_sec == normalized:
+            return
+        self._global_rule_cooldown_sec = normalized
+        for rule in self._rules:
+            rule.cooldown_sec = normalized
+        self.rules_changed.emit()
 
     def rules(self) -> list[AutomationRule]:
         return [replace(item) for item in self._rules]
@@ -2697,10 +2935,10 @@ class AutomationTab(QWidget):
         layout = QVBoxLayout(box)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        label = QLabel(tr("Select a block to edit."))
-        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        layout.addWidget(label, 0, Qt.AlignmentFlag.AlignTop)
+        self.empty_editor_hint = QLabel(tr("Select a block to edit."))
+        self.empty_editor_hint.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.empty_editor_hint.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        layout.addWidget(self.empty_editor_hint, 0, Qt.AlignmentFlag.AlignTop)
         return box
 
     def _build_trigger_editor(self) -> QWidget:
@@ -2836,10 +3074,10 @@ class AutomationTab(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(8)
 
-        hint = QLabel(tr("Add inverter setting changes. Each field can be selected once."))
-        hint.setObjectName("SidebarMeta")
-        hint.setWordWrap(True)
-        root.addWidget(hint)
+        self.action_inverter_hint = QLabel(tr("Add inverter setting changes. Each field can be selected once."))
+        self.action_inverter_hint.setObjectName("SidebarMeta")
+        self.action_inverter_hint.setWordWrap(True)
+        root.addWidget(self.action_inverter_hint)
 
         rows_holder = QWidget()
         rows_layout = QVBoxLayout(rows_holder)
@@ -2885,7 +3123,7 @@ class AutomationTab(QWidget):
             name=tr("Automation {index}").format(index=len(self._rules) + 1),
             enabled=True,
             active=False,
-            flow_blocks=[{"type": "start"}, {"type": "trigger"}, {"type": "action"}],
+            flow_blocks=[{"type": "start"}, {"type": "trigger"}, {"type": "action"}, {"type": "end"}],
         )
         self._rules.append(rule)
         # Do not rebuild the whole rule list on every autosave - it resets
@@ -3049,8 +3287,6 @@ class AutomationTab(QWidget):
         if normalized_type == "end" and self._has_end_block_in_canvas():
             self._update_palette_block_availability()
             return
-        if self._try_add_palette_block_to_active_target(normalized_type):
-            return
 
         block: dict[str, object]
         if normalized_type == "start":
@@ -3067,8 +3303,42 @@ class AutomationTab(QWidget):
             block = {"type": "end"}
         else:
             block = {"type": "action", "action_type": "power", "value": True, "retries": 0, "retry_delay_sec": 1.0}
-        self._append_block_item(block)
+        self._insert_block_after_selection(block)
         self._save_current_rule()
+
+    def _end_block_row(self) -> int:
+        for idx in range(self.canvas.count()):
+            item = self.canvas.item(idx)
+            if item is None:
+                continue
+            block = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(block, dict) and str(block.get("type", "")).strip().lower() == "end":
+                return idx
+        return -1
+
+    def _insert_block_after_selection(self, block: dict[str, object]) -> None:
+        self._ensure_block_id(block)
+        selected_row = self.diagram_view.selected_index()
+        if selected_row < 0:
+            selected_row = self.canvas.currentRow()
+        end_row = self._end_block_row()
+        insert_row = self.canvas.count() if end_row < 0 else end_row
+        if 0 <= selected_row < self.canvas.count():
+            selected_item = self.canvas.item(selected_row)
+            selected_block = selected_item.data(Qt.ItemDataRole.UserRole) if selected_item is not None else None
+            selected_type = str(selected_block.get("type", "")).strip().lower() if isinstance(selected_block, dict) else ""
+            if selected_type == "end":
+                insert_row = selected_row
+            else:
+                insert_row = selected_row + 1
+                if end_row >= 0:
+                    insert_row = min(insert_row, end_row)
+        insert_row = max(0, min(insert_row, self.canvas.count()))
+        item = QListWidgetItem(self._block_label(block))
+        item.setData(Qt.ItemDataRole.UserRole, dict(block))
+        self.canvas.insertItem(insert_row, item)
+        self.canvas.setCurrentRow(insert_row)
+        self._sync_diagram_from_canvas()
 
     def _has_end_block_in_canvas(self) -> bool:
         for idx in range(self.canvas.count()):
@@ -3258,7 +3528,6 @@ class AutomationTab(QWidget):
     def _populate_rule_details(self, rule: AutomationRule) -> None:
         self._syncing = True
         self._selected_nested_condition = None
-        self.rule_cooldown.setValue(rule.cooldown_sec)
         self.canvas.clear()
         flow_blocks = list(rule.flow_blocks)
         if not flow_blocks:
@@ -3281,11 +3550,22 @@ class AutomationTab(QWidget):
         elif normalized_blocks and str(normalized_blocks[0].get("type", "")).strip().lower() != "start":
             start_block = next((item for item in normalized_blocks if str(item.get("type", "")).strip().lower() == "start"), {"type": "start"})
             normalized_blocks = [dict(start_block), *[item for item in normalized_blocks if str(item.get("type", "")).strip().lower() != "start"]]
+        end_block = next(
+            (dict(item) for item in normalized_blocks if str(item.get("type", "")).strip().lower() == "end"),
+            None,
+        )
+        if end_block is not None:
+            normalized_blocks = [item for item in normalized_blocks if str(item.get("type", "")).strip().lower() != "end"]
+            normalized_blocks.append(end_block)
+        else:
+            normalized_blocks.append({"type": "end"})
         flow_blocks = normalized_blocks
         for block in flow_blocks:
             self._append_block_item(dict(block))
         if self.canvas.count() > 0:
             self.canvas.setCurrentRow(0)
+        else:
+            self._set_empty_editor_message(tr("Select a block to edit."))
         self._sync_diagram_from_canvas()
         self._syncing = False
         self._apply_runtime_highlight()
@@ -3366,12 +3646,14 @@ class AutomationTab(QWidget):
         self._selected_nested_condition = None
         if row < 0 or row >= self.canvas.count():
             self.selected_block_title.setText("")
+            self._set_empty_editor_message(tr("Select a block to edit."))
             self.block_editor.setCurrentIndex(0)
             return
         item = self.canvas.item(row)
         block = item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(block, dict):
             self.selected_block_title.setText("")
+            self._set_empty_editor_message(tr("Select a block to edit."))
             self.block_editor.setCurrentIndex(0)
             return
         kind = str(block.get("type", "")).strip().lower()
@@ -3393,6 +3675,7 @@ class AutomationTab(QWidget):
             self.block_editor.setCurrentIndex(5)
             self._load_action_block(block)
         else:
+            self._set_empty_editor_message(tr("No editable fields for this block."))
             self.block_editor.setCurrentIndex(0)
         self._syncing = False
 
@@ -3754,7 +4037,7 @@ class AutomationTab(QWidget):
             rule.conditions_logic = "all"
         else:
             rule.conditions_logic = "all"
-        rule.cooldown_sec = int(self.rule_cooldown.value())
+        rule.cooldown_sec = int(self._global_rule_cooldown_sec)
         rule.flow_blocks = blocks
         expanded_for_graph = self._expand_blocks_for_graph(blocks)
         rule.flow_graph = build_flow_graph_from_blocks(expanded_for_graph)
@@ -3806,6 +4089,10 @@ class AutomationTab(QWidget):
         # Full rule-list refresh repopulates canvas and jumps to row 0 ("Start").
         self._update_rule_row_selection_state()
         self.rules_changed.emit()
+
+    def _set_empty_editor_message(self, text: str) -> None:
+        if hasattr(self, "empty_editor_hint") and isinstance(self.empty_editor_hint, QLabel):
+            self.empty_editor_hint.setText(str(text))
 
     @staticmethod
     def _expand_gate_children_for_graph(gate_block: dict[str, object]) -> list[dict[str, object]]:
@@ -4172,6 +4459,15 @@ class AutomationTab(QWidget):
                 self._sync_diagram_selection(row)
                 return
             self.canvas.setCurrentRow(row)
+            return
+        self._selected_nested_condition = None
+        self.canvas.setCurrentRow(-1)
+        self.diagram_view.set_selected_index(-1)
+        self.diagram_view.set_selected_gate_condition(-1, -1)
+        self.selected_block_title.setText("")
+        self._set_empty_editor_message(tr("Select a block to edit."))
+        self.block_editor.setCurrentIndex(0)
+        self._apply_runtime_highlight()
 
     def _select_nested_condition_from_diagram(self, gate_row: int, condition_row: int) -> None:
         if gate_row < 0 or gate_row >= self.canvas.count():
@@ -4205,15 +4501,22 @@ class AutomationTab(QWidget):
             return
         normalized_blocks = [dict(item) for item in blocks if isinstance(item, dict)]
         start_block = None
+        end_block = None
         rest_blocks: list[dict[str, object]] = []
         for block in normalized_blocks:
-            if start_block is None and str(block.get("type", "")).strip().lower() == "start":
+            block_type = str(block.get("type", "")).strip().lower()
+            if start_block is None and block_type == "start":
                 start_block = block
+                continue
+            if end_block is None and block_type == "end":
+                end_block = block
                 continue
             rest_blocks.append(block)
         if start_block is None:
             start_block = {"type": "start"}
         normalized_blocks = [start_block, *rest_blocks]
+        if end_block is not None:
+            normalized_blocks.append(end_block)
         self._syncing = True
         selected_row = self.diagram_view.selected_index()
         self.canvas.clear()

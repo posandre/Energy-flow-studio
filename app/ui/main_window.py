@@ -1823,6 +1823,12 @@ class MainWindow(QMainWindow):
         logs_payload = load_profile_automation_logs(profile_name)
         self._automation_logs = [str(item) for item in logs_payload if str(item).strip()]
         if hasattr(self, "automation_tab"):
+            cooldown_sec = (
+                self.active_device_profile.resolved_automation_cooldown_sec()
+                if self.active_device_profile is not None
+                else 60
+            )
+            self.automation_tab.set_global_cooldown_sec(cooldown_sec)
             self.automation_tab.set_rules(self._automation_rules)
             self.automation_tab.set_logs(self._automation_logs)
             self.automation_tab.set_analytics(analytics_from_logs(self._automation_logs))
@@ -2076,98 +2082,140 @@ class MainWindow(QMainWindow):
                 time.sleep(rule.delay_before_actions_sec)
 
             for step in run.steps:
-                self._queue_runtime_automation_node(rule.rule_id, step.node_id)
-                if step.step_type == "delay":
-                    seconds = max(0.0, float(step.payload.get("seconds", 0.0) or 0.0))
-                    self._queue_automation_log(
-                        "info",
-                        rule,
-                        tr("Delay before next step: {seconds} sec").format(seconds=f"{seconds:.3f}"),
-                    )
-                    if seconds > 0:
-                        time.sleep(seconds)
-                    continue
-                if step.step_type != "action":
-                    continue
-
-                action_type = str(step.payload.get("action_type", "power")).strip() or "power"
-                action_device_id = str(step.payload.get("device_id", "")).strip()
                 try:
-                    action_retries = max(0, int(float(step.payload.get("retries", 0) or 0)))
-                except (TypeError, ValueError):
-                    action_retries = 0
-                try:
-                    action_retry_delay_sec = max(0.0, float(step.payload.get("retry_delay_sec", 1.0) or 1.0))
-                except (TypeError, ValueError):
-                    action_retry_delay_sec = 1.0
+                    self._queue_runtime_automation_node(rule.rule_id, step.node_id)
+                    if step.step_type == "delay":
+                        seconds = max(0.0, float(step.payload.get("seconds", 0.0) or 0.0))
+                        self._queue_automation_log(
+                            "info",
+                            rule,
+                            tr("Delay before next step: {seconds} sec").format(seconds=f"{seconds:.3f}"),
+                        )
+                        if seconds > 0:
+                            time.sleep(seconds)
+                        continue
+                    if step.step_type != "action":
+                        continue
 
-                attempt = 0
-                max_attempts = max(1, action_retries + 1)
-                success = False
-                action_target_label = self._automation_device_label(action_device_id)
-                while attempt < max_attempts:
-                    attempt += 1
-                    ok = False
-                    details = "unknown"
-                    success_message = ""
-                    if action_type == "power":
-                        action_value = bool(step.payload.get("value", False))
-                        if not action_device_id:
-                            self._queue_automation_log("error", rule, tr("Action skipped: no device selected."))
+                    action_type = str(step.payload.get("action_type", "power")).strip() or "power"
+                    action_device_id = str(step.payload.get("device_id", "")).strip()
+                    try:
+                        action_retries = max(0, int(float(step.payload.get("retries", 0) or 0)))
+                    except (TypeError, ValueError):
+                        action_retries = 0
+                    try:
+                        action_retry_delay_sec = max(0.0, float(step.payload.get("retry_delay_sec", 1.0) or 1.0))
+                    except (TypeError, ValueError):
+                        action_retry_delay_sec = 1.0
+
+                    attempt = 0
+                    max_attempts = max(1, action_retries + 1)
+                    success = False
+                    action_target_label = self._automation_device_label(action_device_id)
+                    while attempt < max_attempts:
+                        attempt += 1
+                        ok = False
+                        details = "unknown"
+                        success_message = ""
+                        if action_type == "power":
+                            action_value = bool(step.payload.get("value", False))
+                            if not action_device_id:
+                                self._queue_automation_log("error", rule, tr("Action skipped: no device selected."))
+                                break
+                            self._queue_automation_log(
+                                "info",
+                                rule,
+                                "ACTION_SEND "
+                                + f"type=power device_id={action_device_id} "
+                                + f"device={action_target_label} target={'on' if action_value else 'off'} "
+                                + f"attempt={attempt}/{max_attempts} "
+                                + f"endpoint={self._tuya_settings.normalized_endpoint()}",
+                            )
+                            ok, details = self._execute_automation_power_action(action_device_id, action_value)
+                            self._queue_automation_log(
+                                "info",
+                                rule,
+                                "ACTION_RESULT "
+                                + f"type=power device_id={action_device_id} "
+                                + f"attempt={attempt}/{max_attempts} ok={ok} details={details}",
+                            )
+                            device_label = self._automation_device_label(action_device_id)
+                            success_message = tr("Action: {device} - {state} (attempt {attempt}/{max_attempts}).").format(
+                                device=device_label,
+                                state=(tr("On") if action_value else tr("Off")),
+                                attempt=attempt,
+                                max_attempts=max_attempts,
+                            )
+                        elif action_type == "inverter_settings":
+                            changes_raw = step.payload.get("changes", step.payload.get("value", []))
+                            self._queue_automation_log(
+                                "info",
+                                rule,
+                                "ACTION_SEND "
+                                + f"type=inverter_settings changes={len(changes_raw) if isinstance(changes_raw, list) else 0} "
+                                + f"attempt={attempt}/{max_attempts}",
+                            )
+                            ok, details = self._execute_automation_inverter_settings_action(changes_raw)
+                            self._queue_automation_log(
+                                "info",
+                                rule,
+                                "ACTION_RESULT "
+                                + f"type=inverter_settings attempt={attempt}/{max_attempts} ok={ok} details={details}",
+                            )
+                            changes_count = len(changes_raw) if isinstance(changes_raw, list) else 0
+                            success_message = tr(
+                                "Inverter settings updated ({count}) (attempt {attempt}/{max_attempts})."
+                            ).format(
+                                count=changes_count,
+                                attempt=attempt,
+                                max_attempts=max_attempts,
+                            )
+                        else:
+                            self._queue_automation_log(
+                                "error",
+                                rule,
+                                tr("Unsupported action type: {action_type}").format(action_type=action_type),
+                            )
                             break
-                        ok, details = self._execute_automation_power_action(action_device_id, action_value)
-                        device_label = self._automation_device_label(action_device_id)
-                        success_message = tr("Action: {device} - {state} (attempt {attempt}/{max_attempts}).").format(
-                            device=device_label,
-                            state=(tr("On") if action_value else tr("Off")),
-                            attempt=attempt,
-                            max_attempts=max_attempts,
-                        )
-                    elif action_type == "inverter_settings":
-                        changes_raw = step.payload.get("changes", step.payload.get("value", []))
-                        ok, details = self._execute_automation_inverter_settings_action(changes_raw)
-                        changes_count = len(changes_raw) if isinstance(changes_raw, list) else 0
-                        success_message = tr(
-                            "Inverter settings updated ({count}) (attempt {attempt}/{max_attempts})."
-                        ).format(
-                            count=changes_count,
-                            attempt=attempt,
-                            max_attempts=max_attempts,
-                        )
-                    else:
+                        if ok:
+                            self._queue_automation_log(
+                                "ok",
+                                rule,
+                                success_message,
+                            )
+                            success = True
+                            break
                         self._queue_automation_log(
                             "error",
                             rule,
-                            tr("Unsupported action type: {action_type}").format(action_type=action_type),
+                            tr("Action failed for {device_id} (attempt {attempt}/{max_attempts}): {details}").format(
+                                device_id=action_target_label,
+                                attempt=attempt,
+                                max_attempts=max_attempts,
+                                details=details,
+                            ),
                         )
-                        break
-                    if ok:
+                        if attempt < max_attempts and action_retry_delay_sec > 0:
+                            time.sleep(action_retry_delay_sec)
+                    if not success:
                         self._queue_automation_log(
-                            "ok",
+                            "error",
                             rule,
-                            success_message,
+                            tr("Action exhausted retries for {device_id}.").format(
+                                device_id=action_target_label,
+                            ),
                         )
-                        success = True
-                        break
+                except Exception:
                     self._queue_automation_log(
                         "error",
                         rule,
-                        tr("Action failed for {device_id} (attempt {attempt}/{max_attempts}): {details}").format(
-                            device_id=action_target_label,
-                            attempt=attempt,
-                            max_attempts=max_attempts,
-                            details=details,
-                        ),
+                        "ACTION_EXCEPTION "
+                        + f"node_id={getattr(step, 'node_id', '')} type={getattr(step, 'step_type', '')}",
                     )
-                    if attempt < max_attempts and action_retry_delay_sec > 0:
-                        time.sleep(action_retry_delay_sec)
-                if not success:
                     self._queue_automation_log(
                         "error",
                         rule,
-                        tr("Action exhausted retries for {device_id}.").format(
-                            device_id=action_target_label,
-                        ),
+                        traceback.format_exc().strip(),
                     )
 
             if action_steps:
@@ -2175,6 +2223,9 @@ class MainWindow(QMainWindow):
             self._queue_automation_save()
             self._log_flow_run_summary(rule, run, action_steps=len(action_steps), use_queue=True)
             self._queue_automation_log("info", rule, tr("───────────────────── Run End ─────────────────────"))
+        except Exception:
+            self._queue_automation_log("error", rule, "RUN_EXCEPTION")
+            self._queue_automation_log("error", rule, traceback.format_exc().strip())
         finally:
             self._queue_runtime_automation_node(rule.rule_id, "")
 
@@ -2397,7 +2448,8 @@ class MainWindow(QMainWindow):
             normalized_device_id,
             {"ok": True, "device": updated_device, "target": turn_on},
         )
-        return True, "ok"
+        device_name = str(updated_device.name or updated_device.device_name or normalized_device_id).strip()
+        return True, f"confirmed name={device_name} power_on={bool(updated_device.power_on)}"
 
     def _execute_automation_inverter_settings_action(self, raw_changes: object) -> tuple[bool, str]:
         if not isinstance(raw_changes, list):
@@ -2469,7 +2521,7 @@ class MainWindow(QMainWindow):
         normalized = str(device_id or "").strip()
         if not normalized:
             return tr("Device")
-        if normalized == INVERTER_DEVICE_ID:
+        if normalized == AUTOMATION_INVERTER_DEVICE_ID:
             return tr("Inverter")
         for item in self._tuya_devices:
             if str(item.device_id).strip() != normalized:
