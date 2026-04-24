@@ -157,6 +157,8 @@ AUTO_SYNC_LOOKBACK_MINUTES = 15
 PROFILE_ACTIVATION_ENERGYFLOW_RETRY_DELAYS_MS = (700,)
 ENERGYFLOW_REQUEST_TIMEOUT_MS = 75000
 TUYA_REFRESH_TIMEOUT_MS = 35000
+TUYA_TRANSIENT_RETRY_DELAY_MS = 4000
+TUYA_TRANSIENT_RETRY_MAX_ATTEMPTS = 1
 AUTOMATION_EVALUATION_INTERVAL_MS = 5000
 AUTOMATION_MAX_ACTIONS_PER_CYCLE = 16
 AUTOMATION_INVERTER_DEVICE_ID = "__inverter__"
@@ -174,6 +176,28 @@ def _is_profile_activation_retryable_energyflow_error(message: str) -> bool:
         "timed out",
     )
     return any(marker in normalized for marker in timeout_markers)
+
+
+def _is_retryable_tuya_transport_error(message: str) -> bool:
+    normalized = message.strip().lower()
+    markers = (
+        "could not reach tuya endpoint",
+        "name resolutionerror",
+        "failed to resolve",
+        "nodename nor servname",
+        "temporary failure in name resolution",
+        "network is unreachable",
+        "connection reset",
+        "connection aborted",
+        "timed out",
+        "ssl",
+        "tls",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _should_auto_retry_tuya_transient_error(message: str, attempts: int, *, max_attempts: int) -> bool:
+    return _is_retryable_tuya_transport_error(message) and attempts < max_attempts
 
 
 class DessMonitorImportWorker(QObject):
@@ -1175,6 +1199,7 @@ class MainWindow(QMainWindow):
     inverter_edit_sync_finished = Signal(str, object, object)
     automation_log_requested = Signal(str, object, str)
     automation_save_requested = Signal()
+    automation_runtime_node_requested = Signal(str, str, str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -1295,6 +1320,10 @@ class MainWindow(QMainWindow):
         self._tuya_refresh_timeout_timer = QTimer(self)
         self._tuya_refresh_timeout_timer.setSingleShot(True)
         self._tuya_refresh_timeout_timer.timeout.connect(self._handle_tuya_refresh_timeout)
+        self._tuya_transient_retry_timer = QTimer(self)
+        self._tuya_transient_retry_timer.setSingleShot(True)
+        self._tuya_transient_retry_timer.timeout.connect(self._handle_tuya_transient_retry_timeout)
+        self._tuya_transient_retry_attempts = 0
         self._tuya_gate_state_cache: dict[str, str] = {}
         self._tuya_gate_last_change_cache: dict[str, str] = {}
         self._automation_engine = AutomationEngine()
@@ -1315,6 +1344,10 @@ class MainWindow(QMainWindow):
         self.inverter_edit_sync_finished.connect(self._on_inverter_edit_sync_finished, Qt.ConnectionType.QueuedConnection)
         self.automation_log_requested.connect(self._append_automation_log, Qt.ConnectionType.QueuedConnection)
         self.automation_save_requested.connect(self._save_profile_automations_from_tab, Qt.ConnectionType.QueuedConnection)
+        self.automation_runtime_node_requested.connect(
+            self._set_runtime_automation_node,
+            Qt.ConnectionType.QueuedConnection,
+        )
         self._last_weather_snapshot: WeatherLiveSnapshot | None = None
         self._weather_live_state = "unknown"
         self._weather_live_error = ""
@@ -1758,6 +1791,7 @@ class MainWindow(QMainWindow):
             self._tuya_poll_timer.stop()
             self._tuya_countdown_timer.stop()
             self._tuya_refresh_timeout_timer.stop()
+            self._cancel_tuya_transient_retry(reset_attempts=True)
             self._tuya_action_inflight_ids.clear()
             self._tuya_devices = []
             self._render_tuya_devices([])
@@ -1900,7 +1934,7 @@ class MainWindow(QMainWindow):
         rule = next((item for item in self._automation_rules if item.rule_id == rule_id), None)
         if rule is None:
             return
-        self._append_automation_log("info", rule, tr("Manual run requested."))
+        self._append_automation_log("info", rule, tr("Manual run requested by user."))
         threading.Thread(
             target=self._run_automation_rule_actions,
             args=(rule, True),
@@ -1912,20 +1946,44 @@ class MainWindow(QMainWindow):
         rule = next((item for item in self._automation_rules if item.rule_id == rule_id), None)
         if rule is None:
             return
-        measurements = self._build_tuya_numeric_measurements_map()
-        run = self._automation_engine.run_flow(
-            rule=rule,
-            numeric_measurements=measurements,
-            force_start=True,
-        )
-        success_count = sum(1 for item in run.node_results if item.status == "success")
-        failed_count = sum(1 for item in run.node_results if item.status == "fail")
-        status = tr("passed") if failed_count == 0 and success_count > 0 else tr("failed")
-        self._append_automation_log(
-            "info",
-            rule,
-            tr("Simulation completed: conditions {status}.").format(status=status),
-        )
+        self._queue_runtime_automation_node(rule.rule_id, "")
+        try:
+            self._append_automation_log(
+                "info",
+                rule,
+                tr("══════════ Rule: {name} ({rule_id}) ══════════").format(
+                    name=rule.name,
+                    rule_id=rule.rule_id,
+                ),
+            )
+            measurements = self._build_tuya_numeric_measurements_map()
+            run = self._automation_engine.run_flow(
+                rule=rule,
+                numeric_measurements=measurements,
+                force_start=True,
+            )
+            success_count = sum(1 for item in run.node_results if item.status == "success")
+            failed_count = sum(1 for item in run.node_results if item.status == "fail")
+            status = tr("passed") if failed_count == 0 and success_count > 0 else tr("failed")
+            self._append_automation_log("info", rule, tr("────────────────── Simulation Start ──────────────────"))
+            self._append_automation_log(
+                "info",
+                rule,
+                tr('Rule: "{name}" | Measurements for check: {count}').format(
+                    name=rule.name,
+                    count=len(measurements),
+                ),
+            )
+            self._log_flow_run_node_details(rule, run, highlight_runtime=True)
+            self._append_automation_log(
+                "info",
+                rule,
+                tr("Simulation completed: conditions {status}.").format(status=status),
+            )
+            self._log_flow_run_summary(rule, run, action_steps=0, use_queue=False)
+            self._append_automation_log("info", rule, tr("─────────────────── Simulation End ───────────────────"))
+        finally:
+            self._queue_runtime_automation_node(rule.rule_id, "")
 
     def _handle_clear_automation_logs(self) -> None:
         self._automation_logs = []
@@ -1975,119 +2033,326 @@ class MainWindow(QMainWindow):
             self._refresh_tab_badges()
 
     def _run_automation_rule_actions(self, rule: AutomationRule, force_start: bool = False) -> None:
-        measurements = self._build_tuya_numeric_measurements_map()
-        run = self._automation_engine.run_flow(
-            rule=rule,
-            numeric_measurements=measurements,
-            force_start=force_start,
-        )
+        self._queue_runtime_automation_node(rule.rule_id, "")
+        try:
+            self._queue_automation_log(
+                "info",
+                rule,
+                tr("══════════ Rule: {name} ({rule_id}) ══════════").format(
+                    name=rule.name,
+                    rule_id=rule.rule_id,
+                ),
+            )
+            measurements = self._build_tuya_numeric_measurements_map()
+            run = self._automation_engine.run_flow(
+                rule=rule,
+                numeric_measurements=measurements,
+                force_start=force_start,
+            )
+            self._queue_automation_log("info", rule, tr("──────────────────── Run Start ────────────────────"))
+            self._queue_automation_log(
+                "info",
+                rule,
+                tr('Rule: "{name}" | Measurements for check: {count} | Force start: {force_start}').format(
+                    name=rule.name,
+                    count=len(measurements),
+                    force_start=(tr("yes") if bool(force_start) else tr("no")),
+                ),
+            )
+            self._log_flow_run_node_details(rule, run, use_queue=True, highlight_runtime=True)
 
-        for node_result in run.node_results:
+            action_steps = [step for step in run.steps if step.step_type == "action"]
+            delay_steps = [step for step in run.steps if step.step_type == "delay"]
+            self._queue_automation_log(
+                "info",
+                rule,
+                tr("Execution plan: total={total} action_steps={actions} delay_steps={delays}").format(
+                    total=len(run.steps),
+                    actions=len(action_steps),
+                    delays=len(delay_steps),
+                ),
+            )
+            if not action_steps and not run.steps and rule.delay_before_actions_sec > 0:
+                time.sleep(rule.delay_before_actions_sec)
+
+            for step in run.steps:
+                self._queue_runtime_automation_node(rule.rule_id, step.node_id)
+                if step.step_type == "delay":
+                    seconds = max(0.0, float(step.payload.get("seconds", 0.0) or 0.0))
+                    self._queue_automation_log(
+                        "info",
+                        rule,
+                        tr("Delay before next step: {seconds} sec").format(seconds=f"{seconds:.3f}"),
+                    )
+                    if seconds > 0:
+                        time.sleep(seconds)
+                    continue
+                if step.step_type != "action":
+                    continue
+
+                action_type = str(step.payload.get("action_type", "power")).strip() or "power"
+                action_device_id = str(step.payload.get("device_id", "")).strip()
+                try:
+                    action_retries = max(0, int(float(step.payload.get("retries", 0) or 0)))
+                except (TypeError, ValueError):
+                    action_retries = 0
+                try:
+                    action_retry_delay_sec = max(0.0, float(step.payload.get("retry_delay_sec", 1.0) or 1.0))
+                except (TypeError, ValueError):
+                    action_retry_delay_sec = 1.0
+
+                attempt = 0
+                max_attempts = max(1, action_retries + 1)
+                success = False
+                action_target_label = self._automation_device_label(action_device_id)
+                while attempt < max_attempts:
+                    attempt += 1
+                    ok = False
+                    details = "unknown"
+                    success_message = ""
+                    if action_type == "power":
+                        action_value = bool(step.payload.get("value", False))
+                        if not action_device_id:
+                            self._queue_automation_log("error", rule, tr("Action skipped: no device selected."))
+                            break
+                        ok, details = self._execute_automation_power_action(action_device_id, action_value)
+                        device_label = self._automation_device_label(action_device_id)
+                        success_message = tr("Action: {device} - {state} (attempt {attempt}/{max_attempts}).").format(
+                            device=device_label,
+                            state=(tr("On") if action_value else tr("Off")),
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                        )
+                    elif action_type == "inverter_settings":
+                        changes_raw = step.payload.get("changes", step.payload.get("value", []))
+                        ok, details = self._execute_automation_inverter_settings_action(changes_raw)
+                        changes_count = len(changes_raw) if isinstance(changes_raw, list) else 0
+                        success_message = tr(
+                            "Inverter settings updated ({count}) (attempt {attempt}/{max_attempts})."
+                        ).format(
+                            count=changes_count,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                        )
+                    else:
+                        self._queue_automation_log(
+                            "error",
+                            rule,
+                            tr("Unsupported action type: {action_type}").format(action_type=action_type),
+                        )
+                        break
+                    if ok:
+                        self._queue_automation_log(
+                            "ok",
+                            rule,
+                            success_message,
+                        )
+                        success = True
+                        break
+                    self._queue_automation_log(
+                        "error",
+                        rule,
+                        tr("Action failed for {device_id} (attempt {attempt}/{max_attempts}): {details}").format(
+                            device_id=action_target_label,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            details=details,
+                        ),
+                    )
+                    if attempt < max_attempts and action_retry_delay_sec > 0:
+                        time.sleep(action_retry_delay_sec)
+                if not success:
+                    self._queue_automation_log(
+                        "error",
+                        rule,
+                        tr("Action exhausted retries for {device_id}.").format(
+                            device_id=action_target_label,
+                        ),
+                    )
+
+            if action_steps:
+                self._automation_engine.mark_rule_executed(rule.rule_id)
+            self._queue_automation_save()
+            self._log_flow_run_summary(rule, run, action_steps=len(action_steps), use_queue=True)
+            self._queue_automation_log("info", rule, tr("───────────────────── Run End ─────────────────────"))
+        finally:
+            self._queue_runtime_automation_node(rule.rule_id, "")
+
+    def _log_flow_run_node_details(
+        self,
+        rule: AutomationRule,
+        run,
+        *,
+        use_queue: bool = False,
+        highlight_runtime: bool = False,
+    ) -> None:
+        total_nodes = len(run.node_results)
+        for index, node_result in enumerate(run.node_results, start=1):
+            if highlight_runtime:
+                runtime_branch = self._runtime_branch_for_node_result(node_result.node_type, node_result.status, node_result.reason)
+                self._queue_runtime_automation_node(rule.rule_id, node_result.node_id, runtime_branch)
             if node_result.status == "success":
                 level = "ok"
             elif node_result.status == "fail":
                 level = "error"
             else:
                 level = "info"
-            self._queue_automation_log(
-                level,
-                rule,
-                f"Node {node_result.node_type}:{node_result.node_id} {node_result.status} ({node_result.reason}).",
+            message = self._format_friendly_node_message(
+                index=index,
+                total=total_nodes,
+                node_type=node_result.node_type,
+                node_status=node_result.status,
+                reason=node_result.reason,
             )
+            if use_queue:
+                self._queue_automation_log(level, rule, message)
+            else:
+                self._append_automation_log(level, rule, message)
 
-        action_steps = [step for step in run.steps if step.step_type == "action"]
-        if not action_steps and not run.steps and rule.delay_before_actions_sec > 0:
-            time.sleep(rule.delay_before_actions_sec)
+    def _log_flow_run_summary(self, rule: AutomationRule, run, *, action_steps: int, use_queue: bool) -> None:
+        ok_count = sum(1 for item in run.node_results if item.status == "success")
+        fail_count = sum(1 for item in run.node_results if item.status == "fail")
+        skip_count = sum(1 for item in run.node_results if item.status == "skipped")
+        summary = tr(
+            "Run summary: success={ok} fail={fail} skipped={skipped} executed_actions={actions}"
+        ).format(
+            ok=ok_count,
+            fail=fail_count,
+            skipped=skip_count,
+            actions=action_steps,
+        )
+        if use_queue:
+            self._queue_automation_log("info", rule, summary)
+        else:
+            self._append_automation_log("info", rule, summary)
 
-        for step in run.steps:
-            if step.step_type == "delay":
-                seconds = max(0.0, float(step.payload.get("seconds", 0.0) or 0.0))
-                if seconds > 0:
-                    time.sleep(seconds)
-                continue
-            if step.step_type != "action":
-                continue
+    def _format_friendly_node_message(self, *, index: int, total: int, node_type: str, node_status: str, reason: str) -> str:
+        prefix = tr("[Step {index}/{total}] {node_type}").format(
+            index=index,
+            total=total,
+            node_type=self._friendly_node_type(node_type),
+        )
+        status_text = {
+            "success": tr("done"),
+            "fail": tr("not completed"),
+            "skipped": tr("skipped"),
+        }.get(node_status, node_status)
+        short_reason, details = self._split_reason_details(reason)
+        if short_reason.startswith("condition_"):
+            metric = details.get("metric", tr("unknown metric"))
+            device = details.get("device", "<global>")
+            actual = details.get("actual", "?")
+            operator = details.get("operator", "?")
+            expected = details.get("expected", "?")
+            return tr(
+                '{prefix}: Condition for "{metric}" ({device}) -> {status}. Check: {actual} {operator} {expected}.'
+            ).format(
+                prefix=prefix,
+                metric=metric,
+                device=device,
+                status=status_text,
+                actual=actual,
+                operator=operator,
+                expected=expected,
+            )
+        if short_reason.startswith("trigger_"):
+            metric = details.get("metric", tr("unknown metric"))
+            actual = details.get("actual", "?")
+            operator = details.get("operator", "?")
+            expected = details.get("expected", "?")
+            fired = details.get("fired")
+            fired_text = (
+                tr(", fired={fired}").format(fired=fired)
+                if fired is not None
+                else ""
+            )
+            return tr(
+                "{prefix}: Trigger -> {status}. Check: {metric}: {actual} {operator} {expected}{fired}."
+            ).format(
+                prefix=prefix,
+                status=status_text,
+                metric=metric,
+                actual=actual,
+                operator=operator,
+                expected=expected,
+                fired=fired_text,
+            )
+        if short_reason.startswith("gate_"):
+            inputs = details.get("inputs", "?")
+            true_count = details.get("true", "?")
+            false_count = details.get("false", "?")
+            return tr(
+                "{prefix}: Gate evaluation -> {status}. Inputs: {inputs}, true: {true_count}, false: {false_count}."
+            ).format(
+                prefix=prefix,
+                status=status_text,
+                inputs=inputs,
+                true_count=true_count,
+                false_count=false_count,
+            )
+        if short_reason == "metric_missing":
+            metric = details.get("metric", tr("unknown metric"))
+            return tr('{prefix}: Metric "{metric}" is missing in current measurements.').format(
+                prefix=prefix,
+                metric=metric,
+            )
+        return tr("{prefix}: {status}. Details: {details}").format(
+            prefix=prefix,
+            status=status_text,
+            details=self._friendly_reason_title(short_reason),
+        )
 
-            action_type = str(step.payload.get("action_type", "power")).strip() or "power"
-            action_device_id = str(step.payload.get("device_id", "")).strip()
-            try:
-                action_retries = max(0, int(float(step.payload.get("retries", 0) or 0)))
-            except (TypeError, ValueError):
-                action_retries = 0
-            try:
-                action_retry_delay_sec = max(0.0, float(step.payload.get("retry_delay_sec", 1.0) or 1.0))
-            except (TypeError, ValueError):
-                action_retry_delay_sec = 1.0
+    @staticmethod
+    def _friendly_node_type(node_type: str) -> str:
+        return {
+            "start": tr("Start"),
+            "trigger": tr("Trigger"),
+            "condition": tr("Condition"),
+            "gate": tr("Gate"),
+            "delay": tr("Delay"),
+            "action": tr("Action"),
+            "end": tr("End"),
+        }.get(str(node_type).strip().lower(), str(node_type).strip().lower())
 
-            attempt = 0
-            max_attempts = max(1, action_retries + 1)
-            success = False
-            action_target_label = action_device_id or tr("Inverter")
-            while attempt < max_attempts:
-                attempt += 1
-                ok = False
-                details = "unknown"
-                success_message = ""
-                if action_type == "power":
-                    action_value = bool(step.payload.get("value", False))
-                    if not action_device_id:
-                        self._queue_automation_log("error", rule, tr("Action skipped: no device selected."))
-                        break
-                    ok, details = self._execute_automation_power_action(action_device_id, action_value)
-                    success_message = tr("Power {state} -> {device_id} (attempt {attempt}/{max_attempts}).").format(
-                        state=(tr("ON") if action_value else tr("OFF")),
-                        device_id=action_device_id,
-                        attempt=attempt,
-                        max_attempts=max_attempts,
-                    )
-                elif action_type == "inverter_settings":
-                    changes_raw = step.payload.get("changes", step.payload.get("value", []))
-                    ok, details = self._execute_automation_inverter_settings_action(changes_raw)
-                    changes_count = len(changes_raw) if isinstance(changes_raw, list) else 0
-                    success_message = tr(
-                        "Inverter settings updated ({count}) (attempt {attempt}/{max_attempts})."
-                    ).format(
-                        count=changes_count,
-                        attempt=attempt,
-                        max_attempts=max_attempts,
-                    )
-                else:
-                    self._queue_automation_log(
-                        "error",
-                        rule,
-                        tr("Unsupported action type: {action_type}").format(action_type=action_type),
-                    )
-                    break
-                if ok:
-                    self._queue_automation_log(
-                        "ok",
-                        rule,
-                        success_message,
-                    )
-                    success = True
-                    break
-                self._queue_automation_log(
-                    "error",
-                    rule,
-                    tr("Action failed for {device_id} (attempt {attempt}/{max_attempts}): {details}").format(
-                        device_id=action_target_label,
-                        attempt=attempt,
-                        max_attempts=max_attempts,
-                        details=details,
-                    ),
-                )
-                if attempt < max_attempts and action_retry_delay_sec > 0:
-                    time.sleep(action_retry_delay_sec)
-            if not success:
-                self._queue_automation_log(
-                    "error",
-                    rule,
-                    tr("Action exhausted retries for {device_id}.").format(device_id=action_target_label),
-                )
+    @staticmethod
+    def _friendly_reason_title(reason: str) -> str:
+        titles = {
+            "start_ready": tr("start node ready"),
+            "end_reached": tr("end reached"),
+            "action_ready": tr("action is ready"),
+            "delay_ready": tr("delay is ready"),
+            "upstream_blocked": tr("blocked by upstream node"),
+            "forced_start=True": tr("forced start"),
+        }
+        return titles.get(reason, reason)
 
-        if action_steps:
-            self._automation_engine.mark_rule_executed(rule.rule_id)
-        self._queue_automation_save()
+    @staticmethod
+    def _runtime_branch_for_node_result(node_type: str, status: str, reason: str) -> str:
+        kind = str(node_type or "").strip().lower()
+        state = str(status or "").strip().lower()
+        short_reason = str(reason or "").split(";", 1)[0].strip().lower()
+        if kind in {"condition", "gate"}:
+            if short_reason.endswith("_true") or state == "success":
+                return "true"
+            if short_reason.endswith("_false") or state == "fail":
+                return "false"
+            return ""
+        if kind in {"start", "trigger", "delay", "action"} and state == "success":
+            return "next"
+        return ""
+
+    @staticmethod
+    def _split_reason_details(reason: str) -> tuple[str, dict[str, str]]:
+        text = str(reason or "").strip()
+        if not text:
+            return "", {}
+        parts = text.split(";", 1)
+        short_reason = parts[0].strip()
+        details: dict[str, str] = {}
+        if len(parts) > 1:
+            for key, value in re.findall(r"([a-zA-Z_]+)=([^\s]+)", parts[1]):
+                details[key] = value
+        return short_reason, details
 
     def _queue_automation_log(self, level: str, rule: AutomationRule, message: str) -> None:
         if QThread.currentThread() is self.thread():
@@ -2100,6 +2365,19 @@ class MainWindow(QMainWindow):
             self._save_profile_automations_from_tab()
             return
         self.automation_save_requested.emit()
+
+    def _set_runtime_automation_node(self, rule_id: str, node_id: str, branch: str = "") -> None:
+        if hasattr(self, "automation_tab"):
+            self.automation_tab.set_runtime_active_node(rule_id, node_id, branch)
+
+    def _queue_runtime_automation_node(self, rule_id: str, node_id: str, branch: str = "") -> None:
+        normalized_rule = str(rule_id or "").strip()
+        normalized_node = str(node_id or "").strip()
+        normalized_branch = str(branch or "").strip().lower()
+        if QThread.currentThread() is self.thread():
+            self._set_runtime_automation_node(normalized_rule, normalized_node, normalized_branch)
+            return
+        self.automation_runtime_node_requested.emit(normalized_rule, normalized_node, normalized_branch)
 
     def _execute_automation_power_action(self, device_id: str, turn_on: bool) -> tuple[bool, str]:
         normalized_device_id = device_id.strip()
@@ -2187,10 +2465,23 @@ class MainWindow(QMainWindow):
                     self._persist_inverter_settings_cache(self.active_device_profile, list(self._latest_inverter_settings), loaded_at)
         return True, "ok"
 
+    def _automation_device_label(self, device_id: str) -> str:
+        normalized = str(device_id or "").strip()
+        if not normalized:
+            return tr("Device")
+        if normalized == INVERTER_DEVICE_ID:
+            return tr("Inverter")
+        for item in self._tuya_devices:
+            if str(item.device_id).strip() != normalized:
+                continue
+            title = str(item.name or item.device_name or normalized).strip()
+            return title or normalized
+        return normalized
+
     def _append_automation_log(self, level: str, rule: AutomationRule, message: str) -> None:
         label = level.strip().upper() or "INFO"
         now = datetime.now().strftime("%H:%M:%S")
-        line = f"{now} [{label}] rule={rule.rule_id} {rule.name}: {message}"
+        line = f"{now} [{label}] {message}"
         self._automation_logs.append(line)
         self._automation_logs = self._automation_logs[-400:]
         profile_name = self.active_device_profile.profile_name if self.active_device_profile is not None else ""
@@ -2291,9 +2582,11 @@ class MainWindow(QMainWindow):
             return
         self._refresh_tuya_devices()
 
-    def _refresh_tuya_devices(self) -> None:
+    def _refresh_tuya_devices(self, *, auto_retry: bool = False) -> None:
         if not self._tuya_settings.enabled or self._tuya_loading:
             return
+        if not auto_retry:
+            self._cancel_tuya_transient_retry(reset_attempts=True)
         if self._tuya_poll_timer.isActive():
             self._tuya_poll_timer.stop()
             self._tuya_poll_timer.start()
@@ -2319,6 +2612,19 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=worker, daemon=True, name=f"tuya-refresh-{request_id}").start()
 
+    def _handle_tuya_transient_retry_timeout(self) -> None:
+        if not self._tuya_settings.enabled:
+            self._cancel_tuya_transient_retry(reset_attempts=True)
+            return
+        if self._tuya_loading:
+            return
+        self._refresh_tuya_devices(auto_retry=True)
+
+    def _cancel_tuya_transient_retry(self, *, reset_attempts: bool) -> None:
+        self._tuya_transient_retry_timer.stop()
+        if reset_attempts:
+            self._tuya_transient_retry_attempts = 0
+
     def _handle_tuya_refresh_timeout(self) -> None:
         if not self._tuya_loading:
             return
@@ -2335,6 +2641,7 @@ class MainWindow(QMainWindow):
         self._tuya_refresh_timeout_timer.stop()
         try:
             if bool(result.get("ok")):
+                self._cancel_tuya_transient_retry(reset_attempts=True)
                 devices = list(result.get("devices") or [])
                 self._tuya_devices = devices
                 self._render_tuya_devices(self._tuya_devices)
@@ -2344,15 +2651,51 @@ class MainWindow(QMainWindow):
                 self._set_tab_message(self.tuya_status_label, message, error=False)
             else:
                 exc_text = str(result.get("error", "Unknown Tuya error"))
+                friendly_error = self._friendly_tuya_error(exc_text)
+                transient_transport_error = _is_retryable_tuya_transport_error(exc_text)
+                auto_retry_planned = False
+                if _should_auto_retry_tuya_transient_error(
+                    exc_text,
+                    self._tuya_transient_retry_attempts,
+                    max_attempts=TUYA_TRANSIENT_RETRY_MAX_ATTEMPTS,
+                ):
+                    self._tuya_transient_retry_attempts += 1
+                    self._tuya_transient_retry_timer.start(TUYA_TRANSIENT_RETRY_DELAY_MS)
+                    auto_retry_planned = True
+                elif not transient_transport_error:
+                    self._cancel_tuya_transient_retry(reset_attempts=True)
+
                 if self._tuya_devices:
+                    if transient_transport_error:
+                        message = f"Tuya temporarily unavailable: {friendly_error} (showing last known devices)"
+                        if auto_retry_planned:
+                            retry_seconds = TUYA_TRANSIENT_RETRY_DELAY_MS // 1000
+                            message += f". Retrying automatically in {retry_seconds}s."
+                        message = tr_fragment(message)
+                    else:
+                        message = tr_fragment(f"Tuya error: {friendly_error} (showing last known devices)")
                     self._set_tab_message(
                         self.tuya_status_label,
-                        tr_fragment(f"Tuya error: {exc_text} (showing last known devices)"),
-                        error=True,
+                        message,
+                        error=not transient_transport_error,
                     )
                 else:
-                    self._set_tab_message(self.tuya_status_label, tr_fragment(f"Tuya error: {exc_text}"), error=True)
-                    self._render_tuya_devices([])
+                    message = f"Tuya error: {friendly_error}"
+                    show_error = True
+                    if transient_transport_error and auto_retry_planned:
+                        retry_seconds = TUYA_TRANSIENT_RETRY_DELAY_MS // 1000
+                        message = (
+                            f"Tuya temporarily unavailable: {friendly_error}. "
+                            f"Retrying automatically in {retry_seconds}s."
+                        )
+                        show_error = False
+                    self._set_tab_message(
+                        self.tuya_status_label,
+                        tr_fragment(message),
+                        error=show_error,
+                    )
+                    if not transient_transport_error:
+                        self._render_tuya_devices([])
         except Exception as exc:
             self._append_log(f"Tuya refresh UI warning: {exc}")
         finally:
@@ -2762,9 +3105,17 @@ class MainWindow(QMainWindow):
         if not clean:
             return tr("Unknown Tuya error")
         first_line = clean.splitlines()[0].strip()
+        if first_line.lower().startswith("could not reach tuya endpoint:"):
+            first_line = first_line.split(":", 1)[1].strip() or first_line
+        if "(caused by" in first_line.lower():
+            first_line = re.split(r"\(caused by", first_line, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        if _is_retryable_tuya_transport_error(clean):
+            if "name resolution" in clean.lower() or "failed to resolve" in clean.lower():
+                return "DNS lookup failed after wake."
+            return "Temporary network error."
         if first_line.lower().startswith("tuya api error"):
             return first_line
-        return first_line
+        return first_line[:180].strip()
 
     def _format_tuya_measurements_column(self, raw_text: str) -> str:
         normalized = (raw_text or "").strip()

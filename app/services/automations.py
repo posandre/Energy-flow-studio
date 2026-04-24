@@ -658,11 +658,18 @@ class AutomationEngine:
             if node_type == "trigger":
                 if force_start:
                     status = "success"
-                    reason = "forced_start"
+                    reason = "forced_start=True"
                 else:
-                    ok = self._evaluate_trigger_node(rule.rule_id, node_id, params, numeric_measurements, now, update_state=False)
+                    ok, trigger_details = self._evaluate_trigger_node_with_details(
+                        rule_id=rule.rule_id,
+                        node_id=node_id,
+                        params=params,
+                        measurements=numeric_measurements,
+                        now_epoch=now,
+                        update_state=False,
+                    )
                     status = "success" if ok else "fail"
-                    reason = "trigger_true" if ok else "trigger_false"
+                    reason = f"{'trigger_true' if ok else 'trigger_false'}; {trigger_details}"
             elif node_type == "start":
                 status = "success"
                 reason = "start_ready"
@@ -680,7 +687,12 @@ class AutomationEngine:
                     mode = str(params.get("mode", "and")).strip().lower() or "and"
                     passed = all(parent_values) if mode == "and" else any(parent_values)
                     status = "success" if passed else "fail"
-                    reason = f"gate_{mode}_{'passed' if passed else 'failed'}"
+                    true_count = sum(1 for value in parent_values if value)
+                    false_count = len(parent_values) - true_count
+                    reason = (
+                        f"gate_{mode}_{'passed' if passed else 'failed'}; "
+                        f"inputs={len(parent_values)} true={true_count} false={false_count}"
+                    )
             elif not parent_active:
                 status = "skipped"
                 reason = "upstream_blocked"
@@ -690,13 +702,22 @@ class AutomationEngine:
                 expected = _to_float(params.get("value", 0.0))
                 device_id = str(params.get("device_id", "")).strip()
                 value = _lookup_metric(numeric_measurements, device_id=device_id, metric_key=metric_key)
+                lookup_key = _build_metric_lookup_key(device_id, metric_key)
                 if value is None:
                     status = "fail"
-                    reason = "metric_missing"
+                    reason = (
+                        "metric_missing; "
+                        f"device={device_id or '<global>'} metric={metric_key or '<empty>'} lookup={lookup_key} "
+                        f"operator={operator} expected={_format_number(expected)} actual=<missing>"
+                    )
                 else:
                     passed = evaluate_numeric_condition(value, operator, expected)
                     status = "success" if passed else "fail"
-                    reason = "condition_true" if passed else "condition_false"
+                    reason = (
+                        f"{'condition_true' if passed else 'condition_false'}; "
+                        f"device={device_id or '<global>'} metric={metric_key or '<empty>'} lookup={lookup_key} "
+                        f"actual={_format_number(value)} operator={operator} expected={_format_number(expected)}"
+                    )
             elif node_type == "delay":
                 seconds = max(0.0, _to_float(params.get("seconds", 0.0)))
                 status = "success"
@@ -780,34 +801,75 @@ class AutomationEngine:
         *,
         update_state: bool,
     ) -> bool:
+        fired, _details = self._evaluate_trigger_node_with_details(
+            rule_id=rule_id,
+            node_id=node_id,
+            params=params,
+            measurements=measurements,
+            now_epoch=now_epoch,
+            update_state=update_state,
+        )
+        return fired
+
+    def _evaluate_trigger_node_with_details(
+        self,
+        *,
+        rule_id: str,
+        node_id: str,
+        params: dict[str, object],
+        measurements: dict[str, float],
+        now_epoch: float,
+        update_state: bool,
+    ) -> tuple[bool, str]:
         trigger_type = str(params.get("trigger_type", "measurement")).strip().lower() or "measurement"
         state_key = f"{rule_id}:{node_id}"
         if trigger_type == "manual":
-            return False
+            return False, "trigger_type=manual (requires force_start)"
         if trigger_type == "schedule":
             interval = max(1, int(_to_float(params.get("schedule_every_minutes", 15))))
             slot = int(now_epoch // (interval * 60))
             previous_slot = self._last_schedule_slot.get(state_key)
             if previous_slot == slot:
-                return False
+                return (
+                    False,
+                    "trigger_type=schedule "
+                    f"interval_min={interval} slot={slot} previous_slot={previous_slot} fired=False",
+                )
             if update_state:
                 self._last_schedule_slot[state_key] = slot
-            return True
+            return (
+                True,
+                "trigger_type=schedule "
+                f"interval_min={interval} slot={slot} previous_slot={previous_slot} fired=True",
+            )
 
         metric_key = str(params.get("metric_key", "")).strip()
         operator = str(params.get("operator", ">=")).strip() or ">="
         expected = _to_float(params.get("value", 0.0))
         device_id = str(params.get("device_id", "")).strip()
         value = _lookup_metric(measurements, device_id=device_id, metric_key=metric_key)
+        lookup_key = _build_metric_lookup_key(device_id, metric_key)
         if value is None:
             if update_state:
                 self._last_trigger_state[state_key] = False
-            return False
+            return (
+                False,
+                "trigger_type=measurement "
+                f"device={device_id or '<global>'} metric={metric_key or '<empty>'} lookup={lookup_key} "
+                f"actual=<missing> operator={operator} expected={_format_number(expected)} fired=False",
+            )
         current_state = evaluate_numeric_condition(value, operator, expected)
         previous_state = self._last_trigger_state.get(state_key, False)
         if update_state:
             self._last_trigger_state[state_key] = current_state
-        return current_state and not previous_state
+        fired = current_state and not previous_state
+        return (
+            fired,
+            "trigger_type=measurement "
+            f"device={device_id or '<global>'} metric={metric_key or '<empty>'} lookup={lookup_key} "
+            f"actual={_format_number(value)} operator={operator} expected={_format_number(expected)} "
+            f"current={current_state} previous={previous_state} fired={fired}",
+        )
 
     def _is_rule_triggered(self, rule: AutomationRule, measurements: dict[str, float], now_epoch: float) -> bool:
         trigger_type = rule.trigger_type.strip().lower()
@@ -934,6 +996,14 @@ def _to_float(value: object) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _format_number(value: float) -> str:
+    text = f"{float(value):.6f}"
+    text = text.rstrip("0").rstrip(".")
+    if text in {"-0", ""}:
+        return "0"
+    return text
 
 
 def _edge_is_active_for_parent(

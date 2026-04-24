@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
+import re
 import uuid
 from typing import Iterable
 
@@ -22,6 +24,8 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QFileDialog,
+    QMessageBox,
     QSpinBox,
     QStackedWidget,
     QTextBrowser,
@@ -39,6 +43,7 @@ from app.services.automations import (
     AutomationRule,
     build_flow_graph_from_blocks,
     build_rule_analytics,
+    deserialize_rules,
     flow_blocks_from_graph,
 )
 from app.services.i18n import tr
@@ -211,6 +216,8 @@ class FlowDiagramView(QWidget):
         self._blocks: list[dict[str, object]] = []
         self._labels: list[str] = []
         self._selected_index = -1
+        self._runtime_active_index = -1
+        self._runtime_active_branch: tuple[int, str] | None = None
         self._selected_gate_condition: tuple[int, int] | None = None
         self._hit_areas: list[QRectF] = []
         self._delete_hit_areas: list[QRectF] = []
@@ -298,6 +305,26 @@ class FlowDiagramView(QWidget):
 
     def selected_index(self) -> int:
         return self._selected_index
+
+    def set_runtime_active_index(self, index: int) -> None:
+        normalized = index if 0 <= index < len(self._blocks) else -1
+        if self._runtime_active_index == normalized:
+            return
+        self._runtime_active_index = normalized
+        self.update()
+
+    def set_runtime_active_branch(self, index: int, branch: str) -> None:
+        normalized_branch = str(branch or "").strip().lower()
+        if normalized_branch not in {"true", "false", "next"}:
+            normalized = None
+        elif 0 <= index < len(self._blocks):
+            normalized = (index, normalized_branch)
+        else:
+            normalized = None
+        if self._runtime_active_branch == normalized:
+            return
+        self._runtime_active_branch = normalized
+        self.update()
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802
         if event.mimeData().hasFormat(BLOCK_MIME):
@@ -1001,10 +1028,14 @@ class FlowDiagramView(QWidget):
                 and self._selected_gate_condition[0] == idx
             )
             is_dragged_block = self._drag_active and idx == self._drag_origin_index
+            runtime_active = idx == self._runtime_active_index
             selected = idx == self._selected_index and not gate_nested_selected
             invalid_connection = connectivity.get(idx, False)
             border = QColor(34, 211, 238) if selected else QColor(45, 71, 103)
             background = QColor(12, 28, 52, 220 if selected else 180)
+            if runtime_active:
+                border = QColor(45, 212, 191)
+                background = QColor(10, 58, 74, 230 if selected else 212)
             if invalid_connection:
                 border = QColor(248, 113, 113)
                 background = QColor(54, 19, 28, 205 if selected else 175)
@@ -1785,9 +1816,15 @@ class FlowDiagramView(QWidget):
                         if target is None:
                             continue
                         key = (idx, branch, target_idx)
+                        runtime_branch_active = self._runtime_active_branch == (idx, branch)
                         hovered = self._connection_hover == key
-                        pen_color = color.lighter(125) if hovered else color
-                        painter.setPen(QPen(pen_color, 2.6 if hovered else 1.6))
+                        if runtime_branch_active:
+                            pen_color = color.lighter(145)
+                            line_width = 3.0
+                        else:
+                            pen_color = color.lighter(125) if hovered else color
+                            line_width = 2.6 if hovered else 1.6
+                        painter.setPen(QPen(pen_color, line_width))
                         segments = self._orthogonal_segments(source, target)
                         for segment in segments:
                             painter.drawLine(segment)
@@ -1804,9 +1841,15 @@ class FlowDiagramView(QWidget):
                     if target is None:
                         continue
                     key = (idx, "next", target_idx)
+                    runtime_branch_active = self._runtime_active_branch == (idx, "next")
                     hovered = self._connection_hover == key
-                    pen_color = color.lighter(130) if hovered else color
-                    painter.setPen(QPen(pen_color, 2.2 if hovered else 1.2))
+                    if runtime_branch_active:
+                        pen_color = color.lighter(145)
+                        line_width = 2.8
+                    else:
+                        pen_color = color.lighter(130) if hovered else color
+                        line_width = 2.2 if hovered else 1.2
+                    painter.setPen(QPen(pen_color, line_width))
                     segments = self._orthogonal_segments(source, target)
                     for segment in segments:
                         painter.drawLine(segment)
@@ -1976,6 +2019,9 @@ class AutomationTab(QWidget):
         self._inverter_setting_options: list[dict[str, object]] = []
         self._action_inverter_rows: list[dict[str, object]] = []
         self._active_rule_id: str | None = None
+        self._runtime_rule_id: str | None = None
+        self._runtime_node_id: str | None = None
+        self._runtime_branch: str | None = None
         self._syncing = False
         self._selected_nested_condition: tuple[int, int] | None = None
         self._rule_row_widgets: dict[str, RuleListRowWidget] = {}
@@ -2070,10 +2116,14 @@ class AutomationTab(QWidget):
         self.add_rule_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.add_rule_btn.setFixedSize(24, 24)
         rules_header.addWidget(self.add_rule_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.import_rule_btn = self._header_action_button("⤒", tr("Import JSON"), self._import_rule_json)
+        self.export_rule_btn = self._header_action_button("⤓", tr("Export JSON"), self._export_rule_json)
         self.duplicate_rule_btn = self._header_action_button("⧉", tr("Duplicate"), self._duplicate_rule)
         self.manual_run_btn = self._header_action_button("▶", tr("Run"), self._emit_manual_run)
         self.simulate_btn = self._header_action_button("◉", tr("Simulate"), self._emit_simulate)
         self.delete_rule_btn = self._header_action_button("✕", tr("Delete"), self._delete_rule)
+        rules_header.addWidget(self.import_rule_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        rules_header.addWidget(self.export_rule_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         rules_header.addWidget(self.duplicate_rule_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         rules_header.addWidget(self.manual_run_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         rules_header.addWidget(self.simulate_btn, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -2143,7 +2193,10 @@ class AutomationTab(QWidget):
         right_fields.setSpacing(16)
         right_fields.setAlignment(Qt.AlignmentFlag.AlignTop)
         right_fields.addWidget(meta_panel)
-        right_fields.addWidget(QLabel(tr("Selected Block")))
+        self.selected_block_title = QLabel("")
+        self.selected_block_title.setObjectName("ChartSectionTitle")
+        self.selected_block_title.setWordWrap(True)
+        right_fields.addWidget(self.selected_block_title)
         right_fields.addWidget(self.block_editor)
 
         right_scroll = QScrollArea()
@@ -2633,9 +2686,16 @@ class AutomationTab(QWidget):
             )
         )
 
+    def set_runtime_active_node(self, rule_id: str, node_id: str, branch: str = "") -> None:
+        self._runtime_rule_id = str(rule_id or "").strip() or None
+        self._runtime_node_id = str(node_id or "").strip() or None
+        self._runtime_branch = str(branch or "").strip().lower() or None
+        self._apply_runtime_highlight()
+
     def _build_empty_editor(self) -> QWidget:
         box = QWidget()
         layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         label = QLabel(tr("Select a block to edit."))
         label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
@@ -2646,6 +2706,7 @@ class AutomationTab(QWidget):
     def _build_trigger_editor(self) -> QWidget:
         box = QWidget()
         form = QFormLayout(box)
+        form.setContentsMargins(0, 0, 0, 0)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         self.trigger_mode = QComboBox()
@@ -2682,6 +2743,7 @@ class AutomationTab(QWidget):
     def _build_condition_editor(self) -> QWidget:
         box = QWidget()
         form = QFormLayout(box)
+        form.setContentsMargins(0, 0, 0, 0)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         self.condition_device = QComboBox()
@@ -2707,6 +2769,7 @@ class AutomationTab(QWidget):
     def _build_gate_editor(self) -> QWidget:
         box = QWidget()
         form = QFormLayout(box)
+        form.setContentsMargins(0, 0, 0, 0)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         self.gate_mode = QComboBox()
@@ -2723,6 +2786,7 @@ class AutomationTab(QWidget):
     def _build_delay_editor(self) -> QWidget:
         box = QWidget()
         form = QFormLayout(box)
+        form.setContentsMargins(0, 0, 0, 0)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         self.delay_seconds = QDoubleSpinBox()
@@ -2736,6 +2800,7 @@ class AutomationTab(QWidget):
     def _build_action_editor(self) -> QWidget:
         box = QWidget()
         form = QFormLayout(box)
+        form.setContentsMargins(0, 0, 0, 0)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         self._action_form = form
@@ -2885,6 +2950,86 @@ class AutomationTab(QWidget):
         if rule is None:
             return
         self.simulate_requested.emit(rule.rule_id)
+
+    def _export_rule_json(self, rule_id: str | None = None) -> None:
+        rule = self._rule_by_id(rule_id) if rule_id else self._current_rule()
+        if rule is None:
+            return
+        safe_name = re.sub(r"[^\w\-]+", "_", str(rule.name or "").strip()) or "rule"
+        default_name = f"{safe_name}.json"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            tr("Export rule to JSON"),
+            default_name,
+            tr("JSON Files (*.json)"),
+        )
+        if not file_path:
+            return
+        payload = rule.to_dict()
+        try:
+            with open(file_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(
+                self,
+                tr("Export error"),
+                tr("Failed to export rule JSON:\n{error}").format(error=str(exc)),
+            )
+
+    def _import_rule_json(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            tr("Import rule from JSON"),
+            "",
+            tr("JSON Files (*.json)"),
+        )
+        if not file_path:
+            return
+        try:
+            with open(file_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(
+                self,
+                tr("Import error"),
+                tr("Failed to read JSON file:\n{error}").format(error=str(exc)),
+            )
+            return
+
+        imported: list[AutomationRule] = []
+        try:
+            if isinstance(payload, dict) and isinstance(payload.get("rules"), list):
+                imported = deserialize_rules(payload.get("rules"))
+            elif isinstance(payload, list):
+                imported = deserialize_rules(payload)
+            elif isinstance(payload, dict):
+                imported = [AutomationRule.from_dict(payload)]
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(
+                self,
+                tr("Import error"),
+                tr("Invalid automation rule format:\n{error}").format(error=str(exc)),
+            )
+            return
+
+        if not imported:
+            QMessageBox.information(self, tr("Import"), tr("No rules found in JSON file."))
+            return
+
+        existing_ids = {rule.rule_id for rule in self._rules}
+        imported_rules: list[AutomationRule] = []
+        for rule in imported:
+            rule_data = rule.to_dict()
+            incoming = AutomationRule.from_dict(rule_data)
+            if not str(incoming.rule_id).strip() or incoming.rule_id in existing_ids:
+                incoming.rule_id = uuid.uuid4().hex
+            existing_ids.add(incoming.rule_id)
+            incoming.active = False
+            imported_rules.append(incoming)
+
+        self._rules.extend(imported_rules)
+        self._refresh_rule_list(select_rule_id=imported_rules[0].rule_id)
+        self.rules_changed.emit()
 
     def _toggle_rule_enabled(self, rule_id: str, enabled: bool) -> None:
         rule = self._rule_by_id(rule_id)
@@ -3036,12 +3181,17 @@ class AutomationTab(QWidget):
             return tr("Delay: {seconds} sec").format(seconds=f"{sec:g}")
         if kind == "action":
             action_type = str(block.get("action_type", "power")).strip().lower() or "power"
+            device_id = str(block.get("device_id", "")).strip()
+            device_name = self._device_display_text(device_id)
             if action_type == "inverter_settings":
                 changes = block.get("changes", block.get("value", []))
                 count = len(changes) if isinstance(changes, list) else 0
-                return tr("Action: Inverter settings ({count})").format(count=count)
-            state = tr("ON") if bool(block.get("value", False)) else tr("OFF")
-            return tr("Action: Power {state}").format(state=state)
+                return tr("Action: {device} - Inverter settings ({count})").format(
+                    device=device_name,
+                    count=count,
+                )
+            state = tr("On") if bool(block.get("value", False)) else tr("Off")
+            return tr("Action: {device} - {state}").format(device=device_name, state=state)
         return tr("Block")
 
     def _switch_rule(self, row: int) -> None:
@@ -3050,11 +3200,13 @@ class AutomationTab(QWidget):
         if row < 0 or row >= len(self._rules):
             self._active_rule_id = None
             self._update_rule_row_selection_state()
+            self._apply_runtime_highlight()
             return
         rule = self._rules[row]
         self._active_rule_id = rule.rule_id
         self._update_rule_row_selection_state()
         self._populate_rule_details(rule)
+        self._apply_runtime_highlight()
 
     def _refresh_rule_list(self, *, select_row: int | None = None, select_rule_id: str | None = None) -> None:
         self._syncing = True
@@ -3101,6 +3253,7 @@ class AutomationTab(QWidget):
         # _syncing is True, so we must populate the selected rule explicitly.
         if selected_rule is not None:
             self._populate_rule_details(selected_rule)
+        self._apply_runtime_highlight()
 
     def _populate_rule_details(self, rule: AutomationRule) -> None:
         self._syncing = True
@@ -3135,6 +3288,7 @@ class AutomationTab(QWidget):
             self.canvas.setCurrentRow(0)
         self._sync_diagram_from_canvas()
         self._syncing = False
+        self._apply_runtime_highlight()
 
     def _current_rule(self) -> AutomationRule | None:
         row = self.rule_list.currentRow()
@@ -3159,6 +3313,32 @@ class AutomationTab(QWidget):
             if rule.rule_id == normalized:
                 return idx
         return -1
+
+    def _row_for_node_id(self, node_id: str | None) -> int:
+        normalized = str(node_id or "").strip()
+        if not normalized:
+            return -1
+        for row in range(self.canvas.count()):
+            item = self.canvas.item(row)
+            if item is None:
+                continue
+            block = item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("_id", "")).strip() == normalized:
+                return row
+        return -1
+
+    def _apply_runtime_highlight(self) -> None:
+        active_rule_id = str(self._active_rule_id or "").strip()
+        runtime_rule_id = str(self._runtime_rule_id or "").strip()
+        if not active_rule_id or active_rule_id != runtime_rule_id:
+            self.diagram_view.set_runtime_active_index(-1)
+            self.diagram_view.set_runtime_active_branch(-1, "")
+            return
+        row = self._row_for_node_id(self._runtime_node_id)
+        self.diagram_view.set_runtime_active_index(row)
+        self.diagram_view.set_runtime_active_branch(row, str(self._runtime_branch or ""))
 
     def _select_rule_by_id(self, rule_id: str) -> None:
         row = self._row_for_rule_id(rule_id)
@@ -3185,14 +3365,17 @@ class AutomationTab(QWidget):
     def _show_selected_block_editor(self, row: int) -> None:
         self._selected_nested_condition = None
         if row < 0 or row >= self.canvas.count():
+            self.selected_block_title.setText("")
             self.block_editor.setCurrentIndex(0)
             return
         item = self.canvas.item(row)
         block = item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(block, dict):
+            self.selected_block_title.setText("")
             self.block_editor.setCurrentIndex(0)
             return
         kind = str(block.get("type", "")).strip().lower()
+        self.selected_block_title.setText(self._block_title_text(kind))
         self._syncing = True
         if kind == "trigger":
             self.block_editor.setCurrentIndex(1)
@@ -3212,6 +3395,24 @@ class AutomationTab(QWidget):
         else:
             self.block_editor.setCurrentIndex(0)
         self._syncing = False
+
+    def _block_title_text(self, kind: str) -> str:
+        normalized = str(kind or "").strip().lower()
+        if normalized == "start":
+            return tr("Start")
+        if normalized == "end":
+            return tr("End")
+        if normalized == "trigger":
+            return tr("Trigger")
+        if normalized == "condition":
+            return tr("Condition")
+        if normalized == "gate":
+            return tr("Gate")
+        if normalized == "delay":
+            return tr("Delay")
+        if normalized == "action":
+            return tr("Action")
+        return tr("Block")
 
     def _update_block_editor_height(self) -> None:
         current = self.block_editor.currentWidget()
@@ -3814,6 +4015,17 @@ class AutomationTab(QWidget):
             return f"{text} ({key})"
         return text
 
+    def _device_display_text(self, device_id: str) -> str:
+        normalized = str(device_id or "").strip()
+        if not normalized:
+            return tr("Device")
+        if normalized == INVERTER_DEVICE_ID:
+            return tr("Inverter")
+        for key, title in self._device_options:
+            if str(key).strip() == normalized:
+                return str(title).strip() or normalized
+        return normalized
+
     def _update_trigger_value_unit_suffix(self) -> None:
         metric_key = str(self.trigger_metric.currentData() or "").strip().lower()
         self.trigger_value.setSuffix(self._metric_value_suffix(metric_key))
@@ -3879,7 +4091,7 @@ class AutomationTab(QWidget):
             if not isinstance(block, dict):
                 continue
             blocks.append(dict(block))
-            labels.append(str(item.text()))
+            labels.append(self._block_subtitle(block))
         self.diagram_view.set_blocks(blocks, labels)
         self._sync_diagram_geometry()
         selected_row = self.canvas.currentRow()
@@ -3888,7 +4100,57 @@ class AutomationTab(QWidget):
             gate_row, condition_row = self._selected_nested_condition
             if gate_row == selected_row:
                 self.diagram_view.set_selected_gate_condition(gate_row, condition_row)
+        self._apply_runtime_highlight()
         self._update_palette_block_availability()
+
+    def _block_subtitle(self, block: dict[str, object]) -> str:
+        kind = str(block.get("type", "")).strip().lower()
+        if kind in {"start", "end"}:
+            return ""
+        if kind == "trigger":
+            trigger_type = str(block.get("trigger_type", "measurement"))
+            if trigger_type == "schedule":
+                return tr("Every {minutes} min").format(
+                    minutes=int(block.get("schedule_every_minutes", 15) or 15)
+                )
+            if trigger_type == "manual":
+                return tr("Manual")
+            metric_key = str(block.get("metric_key", "")).strip()
+            metric = self._metric_display_text(
+                metric_key,
+                include_code=bool(str(block.get("device_id", "")).strip()),
+            ) or metric_key or "metric"
+            operator = str(block.get("operator", ">="))
+            value = float(block.get("value", 0.0) or 0.0)
+            return f"{metric} {operator} {value:g}"
+        if kind == "condition":
+            metric_key = str(block.get("metric_key", "")).strip()
+            metric = self._metric_display_text(
+                metric_key,
+                include_code=bool(str(block.get("device_id", "")).strip()),
+            ) or metric_key or "metric"
+            operator = str(block.get("operator", ">="))
+            value = float(block.get("value", 0.0) or 0.0)
+            return f"{metric} {operator} {value:g}"
+        if kind == "gate":
+            mode = str(block.get("mode", "and")).strip().lower() or "and"
+            mode_label = tr("All conditions") if mode == "and" else tr("Any condition")
+            cond_count = len(self._gate_children(block))
+            return f"{mode_label} ({cond_count})"
+        if kind == "delay":
+            sec = float(block.get("seconds", 0.0) or 0.0)
+            return tr("{seconds} sec").format(seconds=f"{sec:g}")
+        if kind == "action":
+            action_type = str(block.get("action_type", "power")).strip().lower() or "power"
+            device_id = str(block.get("device_id", "")).strip()
+            device_name = self._device_display_text(device_id)
+            if action_type == "inverter_settings":
+                changes = block.get("changes", block.get("value", []))
+                count = len(changes) if isinstance(changes, list) else 0
+                return tr("{device} - Inverter settings ({count})").format(device=device_name, count=count)
+            state = tr("On") if bool(block.get("value", False)) else tr("Off")
+            return tr("{device} - {state}").format(device=device_name, state=state)
+        return ""
 
     def _sync_diagram_selection(self, row: int) -> None:
         self.diagram_view.set_selected_index(row)
@@ -3896,8 +4158,10 @@ class AutomationTab(QWidget):
             gate_row, condition_row = self._selected_nested_condition
             if gate_row == row:
                 self.diagram_view.set_selected_gate_condition(gate_row, condition_row)
+                self._apply_runtime_highlight()
                 return
         self.diagram_view.set_selected_gate_condition(-1, -1)
+        self._apply_runtime_highlight()
 
     def _select_block_from_diagram(self, row: int) -> None:
         if 0 <= row < self.canvas.count():
@@ -3927,6 +4191,7 @@ class AutomationTab(QWidget):
         self.diagram_view.set_selected_gate_condition(gate_row, condition_row)
         self._syncing = True
         child_type = str(child.get("type", "")).strip().lower()
+        self.selected_block_title.setText(self._block_title_text(child_type))
         if child_type == "condition":
             self.block_editor.setCurrentIndex(2)
             self._load_condition_block(child)
@@ -4468,15 +4733,23 @@ def _now_label() -> str:
 
 def analytics_from_logs(log_lines: list[str]) -> dict[str, dict[str, int]]:
     entries = []
+    current_rule_id = ""
+    rule_header_pattern = re.compile(r"\(([0-9a-fA-F]{8,64})\)")
     for line in log_lines:
         text = str(line).strip()
         if not text:
             continue
         level = "ok" if "[OK]" in text else "error" if "[ERROR]" in text else "info"
-        rule_id = ""
+        rule_id = current_rule_id
         if "rule=" in text:
             tail = text.split("rule=", 1)[1]
             rule_id = tail.split(" ", 1)[0].strip()
+            current_rule_id = rule_id or current_rule_id
+        else:
+            match = rule_header_pattern.search(text)
+            if match is not None:
+                rule_id = match.group(1).strip()
+                current_rule_id = rule_id or current_rule_id
         entries.append({"rule_id": rule_id, "level": level})
 
     materialized = []
