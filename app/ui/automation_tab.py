@@ -29,7 +29,9 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QStackedWidget,
     QTextBrowser,
+    QTextEdit,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
     QScrollArea,
@@ -47,6 +49,7 @@ from app.services.automations import (
     flow_blocks_from_graph,
 )
 from app.services.i18n import tr
+from app.services.secret_store import keychain_available, load_secret, save_secret
 from app.services.tuya_api import TuyaDevice
 from app.ui.dialogs import ask_compact_confirmation
 
@@ -2034,6 +2037,9 @@ class FlowDiagramView(QWidget):
         if block_type == "delay":
             return tr("Delay")
         if block_type == "action":
+            action_type = str(block.get("action_type", "power")).strip().lower() or "power"
+            if action_type == "send_message":
+                return tr("Message")
             return tr("Action")
         return tr("Block")
 
@@ -2678,6 +2684,7 @@ class FlowDiagramView(QWidget):
 class RuleListRowWidget(QWidget):
     selected = Signal(str)
     toggled = Signal(str, bool)
+    renamed = Signal(str, str)
 
     def __init__(self, rule_id: str, name: str, enabled: bool, parent=None) -> None:
         super().__init__(parent)
@@ -2699,9 +2706,13 @@ class RuleListRowWidget(QWidget):
         self.name_label = QLabel(name)
         self.name_label.setObjectName("AutomationRuleName")
         self.name_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.name_edit = QLineEdit(name)
+        self.name_edit.setVisible(False)
+        self.name_edit.editingFinished.connect(self._finish_rename)
 
         layout.addWidget(self.enabled_check)
         layout.addWidget(self.name_label, 1)
+        layout.addWidget(self.name_edit, 1)
 
         self.enabled_check.toggled.connect(lambda checked: self.toggled.emit(self._rule_id, checked))
 
@@ -2712,11 +2723,39 @@ class RuleListRowWidget(QWidget):
         self.update()
 
     def set_name(self, name: str) -> None:
-        self.name_label.setText(name)
+        safe = str(name)
+        self.name_label.setText(safe)
+        self.name_edit.setText(safe)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         self.selected.emit(self._rule_id)
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        self.selected.emit(self._rule_id)
+        self._begin_rename()
+        super().mouseDoubleClickEvent(event)
+
+    def _begin_rename(self) -> None:
+        self.name_edit.setText(self.name_label.text())
+        self.name_label.setVisible(False)
+        self.name_edit.setVisible(True)
+        self.name_edit.setFocus(Qt.FocusReason.MouseFocusReason)
+        self.name_edit.selectAll()
+
+    def _finish_rename(self) -> None:
+        if not self.name_edit.isVisible():
+            return
+        new_name = str(self.name_edit.text() or "").strip()
+        old_name = str(self.name_label.text() or "").strip()
+        self.name_edit.setVisible(False)
+        self.name_label.setVisible(True)
+        if not new_name:
+            self.name_edit.setText(old_name)
+            return
+        if new_name != old_name:
+            self.name_label.setText(new_name)
+            self.renamed.emit(self._rule_id, new_name)
 
 
 class AutomationTab(QWidget):
@@ -2724,6 +2763,7 @@ class AutomationTab(QWidget):
     manual_run_requested = Signal(str)
     simulate_requested = Signal(str)
     logs_clear_requested = Signal()
+    message_test_requested = Signal(str, str, str, str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -2743,6 +2783,7 @@ class AutomationTab(QWidget):
         self._palette_tile_by_type: dict[str, PaletteTileButton] = {}
         self._global_rule_cooldown_sec = 60
         self._action_editor_action_type = "power"
+        self._message_help_tooltip = ""
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -2992,6 +3033,7 @@ class AutomationTab(QWidget):
             combo.blockSignals(False)
         self._refresh_trigger_metric_options()
         self._refresh_condition_metric_options()
+        self._refresh_message_help_tooltip()
         self._update_action_editor_mode()
 
     def set_measurement_keys(self, keys: list[str]) -> None:
@@ -3070,6 +3112,9 @@ class AutomationTab(QWidget):
             self._action_form.setRowVisible(self.action_state, (not inverter_mode) and (not message_mode))
             self._action_form.setRowVisible(self.action_bot_token, message_mode)
             self._action_form.setRowVisible(self.action_chat_id, message_mode)
+            self._action_form.setRowVisible(self.action_messenger, message_mode)
+            self._action_form.setRowVisible(self.action_message_template, message_mode)
+            self._action_form.setRowVisible(self.action_send_test_btn, message_mode)
             self._action_form.setRowVisible(self.action_inverter_editor, inverter_mode and (not message_mode))
         if inverter_mode and not message_mode:
             if hasattr(self, "action_inverter_hint") and isinstance(self.action_inverter_hint, QLabel):
@@ -3598,8 +3643,22 @@ class AutomationTab(QWidget):
         self.action_state.addItem(tr("Turn OFF"), False)
         self.action_bot_token = QLineEdit()
         self.action_bot_token.setPlaceholderText(tr("Telegram bot token"))
+        self.action_bot_token.setEchoMode(QLineEdit.EchoMode.Password)
         self.action_chat_id = QLineEdit()
         self.action_chat_id.setPlaceholderText(tr("Telegram chat id"))
+        self.action_messenger = QComboBox()
+        self.action_messenger.addItem(tr("Telegram"), "telegram")
+        self.action_messenger.addItem(tr("Viber"), "viber")
+        self.action_message_template = QTextEdit()
+        self.action_message_template.setPlaceholderText(tr('Automation "{rule}" fired at {time}'))
+        self.action_message_template.setMinimumHeight(88)
+        self.action_message_help_btn = QToolButton()
+        self.action_message_help_btn.setObjectName("AutomationHeaderIconButton")
+        self.action_message_help_btn.setText("?")
+        self.action_message_help_btn.setToolTip(tr("Available placeholders"))
+        self.action_message_help_btn.clicked.connect(self._show_message_template_help_tooltip)
+        self.action_send_test_btn = QPushButton(tr("Send test message"))
+        self.action_send_test_btn.setObjectName("SecondaryActionButton")
         self.action_inverter_editor = self._build_action_inverter_editor()
         self.action_inverter_editor.setVisible(False)
         self.action_retries = QSpinBox()
@@ -3612,6 +3671,16 @@ class AutomationTab(QWidget):
         form.addRow(tr("Action"), self.action_state)
         form.addRow(tr("Bot token"), self.action_bot_token)
         form.addRow(tr("Chat ID"), self.action_chat_id)
+        form.addRow(tr("Messenger"), self.action_messenger)
+        message_label = QWidget()
+        message_label_layout = QHBoxLayout(message_label)
+        message_label_layout.setContentsMargins(0, 0, 0, 0)
+        message_label_layout.setSpacing(6)
+        message_label_layout.addWidget(QLabel(tr("Message")))
+        message_label_layout.addWidget(self.action_message_help_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        message_label_layout.addStretch(1)
+        form.addRow(message_label, self.action_message_template)
+        form.addRow(self.action_send_test_btn)
         form.addRow(self.action_inverter_editor)
         form.addRow(tr("Retries"), self.action_retries)
         form.addRow(tr("Retry delay"), self.action_retry_delay)
@@ -3620,6 +3689,8 @@ class AutomationTab(QWidget):
             self.action_state,
             self.action_bot_token,
             self.action_chat_id,
+            self.action_messenger,
+            self.action_message_template,
             self.action_retries,
             self.action_retry_delay,
         )
@@ -3663,6 +3734,8 @@ class AutomationTab(QWidget):
             self.action_state,
             self.action_bot_token,
             self.action_chat_id,
+            self.action_messenger,
+            self.action_message_template,
             self.action_retries,
             self.action_retry_delay,
             self.io_input_count,
@@ -3680,6 +3753,9 @@ class AutomationTab(QWidget):
         self.action_device.currentIndexChanged.connect(lambda *_args: self._update_action_editor_mode())
         self.action_bot_token.textChanged.connect(lambda *_args: self._save_block_editor())
         self.action_chat_id.textChanged.connect(lambda *_args: self._save_block_editor())
+        self.action_messenger.currentIndexChanged.connect(lambda *_args: self._save_block_editor())
+        self.action_message_template.textChanged.connect(lambda: self._save_block_editor())
+        self.action_send_test_btn.clicked.connect(self._emit_message_test)
         self.trigger_mode.currentIndexChanged.connect(lambda *_args: self._update_trigger_editor_mode())
 
     def _add_rule(self) -> None:
@@ -3850,6 +3926,22 @@ class AutomationTab(QWidget):
             rule.version = max(rule.version, rule.draft_version)
         rule.updated_at = _now_label()
         self._refresh_rule_list(select_rule_id=rule.rule_id)
+        self.rules_changed.emit()
+
+    def _rename_rule(self, rule_id: str, new_name: str) -> None:
+        rule = self._rule_by_id(rule_id)
+        if rule is None:
+            return
+        normalized = str(new_name or "").strip()
+        if not normalized:
+            return
+        if normalized == rule.name:
+            return
+        rule.name = normalized
+        rule.updated_at = _now_label()
+        row_widget = self._rule_row_widgets.get(rule_id)
+        if row_widget is not None:
+            row_widget.set_name(normalized)
         self.rules_changed.emit()
 
     def _add_block(self, block_type: str) -> None:
@@ -4079,7 +4171,9 @@ class AutomationTab(QWidget):
             action_type = str(block.get("action_type", "power")).strip().lower() or "power"
             if action_type == "send_message":
                 chat_id = str(block.get("chat_id", "")).strip() or "?"
-                return tr("Action: Telegram message ({chat_id})").format(chat_id=chat_id)
+                messenger = str(block.get("messenger", "telegram")).strip().lower() or "telegram"
+                messenger_label = tr("Viber") if messenger == "viber" else tr("Telegram")
+                return tr("Action: {messenger} message ({chat_id})").format(messenger=messenger_label, chat_id=chat_id)
             device_id = str(block.get("device_id", "")).strip()
             device_name = self._device_display_text(device_id)
             if action_type == "inverter_settings":
@@ -4122,6 +4216,7 @@ class AutomationTab(QWidget):
             row_widget = RuleListRowWidget(rule.rule_id, rule.name, rule.enabled)
             row_widget.selected.connect(self._select_rule_by_id)
             row_widget.toggled.connect(self._toggle_rule_enabled)
+            row_widget.renamed.connect(self._rename_rule)
             self._rule_row_widgets[rule.rule_id] = row_widget
             self.rule_list.setItemWidget(item, row_widget)
             item.setSizeHint(row_widget.sizeHint())
@@ -4313,7 +4408,11 @@ class AutomationTab(QWidget):
             self.block_editor.setCurrentIndex(0)
             return
         kind = str(block.get("type", "")).strip().lower()
-        self.selected_block_title.setText(self._block_title_text(kind))
+        if kind == "action":
+            action_type = str(block.get("action_type", "power")).strip().lower() or "power"
+            self.selected_block_title.setText(tr("Message") if action_type == "send_message" else self._block_title_text(kind))
+        else:
+            self.selected_block_title.setText(self._block_title_text(kind))
         self._load_io_controls_for_block(block)
         self._syncing = True
         if kind == "trigger":
@@ -4387,12 +4486,20 @@ class AutomationTab(QWidget):
         action_type = str(block.get("action_type", "power")).strip().lower() or "power"
         self._action_editor_action_type = action_type
         if action_type == "send_message":
-            self.action_bot_token.setText(str(block.get("bot_token", "") or ""))
+            secret_ref = str(block.get("bot_token_ref", "") or "").strip()
+            token_value = load_secret(secret_ref) if secret_ref else ""
+            self.action_bot_token.setText(token_value or str(block.get("bot_token", "") or ""))
             self.action_chat_id.setText(str(block.get("chat_id", "") or ""))
+            self._set_combo_by_data(self.action_messenger, str(block.get("messenger", "telegram")).strip().lower() or "telegram")
+            self.action_message_template.setPlainText(
+                str(block.get("message_template", 'Automation "{rule}" fired at {time}') or 'Automation "{rule}" fired at {time}')
+            )
         else:
             self._set_combo_by_data(self.action_device, block.get("device_id", ""))
             self.action_bot_token.setText("")
             self.action_chat_id.setText("")
+            self._set_combo_by_data(self.action_messenger, "telegram")
+            self.action_message_template.setPlainText("")
         if action_type == "inverter_settings":
             raw_changes = block.get("changes", block.get("value", []))
             parsed_changes = raw_changes if isinstance(raw_changes, list) else []
@@ -4632,15 +4739,32 @@ class AutomationTab(QWidget):
             active_action_type = str(block.get("action_type", self._action_editor_action_type)).strip().lower() or "power"
             if active_action_type == "send_message":
                 block["action_type"] = "send_message"
-                block["bot_token"] = str(self.action_bot_token.text() or "").strip()
+                token_value = str(self.action_bot_token.text() or "").strip()
                 block["chat_id"] = str(self.action_chat_id.text() or "").strip()
+                block["messenger"] = str(self.action_messenger.currentData() or "telegram").strip().lower() or "telegram"
+                block["message_template"] = str(self.action_message_template.toPlainText() or "").strip() or 'Automation "{rule}" fired at {time}'
+                secret_ref = str(block.get("bot_token_ref", "") or "").strip()
+                if not secret_ref:
+                    secret_ref = f"automation-msg-{uuid.uuid4().hex}"
+                    block["bot_token_ref"] = secret_ref
+                if token_value:
+                    saved = save_secret(secret_ref, token_value)
+                    if not saved and keychain_available():
+                        block["bot_token"] = token_value
+                    else:
+                        block.pop("bot_token", None)
+                else:
+                    block.pop("bot_token", None)
                 block["device_id"] = ""
                 block.pop("value", None)
                 block.pop("changes", None)
             else:
                 block["device_id"] = self.action_device.currentData() or ""
                 block.pop("bot_token", None)
+                block.pop("bot_token_ref", None)
                 block.pop("chat_id", None)
+                block.pop("messenger", None)
+                block.pop("message_template", None)
             if active_action_type != "send_message" and str(block.get("device_id", "")).strip() == INVERTER_DEVICE_ID:
                 block["action_type"] = "inverter_settings"
                 block["changes"] = self._collect_inverter_action_changes()
@@ -4751,9 +4875,17 @@ class AutomationTab(QWidget):
                 raw_changes = block.get("changes", [])
                 raw_value = [dict(item) for item in raw_changes] if isinstance(raw_changes, list) else []
             elif action_type.strip().lower() == "send_message":
+                chat_id = str(block.get("chat_id", "")).strip()
+                bot_token_ref = str(block.get("bot_token_ref", "")).strip()
+                bot_token_fallback = str(block.get("bot_token", "")).strip()
+                if not chat_id or (not bot_token_ref and not bot_token_fallback):
+                    self._set_empty_editor_message(tr("Message action requires bot token and chat ID."))
+                    return
                 raw_value = {
-                    "bot_token": str(block.get("bot_token", "")).strip(),
-                    "chat_id": str(block.get("chat_id", "")).strip(),
+                    "bot_token_ref": bot_token_ref,
+                    "chat_id": chat_id,
+                    "messenger": str(block.get("messenger", "telegram")).strip().lower() or "telegram",
+                    "message_template": str(block.get("message_template", "")).strip(),
                 }
             else:
                 raw_value = bool(block.get("value", False))
@@ -5138,7 +5270,9 @@ class AutomationTab(QWidget):
             action_type = str(block.get("action_type", "power")).strip().lower() or "power"
             if action_type == "send_message":
                 chat_id = str(block.get("chat_id", "")).strip() or "?"
-                return tr("Telegram ({chat_id})").format(chat_id=chat_id)
+                messenger = str(block.get("messenger", "telegram")).strip().lower() or "telegram"
+                messenger_label = tr("Viber") if messenger == "viber" else tr("Telegram")
+                return tr("{messenger} ({chat_id})").format(messenger=messenger_label, chat_id=chat_id)
             device_id = str(block.get("device_id", "")).strip()
             device_name = self._device_display_text(device_id)
             if action_type == "inverter_settings":
@@ -5159,6 +5293,33 @@ class AutomationTab(QWidget):
                 return
         self.diagram_view.set_selected_gate_condition(-1, -1)
         self._apply_runtime_highlight()
+
+    def _emit_message_test(self) -> None:
+        token_value = str(self.action_bot_token.text() or "").strip()
+        chat_id = str(self.action_chat_id.text() or "").strip()
+        template = str(self.action_message_template.toPlainText() or "").strip() or 'Automation "{rule}" fired at {time}'
+        messenger = str(self.action_messenger.currentData() or "telegram").strip().lower() or "telegram"
+        self.message_test_requested.emit(messenger, token_value, chat_id, template)
+
+    def _refresh_message_help_tooltip(self) -> None:
+        metric_lines: list[str] = []
+        for key in sorted({str(item).strip() for item in self._measurement_keys if str(item).strip()}):
+            metric_lines.append(f"- {{{key}}} / {{measure:{key}}}")
+        if not metric_lines:
+            metric_lines.append(f"- {{measure:{tr('metric_key')}}}")
+        base = [
+            tr("Use placeholders in message template:"),
+            "- {rule}, {rule_id}, {node_id}, {time}, {chat_id}",
+            tr("Measurements:"),
+            *metric_lines[:80],
+        ]
+        self._message_help_tooltip = "\n".join(base)
+        if hasattr(self, "action_message_help_btn"):
+            self.action_message_help_btn.setToolTip(self._message_help_tooltip)
+
+    def _show_message_template_help_tooltip(self) -> None:
+        text = self._message_help_tooltip or tr("No placeholders available yet.")
+        QToolTip.showText(self.action_message_help_btn.mapToGlobal(self.action_message_help_btn.rect().bottomLeft()), text, self.action_message_help_btn)
 
     def _select_block_from_diagram(self, row: int) -> None:
         if 0 <= row < self.canvas.count():

@@ -83,6 +83,7 @@ from app.services.automations import (
 )
 from app.services.i18n import set_language, tr, tr_fragment, translate_widget_tree
 from app.services.logging_utils import get_logger
+from app.services.secret_store import load_secret
 from app.services.storage import (
     cached_remote_first_data_for_metadata,
     clear_database,
@@ -1999,6 +2000,32 @@ class MainWindow(QMainWindow):
             self.automation_tab.set_logs(self._automation_logs)
             self.automation_tab.set_analytics(analytics_from_logs(self._automation_logs))
 
+    def _handle_automation_message_test(self, messenger: str, bot_token: str, chat_id: str, template: str) -> None:
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        measurements = self._build_tuya_numeric_measurements_map()
+        message_text = self._render_automation_message_template(
+            template,
+            rule_name="Manual test",
+            rule_id="manual_test",
+            node_id="message_test",
+            timestamp=now_text,
+            chat_id=chat_id,
+            measurements=measurements,
+        )
+        provider = str(messenger or "telegram").strip().lower()
+        if provider == "viber":
+            ok, details = self._execute_automation_viber_action(bot_token=bot_token, chat_id=chat_id, message=message_text)
+        else:
+            ok, details = self._execute_automation_telegram_action(bot_token=bot_token, chat_id=chat_id, message=message_text)
+        if ok:
+            self._show_message(QMessageBox.Icon.Information, tr("Message test"), tr("Test message sent successfully."))
+            return
+        self._show_message(
+            QMessageBox.Icon.Warning,
+            tr("Message test"),
+            tr("Failed to send test message: {details}").format(details=details),
+        )
+
     def _evaluate_automations_cycle(self) -> None:
         if self._automation_inflight_cycle or self._close_requested:
             return
@@ -2172,32 +2199,63 @@ class MainWindow(QMainWindow):
                             )
                         elif action_type == "send_message":
                             bot_token = str(step.payload.get("bot_token", "")).strip()
+                            bot_token_ref = str(step.payload.get("bot_token_ref", "")).strip()
+                            if not bot_token and bot_token_ref:
+                                bot_token = load_secret(bot_token_ref)
                             chat_id = str(step.payload.get("chat_id", "")).strip()
+                            messenger = str(step.payload.get("messenger", "telegram")).strip().lower() or "telegram"
+                            message_template = str(step.payload.get("message_template", "")).strip() or 'Automation "{rule}" fired at {time}'
+                            now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             self._queue_automation_log(
                                 "info",
                                 rule,
                                 "ACTION_SEND "
-                                + f"type=send_message chat_id={chat_id or '<empty>'} "
+                                + f"type=send_message messenger={messenger} chat_id={chat_id or '<empty>'} "
                                 + f"attempt={attempt}/{max_attempts}",
                             )
-                            ok, details = self._execute_automation_telegram_action(
-                                bot_token=bot_token,
+                            rendered_message = self._render_automation_message_template(
+                                message_template,
+                                rule_name=rule.name,
+                                rule_id=rule.rule_id,
+                                node_id=step.node_id,
+                                timestamp=now_text,
                                 chat_id=chat_id,
-                                message=tr('Automation "{name}" fired.').format(name=rule.name),
+                                measurements=measurements,
                             )
+                            if messenger == "viber":
+                                ok, details = self._execute_automation_viber_action(
+                                    bot_token=bot_token,
+                                    chat_id=chat_id,
+                                    message=rendered_message,
+                                )
+                            else:
+                                ok, details = self._execute_automation_telegram_action(
+                                    bot_token=bot_token,
+                                    chat_id=chat_id,
+                                    message=rendered_message,
+                                )
                             self._queue_automation_log(
                                 "info",
                                 rule,
                                 "ACTION_RESULT "
-                                + f"type=send_message attempt={attempt}/{max_attempts} ok={ok} details={details}",
+                                + f"type=send_message messenger={messenger} attempt={attempt}/{max_attempts} ok={ok} details={details}",
                             )
-                            success_message = tr(
-                                "Telegram message sent to chat {chat_id} (attempt {attempt}/{max_attempts})."
-                            ).format(
-                                chat_id=chat_id or "?",
-                                attempt=attempt,
-                                max_attempts=max_attempts,
-                            )
+                            if messenger == "viber":
+                                success_message = tr(
+                                    "Viber message sent to chat {chat_id} (attempt {attempt}/{max_attempts})."
+                                ).format(
+                                    chat_id=chat_id or "?",
+                                    attempt=attempt,
+                                    max_attempts=max_attempts,
+                                )
+                            else:
+                                success_message = tr(
+                                    "Telegram message sent to chat {chat_id} (attempt {attempt}/{max_attempts})."
+                                ).format(
+                                    chat_id=chat_id or "?",
+                                    attempt=attempt,
+                                    max_attempts=max_attempts,
+                                )
                         else:
                             self._queue_automation_log(
                                 "error",
@@ -2567,6 +2625,81 @@ class MainWindow(QMainWindow):
             detail = response.text.strip()[:240]
             return False, f"HTTP {response.status_code}: {detail}"
         return True, "ok"
+
+    def _execute_automation_viber_action(self, *, bot_token: str, chat_id: str, message: str) -> tuple[bool, str]:
+        safe_token = str(bot_token or "").strip()
+        safe_chat_id = str(chat_id or "").strip()
+        if not safe_token:
+            return False, tr("Bot token is empty.")
+        if not safe_chat_id:
+            return False, tr("Chat ID is empty.")
+        url = "https://chatapi.viber.com/pa/send_message"
+        payload = {
+            "receiver": safe_chat_id,
+            "min_api_version": 1,
+            "sender": {"name": "EnergyFlow Studio"},
+            "type": "text",
+            "text": message,
+        }
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                headers={
+                    "X-Viber-Auth-Token": safe_token,
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
+            )
+        except Exception as exc:
+            return False, str(exc)
+        if not response.ok:
+            detail = response.text.strip()[:240]
+            return False, f"HTTP {response.status_code}: {detail}"
+        try:
+            data = response.json()
+        except Exception:
+            return False, tr("Viber API returned a non-JSON response.")
+        if int(data.get("status", 1) or 1) != 0:
+            return False, str(data.get("status_message", "viber_error"))
+        return True, "ok"
+
+    @staticmethod
+    def _render_automation_message_template(
+        template: str,
+        *,
+        rule_name: str,
+        rule_id: str,
+        node_id: str,
+        timestamp: str,
+        chat_id: str,
+        measurements: dict[str, float] | None = None,
+    ) -> str:
+        source = str(template or "").strip() or 'Automation "{rule}" fired at {time}'
+        mapping = {
+            "rule": str(rule_name or "").strip(),
+            "rule_id": str(rule_id or "").strip(),
+            "node_id": str(node_id or "").strip(),
+            "time": str(timestamp or "").strip(),
+            "chat_id": str(chat_id or "").strip(),
+        }
+        metrics = measurements or {}
+        for key, value in metrics.items():
+            safe_key = str(key or "").strip()
+            if not safe_key:
+                continue
+            mapping.setdefault(safe_key, f"{float(value):g}")
+        # Explicit measure accessor: {measure:cur_power}
+        rendered = source
+        for key, value in metrics.items():
+            safe_key = str(key or "").strip()
+            if not safe_key:
+                continue
+            rendered = rendered.replace("{measure:" + safe_key + "}", f"{float(value):g}")
+        try:
+            return rendered.format(**mapping)
+        except Exception:
+            return rendered
 
     def _automation_device_label(self, device_id: str) -> str:
         normalized = str(device_id or "").strip()
@@ -3871,6 +4004,7 @@ class MainWindow(QMainWindow):
         self.automation_tab.manual_run_requested.connect(self._handle_manual_automation_run)
         self.automation_tab.simulate_requested.connect(self._handle_simulate_automation_run)
         self.automation_tab.logs_clear_requested.connect(self._handle_clear_automation_logs)
+        self.automation_tab.message_test_requested.connect(self._handle_automation_message_test)
 
         self.tuya_tab = QWidget()
         tuya_layout = QVBoxLayout(self.tuya_tab)
