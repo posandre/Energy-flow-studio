@@ -2611,7 +2611,7 @@ class MainWindow(QMainWindow):
         if not safe_token:
             return False, tr("Bot token is empty.")
         if not safe_chat_id:
-            return False, tr("Chat ID is empty.")
+            return False, tr("Receiver ID is empty.")
         url = f"https://api.telegram.org/bot{safe_token}/sendMessage"
         try:
             response = requests.post(
@@ -2632,7 +2632,7 @@ class MainWindow(QMainWindow):
         if not safe_token:
             return False, tr("Bot token is empty.")
         if not safe_chat_id:
-            return False, tr("Chat ID is empty.")
+            return False, tr("Receiver ID is empty.")
         url = "https://chatapi.viber.com/pa/send_message"
         payload = {
             "receiver": safe_chat_id,
