@@ -664,15 +664,40 @@ class AutomationEngine:
                 parent_edges = [(src, "any") for src, targets in adjacency.items() if node_id in targets]
             parent_active = False if parent_edges else True
             parent_values: list[bool] = []
-            for parent_id, branch in parent_edges:
-                active, value = _edge_is_active_for_parent(
-                    parent_result=result_map.get(parent_id),
-                    branch=branch,
-                )
-                if not active:
-                    continue
-                parent_active = True
-                parent_values.append(value)
+            if node_type == "gate":
+                for parent_id, branch in parent_edges:
+                    parent_result = result_map.get(parent_id)
+                    if parent_result is None:
+                        continue
+                    normalized_branch = _normalize_edge_branch(branch)
+                    if normalized_branch == "true":
+                        if parent_result.status in {"success", "fail"}:
+                            parent_active = True
+                            parent_values.append(parent_result.status == "success")
+                        continue
+                    if normalized_branch == "false":
+                        if parent_result.status in {"success", "fail"}:
+                            parent_active = True
+                            parent_values.append(parent_result.status == "fail")
+                        continue
+                    active, value = _edge_is_active_for_parent(
+                        parent_result=parent_result,
+                        branch=branch,
+                    )
+                    if not active:
+                        continue
+                    parent_active = True
+                    parent_values.append(value)
+            else:
+                for parent_id, branch in parent_edges:
+                    active, value = _edge_is_active_for_parent(
+                        parent_result=result_map.get(parent_id),
+                        branch=branch,
+                    )
+                    if not active:
+                        continue
+                    parent_active = True
+                    parent_values.append(value)
 
             status = "skipped"
             reason = "upstream_blocked"

@@ -264,6 +264,7 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "Sun": "Сонце",
         "ETA": "ETA",
         "Idle": "Простій",
+        "Charged": "Заряджено",
         "To full": "До повної",
         "To empty": "До розряду",
         "Next refresh": "Наступне оновлення",

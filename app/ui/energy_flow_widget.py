@@ -637,6 +637,8 @@ class EnergyFlowCanvas(QGraphicsView):
 
         current_a = abs(float(current))
         soc_pct = max(0.0, min(100.0, float(soc)))
+        if soc_pct >= 99.9:
+            return (tr("ETA"), tr("Charged"))
         if current_a < 0.05:
             return (tr("ETA"), tr("Idle"))
 
