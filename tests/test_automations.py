@@ -196,3 +196,43 @@ def test_graph_runtime_respects_gate_and_branch_block() -> None:
     )
     assert any(item.node_id == "g2" and item.status == "success" for item in passed_run.node_results)
     assert [step for step in passed_run.steps if step.step_type == "action"]
+
+
+def test_send_message_action_payload_is_preserved() -> None:
+    engine = AutomationEngine()
+    rule = AutomationRule(
+        rule_id="msg1",
+        name="message",
+        active=True,
+        enabled=True,
+        flow_graph={
+            "version": 1,
+            "nodes": [
+                {"id": "t1", "type": "trigger", "params": {"trigger_type": "manual"}},
+                {
+                    "id": "a1",
+                    "type": "action",
+                    "params": {
+                        "action_type": "send_message",
+                        "bot_token": "token123",
+                        "chat_id": "777",
+                        "retries": 1,
+                        "retry_delay_sec": 2.0,
+                    },
+                },
+            ],
+            "edges": [{"source": "t1", "target": "a1"}],
+        },
+    )
+
+    run = engine.run_flow(
+        rule=rule,
+        numeric_measurements={},
+        force_start=True,
+    )
+    action_steps = [step for step in run.steps if step.step_type == "action"]
+    assert len(action_steps) == 1
+    step_payload = action_steps[0].payload
+    assert step_payload.get("action_type") == "send_message"
+    assert step_payload.get("bot_token") == "token123"
+    assert step_payload.get("chat_id") == "777"

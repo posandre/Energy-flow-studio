@@ -2170,6 +2170,34 @@ class MainWindow(QMainWindow):
                                 attempt=attempt,
                                 max_attempts=max_attempts,
                             )
+                        elif action_type == "send_message":
+                            bot_token = str(step.payload.get("bot_token", "")).strip()
+                            chat_id = str(step.payload.get("chat_id", "")).strip()
+                            self._queue_automation_log(
+                                "info",
+                                rule,
+                                "ACTION_SEND "
+                                + f"type=send_message chat_id={chat_id or '<empty>'} "
+                                + f"attempt={attempt}/{max_attempts}",
+                            )
+                            ok, details = self._execute_automation_telegram_action(
+                                bot_token=bot_token,
+                                chat_id=chat_id,
+                                message=tr('Automation "{name}" fired.').format(name=rule.name),
+                            )
+                            self._queue_automation_log(
+                                "info",
+                                rule,
+                                "ACTION_RESULT "
+                                + f"type=send_message attempt={attempt}/{max_attempts} ok={ok} details={details}",
+                            )
+                            success_message = tr(
+                                "Telegram message sent to chat {chat_id} (attempt {attempt}/{max_attempts})."
+                            ).format(
+                                chat_id=chat_id or "?",
+                                attempt=attempt,
+                                max_attempts=max_attempts,
+                            )
                         else:
                             self._queue_automation_log(
                                 "error",
@@ -2517,6 +2545,27 @@ class MainWindow(QMainWindow):
                 self._inverter_settings_cache[active_key] = (list(self._latest_inverter_settings), loaded_at)
                 if self.active_device_profile is not None:
                     self._persist_inverter_settings_cache(self.active_device_profile, list(self._latest_inverter_settings), loaded_at)
+        return True, "ok"
+
+    def _execute_automation_telegram_action(self, *, bot_token: str, chat_id: str, message: str) -> tuple[bool, str]:
+        safe_token = str(bot_token or "").strip()
+        safe_chat_id = str(chat_id or "").strip()
+        if not safe_token:
+            return False, tr("Bot token is empty.")
+        if not safe_chat_id:
+            return False, tr("Chat ID is empty.")
+        url = f"https://api.telegram.org/bot{safe_token}/sendMessage"
+        try:
+            response = requests.post(
+                url,
+                json={"chat_id": safe_chat_id, "text": message},
+                timeout=10,
+            )
+        except Exception as exc:
+            return False, str(exc)
+        if not response.ok:
+            detail = response.text.strip()[:240]
+            return False, f"HTTP {response.status_code}: {detail}"
         return True, "ok"
 
     def _automation_device_label(self, device_id: str) -> str:

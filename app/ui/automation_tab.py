@@ -2742,6 +2742,7 @@ class AutomationTab(QWidget):
         self._rule_row_widgets: dict[str, RuleListRowWidget] = {}
         self._palette_tile_by_type: dict[str, PaletteTileButton] = {}
         self._global_rule_cooldown_sec = 60
+        self._action_editor_action_type = "power"
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -2874,6 +2875,7 @@ class AutomationTab(QWidget):
             ("gate", "⊞", tr("Gate")),
             ("delay", "⏱", tr("Delay")),
             ("action", "⚙", tr("Action")),
+            ("send_message", "✉", tr("Message")),
         ]
         for block_type, icon, title_text in tile_specs:
             tile = PaletteTileButton(
@@ -3062,10 +3064,14 @@ class AutomationTab(QWidget):
 
     def _update_action_editor_mode(self) -> None:
         inverter_mode = self._action_is_inverter_mode()
+        message_mode = str(self._action_editor_action_type).strip().lower() == "send_message"
         if hasattr(self, "_action_form"):
-            self._action_form.setRowVisible(self.action_state, not inverter_mode)
-            self._action_form.setRowVisible(self.action_inverter_editor, inverter_mode)
-        if inverter_mode:
+            self._action_form.setRowVisible(self.action_device, not message_mode)
+            self._action_form.setRowVisible(self.action_state, (not inverter_mode) and (not message_mode))
+            self._action_form.setRowVisible(self.action_bot_token, message_mode)
+            self._action_form.setRowVisible(self.action_chat_id, message_mode)
+            self._action_form.setRowVisible(self.action_inverter_editor, inverter_mode and (not message_mode))
+        if inverter_mode and not message_mode:
             if hasattr(self, "action_inverter_hint") and isinstance(self.action_inverter_hint, QLabel):
                 if self._inverter_setting_options:
                     self.action_inverter_hint.setText(
@@ -3590,6 +3596,10 @@ class AutomationTab(QWidget):
         self.action_state = QComboBox()
         self.action_state.addItem(tr("Turn ON"), True)
         self.action_state.addItem(tr("Turn OFF"), False)
+        self.action_bot_token = QLineEdit()
+        self.action_bot_token.setPlaceholderText(tr("Telegram bot token"))
+        self.action_chat_id = QLineEdit()
+        self.action_chat_id.setPlaceholderText(tr("Telegram chat id"))
         self.action_inverter_editor = self._build_action_inverter_editor()
         self.action_inverter_editor.setVisible(False)
         self.action_retries = QSpinBox()
@@ -3600,12 +3610,16 @@ class AutomationTab(QWidget):
         self.action_retry_delay.setSuffix(" sec")
         form.addRow(tr("Device"), self.action_device)
         form.addRow(tr("Action"), self.action_state)
+        form.addRow(tr("Bot token"), self.action_bot_token)
+        form.addRow(tr("Chat ID"), self.action_chat_id)
         form.addRow(self.action_inverter_editor)
         form.addRow(tr("Retries"), self.action_retries)
         form.addRow(tr("Retry delay"), self.action_retry_delay)
         self._expand_fields(
             self.action_device,
             self.action_state,
+            self.action_bot_token,
+            self.action_chat_id,
             self.action_retries,
             self.action_retry_delay,
         )
@@ -3647,6 +3661,8 @@ class AutomationTab(QWidget):
             self.delay_seconds,
             self.action_device,
             self.action_state,
+            self.action_bot_token,
+            self.action_chat_id,
             self.action_retries,
             self.action_retry_delay,
             self.io_input_count,
@@ -3662,6 +3678,8 @@ class AutomationTab(QWidget):
         self.trigger_metric.currentIndexChanged.connect(lambda *_args: self._update_trigger_value_unit_suffix())
         self.condition_metric.currentIndexChanged.connect(lambda *_args: self._update_condition_value_unit_suffix())
         self.action_device.currentIndexChanged.connect(lambda *_args: self._update_action_editor_mode())
+        self.action_bot_token.textChanged.connect(lambda *_args: self._save_block_editor())
+        self.action_chat_id.textChanged.connect(lambda *_args: self._save_block_editor())
         self.trigger_mode.currentIndexChanged.connect(lambda *_args: self._update_trigger_editor_mode())
 
     def _add_rule(self) -> None:
@@ -3851,6 +3869,17 @@ class AutomationTab(QWidget):
             block = {"type": "gate", "mode": "and", "input_count": 1}
         elif normalized_type == "delay":
             block = {"type": "delay", "seconds": 1.0, "input_count": 1, "output_count": 1}
+        elif normalized_type == "send_message":
+            block = {
+                "type": "action",
+                "action_type": "send_message",
+                "bot_token": "",
+                "chat_id": "",
+                "retries": 0,
+                "retry_delay_sec": 1.0,
+                "input_count": 1,
+                "output_count": 1,
+            }
         elif normalized_type == "end":
             block = {"type": "end", "input_count": 1}
         else:
@@ -4048,6 +4077,9 @@ class AutomationTab(QWidget):
             return tr("Delay: {seconds} sec").format(seconds=f"{sec:g}")
         if kind == "action":
             action_type = str(block.get("action_type", "power")).strip().lower() or "power"
+            if action_type == "send_message":
+                chat_id = str(block.get("chat_id", "")).strip() or "?"
+                return tr("Action: Telegram message ({chat_id})").format(chat_id=chat_id)
             device_id = str(block.get("device_id", "")).strip()
             device_name = self._device_display_text(device_id)
             if action_type == "inverter_settings":
@@ -4352,15 +4384,22 @@ class AutomationTab(QWidget):
         self.condition_value.setValue(float(block.get("value", 0.0) or 0.0))
 
     def _load_action_block(self, block: dict[str, object]) -> None:
-        self._set_combo_by_data(self.action_device, block.get("device_id", ""))
         action_type = str(block.get("action_type", "power")).strip().lower() or "power"
+        self._action_editor_action_type = action_type
+        if action_type == "send_message":
+            self.action_bot_token.setText(str(block.get("bot_token", "") or ""))
+            self.action_chat_id.setText(str(block.get("chat_id", "") or ""))
+        else:
+            self._set_combo_by_data(self.action_device, block.get("device_id", ""))
+            self.action_bot_token.setText("")
+            self.action_chat_id.setText("")
         if action_type == "inverter_settings":
             raw_changes = block.get("changes", block.get("value", []))
             parsed_changes = raw_changes if isinstance(raw_changes, list) else []
             self._load_inverter_action_rows(
                 [item for item in parsed_changes if isinstance(item, dict)]
             )
-        else:
+        elif action_type != "send_message":
             self._set_combo_by_data(self.action_state, bool(block.get("value", False)))
         self.action_retries.setValue(max(0, int(block.get("retries", 0) or 0)))
         self.action_retry_delay.setValue(float(block.get("retry_delay_sec", 1.0) or 1.0))
@@ -4590,12 +4629,23 @@ class AutomationTab(QWidget):
         elif kind == "delay":
             block["seconds"] = float(self.delay_seconds.value())
         elif kind == "action":
-            block["device_id"] = self.action_device.currentData() or ""
-            if str(block.get("device_id", "")).strip() == INVERTER_DEVICE_ID:
+            active_action_type = str(block.get("action_type", self._action_editor_action_type)).strip().lower() or "power"
+            if active_action_type == "send_message":
+                block["action_type"] = "send_message"
+                block["bot_token"] = str(self.action_bot_token.text() or "").strip()
+                block["chat_id"] = str(self.action_chat_id.text() or "").strip()
+                block["device_id"] = ""
+                block.pop("value", None)
+                block.pop("changes", None)
+            else:
+                block["device_id"] = self.action_device.currentData() or ""
+                block.pop("bot_token", None)
+                block.pop("chat_id", None)
+            if active_action_type != "send_message" and str(block.get("device_id", "")).strip() == INVERTER_DEVICE_ID:
                 block["action_type"] = "inverter_settings"
                 block["changes"] = self._collect_inverter_action_changes()
                 block.pop("value", None)
-            else:
+            elif active_action_type != "send_message":
                 block["action_type"] = "power"
                 block["value"] = bool(self.action_state.currentData())
                 block.pop("changes", None)
@@ -4700,6 +4750,11 @@ class AutomationTab(QWidget):
             if action_type.strip().lower() == "inverter_settings":
                 raw_changes = block.get("changes", [])
                 raw_value = [dict(item) for item in raw_changes] if isinstance(raw_changes, list) else []
+            elif action_type.strip().lower() == "send_message":
+                raw_value = {
+                    "bot_token": str(block.get("bot_token", "")).strip(),
+                    "chat_id": str(block.get("chat_id", "")).strip(),
+                }
             else:
                 raw_value = bool(block.get("value", False))
             parsed_actions.append(
@@ -5081,6 +5136,9 @@ class AutomationTab(QWidget):
             return tr("{seconds} sec").format(seconds=f"{sec:g}")
         if kind == "action":
             action_type = str(block.get("action_type", "power")).strip().lower() or "power"
+            if action_type == "send_message":
+                chat_id = str(block.get("chat_id", "")).strip() or "?"
+                return tr("Telegram ({chat_id})").format(chat_id=chat_id)
             device_id = str(block.get("device_id", "")).strip()
             device_name = self._device_display_text(device_id)
             if action_type == "inverter_settings":
