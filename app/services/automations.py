@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+import hashlib
 import time
 import uuid
 
@@ -68,7 +69,7 @@ class AutomationRule:
     name: str
     enabled: bool = True
     active: bool = False
-    trigger_type: str = "measurement"  # measurement|schedule|manual
+    trigger_type: str = "measurement"  # measurement|schedule|manual|snapshot_update
     trigger_metric_key: str = ""
     trigger_operator: str = ">="
     trigger_value: float = 0.0
@@ -557,6 +558,8 @@ class AutomationEngine:
         self._last_run_epoch: dict[str, float] = {}
         self._last_schedule_slot: dict[str, int] = {}
         self._last_trigger_state: dict[str, bool] = {}
+        self._last_snapshot_digest: str | None = None
+        self._last_action_active: dict[str, bool] = {}
 
     def evaluate_ready_rules(
         self,
@@ -566,15 +569,16 @@ class AutomationEngine:
         now_epoch: float | None = None,
     ) -> list[AutomationRule]:
         now = now_epoch if now_epoch is not None else time.time()
+        snapshot_updated = self._update_snapshot_state(numeric_measurements)
         ready: list[AutomationRule] = []
         for rule in rules:
             if not rule.enabled or not rule.active:
                 continue
             if self._has_graph(rule):
-                if not self._is_graph_triggered(rule, numeric_measurements, now):
+                if not self._is_graph_triggered(rule, numeric_measurements, now, snapshot_updated=snapshot_updated):
                     continue
             else:
-                if not self._is_rule_triggered(rule, numeric_measurements, now):
+                if not self._is_rule_triggered(rule, numeric_measurements, now, snapshot_updated=snapshot_updated):
                     continue
                 if not self._is_conditions_passed(rule, numeric_measurements):
                     continue
@@ -583,6 +587,24 @@ class AutomationEngine:
                 continue
             ready.append(rule)
         return ready
+
+    @staticmethod
+    def _snapshot_digest(measurements: dict[str, float]) -> str:
+        if not measurements:
+            return "empty"
+        chunks: list[str] = []
+        for key, value in sorted(measurements.items(), key=lambda item: str(item[0])):
+            chunks.append(f"{key}={_format_number(float(value))}")
+        payload = "|".join(chunks).encode("utf-8", errors="ignore")
+        return hashlib.sha1(payload).hexdigest()
+
+    def _update_snapshot_state(self, measurements: dict[str, float]) -> bool:
+        current = self._snapshot_digest(measurements)
+        previous = self._last_snapshot_digest
+        self._last_snapshot_digest = current
+        if previous is None:
+            return False
+        return current != previous
 
     def mark_rule_executed(self, rule_id: str, *, now_epoch: float | None = None) -> None:
         self._last_run_epoch[rule_id] = now_epoch if now_epoch is not None else time.time()
@@ -667,6 +689,7 @@ class AutomationEngine:
                         measurements=numeric_measurements,
                         now_epoch=now,
                         update_state=False,
+                        snapshot_updated=False,
                     )
                     status = "success" if ok else "fail"
                     reason = f"{'trigger_true' if ok else 'trigger_false'}; {trigger_details}"
@@ -696,6 +719,8 @@ class AutomationEngine:
             elif not parent_active:
                 status = "skipped"
                 reason = "upstream_blocked"
+                if node_type == "action":
+                    self._last_action_active[f"{rule.rule_id}:{node_id}"] = False
             elif node_type == "condition":
                 metric_key = str(params.get("metric_key", "")).strip()
                 operator = str(params.get("operator", ">=")).strip() or ">="
@@ -730,21 +755,45 @@ class AutomationEngine:
                     )
                 )
             elif node_type == "action":
-                status = "success"
-                reason = "action_ready"
-                steps.append(
-                    AutomationRunStep(
-                        step_type="action",
-                        node_id=node_id,
-                        payload={
-                            "action_type": str(params.get("action_type", "power")).strip() or "power",
-                            "device_id": str(params.get("device_id", "")).strip(),
-                            "value": params.get("value", False),
-                            "retries": max(0, int(_to_float(params.get("retries", 0)))),
-                            "retry_delay_sec": max(0.0, _to_float(params.get("retry_delay_sec", 1.0))),
-                        },
+                action_state_key = f"{rule.rule_id}:{node_id}"
+                previous_active = bool(self._last_action_active.get(action_state_key, False))
+                current_active = True
+                self._last_action_active[action_state_key] = current_active
+                if force_start:
+                    status = "success"
+                    reason = "action_ready_forced"
+                    steps.append(
+                        AutomationRunStep(
+                            step_type="action",
+                            node_id=node_id,
+                            payload={
+                                "action_type": str(params.get("action_type", "power")).strip() or "power",
+                                "device_id": str(params.get("device_id", "")).strip(),
+                                "value": params.get("value", False),
+                                "retries": max(0, int(_to_float(params.get("retries", 0)))),
+                                "retry_delay_sec": max(0.0, _to_float(params.get("retry_delay_sec", 1.0))),
+                            },
+                        )
                     )
-                )
+                elif previous_active:
+                    status = "skipped"
+                    reason = "action_state_unchanged"
+                else:
+                    status = "success"
+                    reason = "action_ready"
+                    steps.append(
+                        AutomationRunStep(
+                            step_type="action",
+                            node_id=node_id,
+                            payload={
+                                "action_type": str(params.get("action_type", "power")).strip() or "power",
+                                "device_id": str(params.get("device_id", "")).strip(),
+                                "value": params.get("value", False),
+                                "retries": max(0, int(_to_float(params.get("retries", 0)))),
+                                "retry_delay_sec": max(0.0, _to_float(params.get("retry_delay_sec", 1.0))),
+                            },
+                        )
+                    )
             else:
                 status = "fail"
                 reason = "unsupported_node"
@@ -773,7 +822,14 @@ class AutomationEngine:
             return build_flow_graph_from_blocks(rule.flow_blocks)
         return build_flow_graph_from_legacy_fields(rule.to_dict())
 
-    def _is_graph_triggered(self, rule: AutomationRule, measurements: dict[str, float], now_epoch: float) -> bool:
+    def _is_graph_triggered(
+        self,
+        rule: AutomationRule,
+        measurements: dict[str, float],
+        now_epoch: float,
+        *,
+        snapshot_updated: bool,
+    ) -> bool:
         graph = self._rule_graph(rule)
         nodes = graph.get("nodes", [])
         if not isinstance(nodes, list):
@@ -787,7 +843,15 @@ class AutomationEngine:
             node_id = str(node.get("id", "")).strip()
             params_raw = node.get("params", {})
             params = dict(params_raw) if isinstance(params_raw, dict) else {}
-            if self._evaluate_trigger_node(rule.rule_id, node_id, params, measurements, now_epoch, update_state=True):
+            if self._evaluate_trigger_node(
+                rule.rule_id,
+                node_id,
+                params,
+                measurements,
+                now_epoch,
+                update_state=True,
+                snapshot_updated=snapshot_updated,
+            ):
                 triggered = True
         return triggered
 
@@ -800,6 +864,7 @@ class AutomationEngine:
         now_epoch: float,
         *,
         update_state: bool,
+        snapshot_updated: bool,
     ) -> bool:
         fired, _details = self._evaluate_trigger_node_with_details(
             rule_id=rule_id,
@@ -808,6 +873,7 @@ class AutomationEngine:
             measurements=measurements,
             now_epoch=now_epoch,
             update_state=update_state,
+            snapshot_updated=snapshot_updated,
         )
         return fired
 
@@ -820,11 +886,20 @@ class AutomationEngine:
         measurements: dict[str, float],
         now_epoch: float,
         update_state: bool,
+        snapshot_updated: bool,
     ) -> tuple[bool, str]:
         trigger_type = str(params.get("trigger_type", "measurement")).strip().lower() or "measurement"
         state_key = f"{rule_id}:{node_id}"
         if trigger_type == "manual":
             return False, "trigger_type=manual (requires force_start)"
+        if trigger_type == "snapshot_update":
+            if update_state:
+                self._last_trigger_state[state_key] = bool(snapshot_updated)
+            return (
+                bool(snapshot_updated),
+                "trigger_type=snapshot_update "
+                f"snapshot_updated={bool(snapshot_updated)} fired={bool(snapshot_updated)}",
+            )
         if trigger_type == "schedule":
             interval = max(1, int(_to_float(params.get("schedule_every_minutes", 15))))
             slot = int(now_epoch // (interval * 60))
@@ -871,10 +946,19 @@ class AutomationEngine:
             f"current={current_state} previous={previous_state} fired={fired}",
         )
 
-    def _is_rule_triggered(self, rule: AutomationRule, measurements: dict[str, float], now_epoch: float) -> bool:
+    def _is_rule_triggered(
+        self,
+        rule: AutomationRule,
+        measurements: dict[str, float],
+        now_epoch: float,
+        *,
+        snapshot_updated: bool,
+    ) -> bool:
         trigger_type = rule.trigger_type.strip().lower()
         if trigger_type == "manual":
             return False
+        if trigger_type == "snapshot_update":
+            return bool(snapshot_updated)
         if trigger_type == "schedule":
             interval = max(1, int(rule.schedule_every_minutes))
             slot = int(now_epoch // (interval * 60))

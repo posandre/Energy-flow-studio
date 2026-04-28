@@ -2371,6 +2371,8 @@ class MainWindow(QMainWindow):
             "start_ready": tr("start node ready"),
             "end_reached": tr("end reached"),
             "action_ready": tr("action is ready"),
+            "action_ready_forced": tr("action is ready (forced run)"),
+            "action_state_unchanged": tr("state has not changed since previous run"),
             "delay_ready": tr("delay is ready"),
             "upstream_blocked": tr("blocked by upstream node"),
             "forced_start=True": tr("forced start"),

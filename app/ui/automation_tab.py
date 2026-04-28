@@ -208,7 +208,7 @@ class FlowDiagramView(QWidget):
     gate_condition_extract_requested = Signal(int, int, int)
     gate_condition_dropped_to_nested_gate = Signal(int, int, int)
     gate_condition_dropped_to_parent_gate = Signal(int, int)
-    branch_connected = Signal(int, str, int)
+    branch_connected = Signal(int, str, int, int, int)
     branch_deleted = Signal(int, str, int)
 
     def __init__(self, parent=None) -> None:
@@ -242,13 +242,13 @@ class FlowDiagramView(QWidget):
         self._gate_condition_delete_hit_areas: list[tuple[int, int, QRectF]] = []
         self._gate_condition_row_hit_areas: list[tuple[int, int, QRectF]] = []
         self._gate_condition_drag_hit_areas: list[tuple[int, int, QRectF]] = []
-        self._input_socket_hit_areas: list[tuple[int, QRectF]] = []
+        self._input_socket_hit_areas: list[tuple[int, int, QRectF]] = []
         self._input_label_hit_areas: list[tuple[int, QRectF]] = []
         self._true_socket_hit_areas: list[tuple[int, QRectF]] = []
         self._true_label_hit_areas: list[tuple[int, QRectF]] = []
         self._false_socket_hit_areas: list[tuple[int, QRectF]] = []
         self._false_label_hit_areas: list[tuple[int, QRectF]] = []
-        self._next_socket_hit_areas: list[tuple[int, QRectF]] = []
+        self._next_socket_hit_areas: list[tuple[int, int, QRectF]] = []
         self._next_label_hit_areas: list[tuple[int, QRectF]] = []
         self._resize_left_hit_areas: list[tuple[int, QRectF]] = []
         self._resize_right_hit_areas: list[tuple[int, QRectF]] = []
@@ -256,8 +256,10 @@ class FlowDiagramView(QWidget):
         self._connection_source_index = -1
         self._connection_branch = ""
         self._connection_hover_target_index = -1
+        self._connection_hover_target_socket_index = -1
         self._connection_cursor_point = QPointF()
         self._connection_source_rect = QRectF()
+        self._connection_source_socket_index = 0
         self._connection_drag_mode = ""
         self._connection_drag_changed = False
         self._connection_drag_start = QPointF()
@@ -271,11 +273,19 @@ class FlowDiagramView(QWidget):
         self._align_drag_changed = False
         self._socket_drag_active = False
         self._socket_drag_index = -1
+        self._socket_drag_socket_index = -1
         self._socket_drag_kind = ""
         self._socket_drag_changed = False
         self._connection_hit_areas: list[tuple[int, str, int, QLineF]] = []
         self._connection_hover: tuple[int, str, int] | None = None
         self._connection_delete_hit_areas: list[tuple[int, str, int, QRectF]] = []
+        self._connection_shelf_hit_areas: list[tuple[int, str, int, str, QRectF]] = []
+        self._connection_shelf_drag_active = False
+        self._connection_shelf_drag_source = -1
+        self._connection_shelf_drag_target = -1
+        self._connection_shelf_drag_branch = ""
+        self._connection_shelf_drag_axis = "y"
+        self._connection_shelf_drag_changed = False
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
         self.setMinimumHeight(220)
@@ -374,6 +384,17 @@ class FlowDiagramView(QWidget):
                 self.branch_deleted.emit(source_index, branch, target_index)
                 self.setCursor(Qt.CursorShape.PointingHandCursor)
                 return
+        for source_index, branch, target_index, axis, rect in self._connection_shelf_hit_areas:
+            if rect.contains(point):
+                self._connection_shelf_drag_active = True
+                self._connection_shelf_drag_source = source_index
+                self._connection_shelf_drag_target = target_index
+                self._connection_shelf_drag_branch = branch
+                self._connection_shelf_drag_axis = axis
+                self._connection_shelf_drag_changed = False
+                self.block_selected.emit(source_index)
+                self.setCursor(Qt.CursorShape.SizeVerCursor if axis == "y" else Qt.CursorShape.SizeHorCursor)
+                return
         for idx, rect in self._resize_left_hit_areas:
             if rect.contains(point):
                 self._resize_drag_active = True
@@ -394,63 +415,26 @@ class FlowDiagramView(QWidget):
                 self.block_selected.emit(idx)
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
                 return
-        for idx, rect in self._input_socket_hit_areas:
+        for idx, socket_index, rect in self._input_socket_hit_areas:
             if rect.contains(point):
                 self._connection_drag_active = False
                 self._socket_drag_active = True
                 self._socket_drag_index = idx
+                self._socket_drag_socket_index = socket_index
                 self._socket_drag_kind = "input"
                 self._socket_drag_changed = False
                 self.block_selected.emit(idx)
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
                 return
-        for idx, rect in self._input_label_hit_areas:
-            if rect.contains(point):
-                self._connection_drag_active = False
-                self._socket_drag_active = True
-                self._socket_drag_index = idx
-                self._socket_drag_kind = "input"
-                self._socket_drag_changed = False
-                self.block_selected.emit(idx)
-                self.setCursor(Qt.CursorShape.SizeHorCursor)
-                return
-        for idx, rect in self._next_label_hit_areas:
-            if rect.contains(point):
-                self._connection_drag_active = False
-                self._socket_drag_active = True
-                self._socket_drag_index = idx
-                self._socket_drag_kind = "next"
-                self._socket_drag_changed = False
-                self.block_selected.emit(idx)
-                self.setCursor(Qt.CursorShape.SizeHorCursor)
-                return
-        for idx, rect in self._true_label_hit_areas:
-            if rect.contains(point):
-                self._connection_drag_active = False
-                self._socket_drag_active = True
-                self._socket_drag_index = idx
-                self._socket_drag_kind = "true"
-                self._socket_drag_changed = False
-                self.block_selected.emit(idx)
-                self.setCursor(Qt.CursorShape.SizeHorCursor)
-                return
-        for idx, rect in self._false_label_hit_areas:
-            if rect.contains(point):
-                self._connection_drag_active = False
-                self._socket_drag_active = True
-                self._socket_drag_index = idx
-                self._socket_drag_kind = "false"
-                self._socket_drag_changed = False
-                self.block_selected.emit(idx)
-                self.setCursor(Qt.CursorShape.SizeHorCursor)
-                return
-        for idx, rect in self._next_socket_hit_areas:
+        for idx, _socket_index, rect in self._next_socket_hit_areas:
             if rect.contains(point):
                 self._socket_drag_active = False
                 self._connection_drag_active = True
                 self._connection_source_index = idx
+                self._connection_source_socket_index = _socket_index
                 self._connection_branch = "next"
                 self._connection_hover_target_index = -1
+                self._connection_hover_target_socket_index = -1
                 self._connection_cursor_point = QPointF(point)
                 self._connection_drag_mode = "connect"
                 self._connection_drag_from_label = False
@@ -463,8 +447,10 @@ class FlowDiagramView(QWidget):
                 self._socket_drag_active = False
                 self._connection_drag_active = True
                 self._connection_source_index = idx
+                self._connection_source_socket_index = 0
                 self._connection_branch = "true"
                 self._connection_hover_target_index = -1
+                self._connection_hover_target_socket_index = -1
                 self._connection_cursor_point = QPointF(point)
                 self._connection_drag_mode = "connect"
                 self._connection_drag_from_label = False
@@ -477,8 +463,10 @@ class FlowDiagramView(QWidget):
                 self._socket_drag_active = False
                 self._connection_drag_active = True
                 self._connection_source_index = idx
+                self._connection_source_socket_index = 0
                 self._connection_branch = "false"
                 self._connection_hover_target_index = -1
+                self._connection_hover_target_socket_index = -1
                 self._connection_cursor_point = QPointF(point)
                 self._connection_drag_mode = "connect"
                 self._connection_drag_from_label = False
@@ -564,6 +552,19 @@ class FlowDiagramView(QWidget):
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         point = event.position()
+        if self._connection_shelf_drag_active:
+            if self._set_connection_shelf_position(
+                source_index=self._connection_shelf_drag_source,
+                branch=self._connection_shelf_drag_branch,
+                target_index=self._connection_shelf_drag_target,
+                point=QPointF(point),
+                axis=self._connection_shelf_drag_axis,
+            ):
+                self._connection_shelf_drag_changed = True
+                self.update()
+            self.setCursor(Qt.CursorShape.SizeVerCursor if self._connection_shelf_drag_axis == "y" else Qt.CursorShape.SizeHorCursor)
+            super().mouseMoveEvent(event)
+            return
         if self._resize_drag_active and self._resize_drag_index >= 0:
             source_rect = self._hit_areas[self._resize_drag_index] if 0 <= self._resize_drag_index < len(self._hit_areas) else QRectF()
             if not source_rect.isValid():
@@ -572,15 +573,23 @@ class FlowDiagramView(QWidget):
             canvas_width = self._canvas_inner_width()
             block = self._blocks[self._resize_drag_index] if 0 <= self._resize_drag_index < len(self._blocks) else {}
             block_align = self._block_align(block) if isinstance(block, dict) else "left"
+            partner_idx = self._row_partner_index(self._resize_drag_index)
+            max_ratio = 1.0
+            if partner_idx >= 0 and 0 <= partner_idx < len(self._blocks):
+                partner = self._blocks[partner_idx]
+                if isinstance(partner, dict):
+                    partner_ratio = self._block_width_ratio(partner)
+                    max_ratio = max(0.35, min(1.0, 1.0 - partner_ratio))
+            max_width = canvas_width * max_ratio
             if block_align == "center":
                 center_x = source_rect.center().x()
-                new_width = self._clamp(abs(point.x() - center_x) * 2.0, canvas_width * 0.35, canvas_width)
+                new_width = self._clamp(abs(point.x() - center_x) * 2.0, canvas_width * 0.35, max_width)
                 changed = self._set_block_layout(self._resize_drag_index, width_ratio=(new_width / canvas_width), align="center")
             elif self._resize_drag_side == "left":
-                new_width = self._clamp(self._resize_anchor_x - point.x(), canvas_width * 0.35, canvas_width)
+                new_width = self._clamp(self._resize_anchor_x - point.x(), canvas_width * 0.35, max_width)
                 changed = self._set_block_layout(self._resize_drag_index, width_ratio=(new_width / canvas_width), align="right")
             else:
-                new_width = self._clamp(point.x() - self._resize_anchor_x, canvas_width * 0.35, canvas_width)
+                new_width = self._clamp(point.x() - self._resize_anchor_x, canvas_width * 0.35, max_width)
                 changed = self._set_block_layout(self._resize_drag_index, width_ratio=(new_width / canvas_width), align="left")
             if changed:
                 self.update()
@@ -591,7 +600,12 @@ class FlowDiagramView(QWidget):
             block_rect = self._hit_areas[self._socket_drag_index] if 0 <= self._socket_drag_index < len(self._hit_areas) else QRectF()
             if block_rect.width() > 1.0:
                 ratio = (point.x() - block_rect.left()) / block_rect.width()
-                if self._set_socket_ratio(self._socket_drag_index, self._socket_drag_kind, ratio):
+                if self._set_socket_ratio(
+                    self._socket_drag_index,
+                    self._socket_drag_kind,
+                    ratio,
+                    socket_index=self._socket_drag_socket_index,
+                ):
                     self._socket_drag_changed = True
                     self.update()
             self.setCursor(Qt.CursorShape.SizeHorCursor)
@@ -617,7 +631,9 @@ class FlowDiagramView(QWidget):
             return
         if self._connection_drag_active:
             self._connection_cursor_point = QPointF(point)
-            self._connection_hover_target_index = self._input_target_for_point(point, self._connection_source_index)
+            target_index, target_socket_index = self._input_target_for_point(point, self._connection_source_index)
+            self._connection_hover_target_index = target_index
+            self._connection_hover_target_socket_index = target_socket_index
             self.setCursor(Qt.CursorShape.CrossCursor)
             self.update()
             super().mouseMoveEvent(event)
@@ -714,6 +730,20 @@ class FlowDiagramView(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         drop_point = event.position()
+        if self._connection_shelf_drag_active:
+            changed = self._connection_shelf_drag_changed
+            self._connection_shelf_drag_active = False
+            self._connection_shelf_drag_source = -1
+            self._connection_shelf_drag_target = -1
+            self._connection_shelf_drag_branch = ""
+            self._connection_shelf_drag_axis = "y"
+            self._connection_shelf_drag_changed = False
+            if changed:
+                self.blocks_reordered.emit([dict(item) for item in self._blocks if isinstance(item, dict)])
+            self._update_hover_cursor(drop_point)
+            self.update()
+            super().mouseReleaseEvent(event)
+            return
         if self._resize_drag_active:
             self._resize_drag_active = False
             self._resize_drag_index = -1
@@ -731,6 +761,7 @@ class FlowDiagramView(QWidget):
             changed = self._socket_drag_changed
             self._socket_drag_active = False
             self._socket_drag_index = -1
+            self._socket_drag_socket_index = -1
             self._socket_drag_kind = ""
             self._socket_drag_changed = False
             self._drag_origin_index = -1
@@ -757,17 +788,25 @@ class FlowDiagramView(QWidget):
             super().mouseReleaseEvent(event)
             return
         if self._connection_drag_active:
-            target_index = self._input_target_for_point(drop_point, self._connection_source_index)
+            target_index, target_socket_index = self._input_target_for_point(drop_point, self._connection_source_index)
             if (
                 target_index >= 0
                 and self._connection_source_index >= 0
                 and self._connection_branch in {"true", "false", "next"}
             ):
-                self.branch_connected.emit(self._connection_source_index, self._connection_branch, target_index)
+                self.branch_connected.emit(
+                    self._connection_source_index,
+                    self._connection_branch,
+                    target_index,
+                    max(0, target_socket_index),
+                    max(0, self._connection_source_socket_index),
+                )
             self._connection_drag_active = False
             self._connection_source_index = -1
+            self._connection_source_socket_index = 0
             self._connection_branch = ""
             self._connection_hover_target_index = -1
+            self._connection_hover_target_socket_index = -1
             self._connection_source_rect = QRectF()
             self._connection_drag_mode = ""
             self._connection_drag_changed = False
@@ -1031,7 +1070,7 @@ class FlowDiagramView(QWidget):
 
         margin_x = 16.0
         top = 14.0
-        gap = 22.0
+        gap = 40.0
         width = max(120.0, self.width() - margin_x * 2.0)
         self._hit_areas = []
         self._delete_hit_areas = []
@@ -1051,6 +1090,7 @@ class FlowDiagramView(QWidget):
         self._resize_right_hit_areas = []
         self._connection_hit_areas = []
         self._connection_delete_hit_areas = []
+        self._connection_shelf_hit_areas = []
         current_top = top
 
         connectivity = self._connectivity_state()
@@ -1173,21 +1213,27 @@ class FlowDiagramView(QWidget):
                 painter.drawText(delete_rect, Qt.AlignmentFlag.AlignCenter, "✕")
 
             if block_type != "start":
-                input_center = self._socket_center(rect, block, "input")
-                input_rect = QRectF(input_center.x() - 6.0, input_center.y() - 6.0, 12.0, 12.0)
-                input_label_rect = QRectF(input_rect.left() - 48.0, input_rect.top() - 1.0, 42.0, 14.0)
-                self._input_socket_hit_areas.append((idx, input_rect))
-                self._input_label_hit_areas.append((idx, input_label_rect))
-                painter.setPen(QPen(QColor(82, 111, 141), 1.2))
-                painter.setBrush(QColor(6, 20, 38, 235))
-                painter.drawEllipse(input_rect)
-                if self._connection_hover_target_index == idx:
-                    glow_pen = QPen(QColor(34, 211, 238), 1.6)
-                    painter.setPen(glow_pen)
-                    painter.setBrush(Qt.BrushStyle.NoBrush)
-                    painter.drawEllipse(input_rect.adjusted(-2.0, -2.0, 2.0, 2.0))
-                painter.setPen(QColor(139, 192, 255))
-                painter.drawText(input_label_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, tr("In"))
+                input_centers = self._socket_centers(rect, block, "input")
+                if input_centers:
+                    first_input_rect = QRectF(input_centers[0].x() - 6.0, input_centers[0].y() - 6.0, 12.0, 12.0)
+                    input_label_rect = QRectF(first_input_rect.left() - 48.0, first_input_rect.top() - 1.0, 42.0, 14.0)
+                    self._input_label_hit_areas.append((idx, input_label_rect))
+                    for socket_idx, center in enumerate(input_centers):
+                        input_rect = QRectF(center.x() - 6.0, center.y() - 6.0, 12.0, 12.0)
+                        self._input_socket_hit_areas.append((idx, socket_idx, input_rect))
+                        painter.setPen(QPen(QColor(82, 111, 141), 1.2))
+                        painter.setBrush(QColor(6, 20, 38, 235))
+                        painter.drawEllipse(input_rect)
+                        if (
+                            self._connection_hover_target_index == idx
+                            and self._connection_hover_target_socket_index == socket_idx
+                        ):
+                            glow_pen = QPen(QColor(34, 211, 238), 1.6)
+                            painter.setPen(glow_pen)
+                            painter.setBrush(Qt.BrushStyle.NoBrush)
+                            painter.drawEllipse(input_rect.adjusted(-2.0, -2.0, 2.0, 2.0))
+                    painter.setPen(QColor(139, 192, 255))
+                    painter.drawText(input_label_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, tr("In"))
 
             if str(block.get("type", "")).strip().lower() == "gate":
                 title_rect = QRectF(rect.left() + 12.0, rect.top() + 20.0, rect.width() - 76.0, 18.0)
@@ -1239,21 +1285,29 @@ class FlowDiagramView(QWidget):
                 painter.setPen(label_pen_false)
                 painter.drawText(false_label_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, tr("False"))
             elif block_type != "end":
-                next_center = self._socket_center(rect, block, "next")
-                next_rect = QRectF(next_center.x() - 6.0, next_center.y() - 6.0, 12.0, 12.0)
-                next_label_rect = QRectF(next_rect.left() - 50.0, next_rect.top() - 1.0, 44.0, 14.0)
-                self._next_socket_hit_areas.append((idx, next_rect))
-                self._next_label_hit_areas.append((idx, next_label_rect))
-                painter.setPen(QPen(QColor(96, 165, 250), 1.2))
-                painter.setBrush(QColor(13, 49, 89, 235))
-                painter.drawEllipse(next_rect)
-                painter.setPen(QColor(139, 192, 255))
-                painter.drawText(next_label_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, tr("Out"))
+                next_centers = self._socket_centers(rect, block, "next")
+                if next_centers:
+                    first_next_rect = QRectF(next_centers[0].x() - 6.0, next_centers[0].y() - 6.0, 12.0, 12.0)
+                    next_label_rect = QRectF(first_next_rect.left() - 50.0, first_next_rect.top() - 1.0, 44.0, 14.0)
+                    self._next_label_hit_areas.append((idx, next_label_rect))
+                    for socket_idx, center in enumerate(next_centers):
+                        next_rect = QRectF(center.x() - 6.0, center.y() - 6.0, 12.0, 12.0)
+                        self._next_socket_hit_areas.append((idx, socket_idx, next_rect))
+                        painter.setPen(QPen(QColor(96, 165, 250), 1.2))
+                        painter.setBrush(QColor(13, 49, 89, 235))
+                        painter.drawEllipse(next_rect)
+                    painter.setPen(QColor(139, 192, 255))
+                    painter.drawText(next_label_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, tr("Out"))
             current_top = rect.bottom() + gap
 
         self._draw_top_level_connections(painter)
         if self._connection_drag_active and self._connection_source_index >= 0:
-            start = self._branch_socket_center(self._connection_source_index, self._connection_branch)
+            start_socket_index = self._connection_source_socket_index if self._connection_branch == "next" else 0
+            start = self._branch_socket_center(
+                self._connection_source_index,
+                self._connection_branch,
+                socket_index=start_socket_index,
+            )
             if start is not None:
                 preview_color = QColor(34, 211, 238) if self._connection_branch == "true" else QColor(245, 158, 11) if self._connection_branch == "false" else QColor(96, 165, 250)
                 preview_pen = QPen(preview_color, 1.8)
@@ -1282,7 +1336,7 @@ class FlowDiagramView(QWidget):
     def _content_height(self) -> int:
         if not self._blocks:
             return 220
-        gap = 22
+        gap = 40
         top = 14
         bottom = 16
         heights = [self._block_height(block) for block in self._blocks]
@@ -1340,6 +1394,7 @@ class FlowDiagramView(QWidget):
                 right_idx == left_idx + 1
                 and self._block_width_ratio(left_block) < 0.999
                 and self._block_width_ratio(right_block) < 0.999
+                and (self._block_width_ratio(left_block) + self._block_width_ratio(right_block)) <= 1.001
                 and self._block_align(left_block) in {"left", "right"}
                 and self._block_align(right_block) in {"left", "right"}
                 and self._block_align(left_block) != self._block_align(right_block)
@@ -1444,7 +1499,6 @@ class FlowDiagramView(QWidget):
             normalized = self._clamp(float(width_ratio), 0.35, 1.0)
             if abs(float(block.get("ui_width_ratio", 1.0) or 1.0) - normalized) > 1e-4:
                 block["ui_width_ratio"] = normalized
-                self._clear_row_id(block)
                 changed = True
         if align is not None:
             requested_align = str(align).strip().lower()
@@ -1482,7 +1536,7 @@ class FlowDiagramView(QWidget):
         raw = float(block.get(key, default) or default)
         return self._clamp(raw, 0.08, 0.92)
 
-    def _set_socket_ratio(self, index: int, kind: str, ratio: float) -> bool:
+    def _set_socket_ratio(self, index: int, kind: str, ratio: float, socket_index: int = 0) -> bool:
         if index < 0 or index >= len(self._blocks):
             return False
         block = self._blocks[index]
@@ -1498,10 +1552,19 @@ class FlowDiagramView(QWidget):
         if not key:
             return False
         normalized = self._clamp(float(ratio), 0.08, 0.92)
-        current = self._socket_ratio(block, kind)
+        ratios = self._socket_ratios(block, kind)
+        if not ratios:
+            return False
+        safe_index = max(0, min(int(socket_index), len(ratios) - 1))
+        current = ratios[safe_index]
         if abs(current - normalized) <= 1e-4:
             return False
-        block[key] = normalized
+        ratios[safe_index] = normalized
+        ratios = [self._clamp(value, 0.08, 0.92) for value in ratios]
+        array_key = f"{key}s"
+        block[array_key] = ratios
+        if kind in {"input", "next", "true", "false"}:
+            block[key] = ratios[min(safe_index, len(ratios) - 1)]
         return True
 
     def _socket_center(self, rect: QRectF, block: dict[str, object], kind: str) -> QPointF:
@@ -1821,9 +1884,16 @@ class FlowDiagramView(QWidget):
         if self._connection_drag_active:
             self.setCursor(Qt.CursorShape.CrossCursor)
             return
+        if self._connection_shelf_drag_active:
+            self.setCursor(Qt.CursorShape.SizeVerCursor if self._connection_shelf_drag_axis == "y" else Qt.CursorShape.SizeHorCursor)
+            return
         for _, _, _, rect in self._connection_delete_hit_areas:
             if rect.contains(point):
                 self.setCursor(Qt.CursorShape.PointingHandCursor)
+                return
+        for _, _, _, axis, rect in self._connection_shelf_hit_areas:
+            if rect.contains(point):
+                self.setCursor(Qt.CursorShape.SizeVerCursor if axis == "y" else Qt.CursorShape.SizeHorCursor)
                 return
         if self._connection_hover is not None:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1849,33 +1919,17 @@ class FlowDiagramView(QWidget):
             if rect.contains(point):
                 self.setCursor(Qt.CursorShape.CrossCursor)
                 return
-        for _, rect in self._true_label_hit_areas:
-            if rect.contains(point):
-                self.setCursor(Qt.CursorShape.SizeHorCursor)
-                return
         for _, rect in self._false_socket_hit_areas:
             if rect.contains(point):
                 self.setCursor(Qt.CursorShape.CrossCursor)
                 return
-        for _, rect in self._false_label_hit_areas:
-            if rect.contains(point):
-                self.setCursor(Qt.CursorShape.SizeHorCursor)
-                return
-        for _, rect in self._next_socket_hit_areas:
+        for _, _, rect in self._next_socket_hit_areas:
             if rect.contains(point):
                 self.setCursor(Qt.CursorShape.CrossCursor)
                 return
-        for _, rect in self._next_label_hit_areas:
-            if rect.contains(point):
-                self.setCursor(Qt.CursorShape.SizeHorCursor)
-                return
-        for _, rect in self._input_socket_hit_areas:
+        for _, _, rect in self._input_socket_hit_areas:
             if rect.contains(point):
                 self.setCursor(Qt.CursorShape.CrossCursor)
-                return
-        for _, rect in self._input_label_hit_areas:
-            if rect.contains(point):
-                self.setCursor(Qt.CursorShape.SizeHorCursor)
                 return
         for _, _, rect in self._gate_condition_drag_hit_areas:
             if rect.contains(point):
@@ -1921,29 +1975,135 @@ class FlowDiagramView(QWidget):
             return tr("Action")
         return tr("Block")
 
-    def _input_target_for_point(self, point: QPointF, source_index: int) -> int:
-        for idx, rect in self._input_socket_hit_areas:
+    def _input_target_for_point(self, point: QPointF, source_index: int) -> tuple[int, int]:
+        best_index = -1
+        best_socket_index = -1
+        best_distance = 999999.0
+        for idx, socket_index, rect in self._input_socket_hit_areas:
             if idx == source_index:
                 continue
-            if rect.adjusted(-4.0, -4.0, 4.0, 4.0).contains(point):
-                return idx
-        return -1
+            if not rect.adjusted(-5.0, -5.0, 5.0, 5.0).contains(point):
+                continue
+            center = rect.center()
+            distance = ((center.x() - point.x()) ** 2 + (center.y() - point.y()) ** 2) ** 0.5
+            if distance < best_distance:
+                best_distance = distance
+                best_index = idx
+                best_socket_index = socket_index
+        return best_index, best_socket_index
 
-    def _branch_socket_center(self, source_index: int, branch: str) -> QPointF | None:
+    def _branch_socket_center(
+        self,
+        source_index: int,
+        branch: str,
+        preferred_x: float | None = None,
+        socket_index: int | None = None,
+    ) -> QPointF | None:
         if branch == "next":
             hit_areas = self._next_socket_hit_areas
+            centers = [(current_socket, rect.center()) for idx, current_socket, rect in hit_areas if idx == source_index]
         else:
             hit_areas = self._true_socket_hit_areas if branch == "true" else self._false_socket_hit_areas
-        for idx, rect in hit_areas:
-            if idx == source_index:
-                return rect.center()
-        return None
+            centers = [(0, rect.center()) for idx, rect in hit_areas if idx == source_index]
+        if not centers:
+            return None
+        if socket_index is not None:
+            safe_index = max(0, int(socket_index))
+            for current_socket, center in centers:
+                if current_socket == safe_index:
+                    return center
+        if preferred_x is None:
+            return centers[0][1]
+        return min((center for _, center in centers), key=lambda center: abs(center.x() - preferred_x))
 
-    def _input_socket_center(self, target_index: int) -> QPointF | None:
-        for idx, rect in self._input_socket_hit_areas:
-            if idx == target_index:
-                return rect.center()
-        return None
+    def _input_socket_center(
+        self,
+        target_index: int,
+        preferred_x: float | None = None,
+        socket_index: int | None = None,
+    ) -> QPointF | None:
+        centers = [
+            (current_socket, rect.center())
+            for idx, current_socket, rect in self._input_socket_hit_areas
+            if idx == target_index
+        ]
+        if not centers:
+            return None
+        if socket_index is not None:
+            safe_index = max(0, int(socket_index))
+            for current_socket, center in centers:
+                if current_socket == safe_index:
+                    return center
+        if preferred_x is None:
+            return centers[0][1]
+        return min((center for _, center in centers), key=lambda center: abs(center.x() - preferred_x))
+
+    def _socket_count(self, block: dict[str, object], kind: str) -> int:
+        block_type = str(block.get("type", "")).strip().lower()
+        if kind == "input":
+            if block_type == "start":
+                return 0
+            raw = int(block.get("input_count", 1) or 1)
+            return max(1, min(raw, 6))
+        if kind == "next":
+            if block_type in {"end", "condition", "gate"}:
+                return 0
+            raw = int(block.get("output_count", 1) or 1)
+            return max(1, min(raw, 6))
+        return 1
+
+    def _socket_ratios(self, block: dict[str, object], kind: str) -> list[float]:
+        count = self._socket_count(block, kind)
+        if count <= 0:
+            return []
+        if kind in {"true", "false"}:
+            return [self._socket_ratio(block, kind)]
+        key_map = {
+            "input": "ui_input_xs",
+            "next": "ui_output_xs",
+        }
+        array_key = key_map.get(kind, "")
+        if array_key:
+            raw = block.get(array_key, [])
+            if isinstance(raw, list):
+                values = [self._clamp(float(item), 0.08, 0.92) for item in raw if isinstance(item, (int, float))]
+                if len(values) >= count:
+                    return values[:count]
+        anchor = self._socket_ratio(block, kind)
+        if count == 1:
+            return [anchor]
+        span = min(0.72, 0.16 * float(count - 1))
+        start = anchor - (span / 2.0)
+        end = anchor + (span / 2.0)
+        low = 0.08
+        high = 0.92
+        if start < low:
+            shift = low - start
+            start += shift
+            end += shift
+        if end > high:
+            shift = end - high
+            start -= shift
+            end -= shift
+        start = self._clamp(start, low, high)
+        end = self._clamp(end, low, high)
+        if count == 2:
+            return [start, end]
+        step = (end - start) / float(count - 1)
+        return [self._clamp(start + (step * index), low, high) for index in range(count)]
+
+    def _socket_centers(self, rect: QRectF, block: dict[str, object], kind: str) -> list[QPointF]:
+        y = rect.top() + 6.0 if kind == "input" else rect.bottom() - 10.0
+        return [QPointF(rect.left() + (rect.width() * ratio), y) for ratio in self._socket_ratios(block, kind)]
+
+    def _socket_center(self, rect: QRectF, block: dict[str, object], kind: str) -> QPointF:
+        centers = self._socket_centers(rect, block, kind)
+        if centers:
+            return centers[0]
+        # Fallback for legacy callers.
+        x = rect.left() + (rect.width() * self._socket_ratio(block, kind))
+        y = rect.top() + 6.0 if kind == "input" else rect.bottom() - 10.0
+        return QPointF(x, y)
 
     def _block_id_to_index(self) -> dict[str, int]:
         mapping: dict[str, int] = {}
@@ -2029,6 +2189,7 @@ class FlowDiagramView(QWidget):
     def _draw_top_level_connections(self, painter: QPainter) -> None:
         self._connection_hit_areas = []
         self._connection_delete_hit_areas = []
+        self._connection_shelf_hit_areas = []
         connection_midpoints: dict[tuple[int, str, int], QPointF] = {}
         for idx, block in enumerate(self._blocks):
             if not isinstance(block, dict):
@@ -2039,11 +2200,12 @@ class FlowDiagramView(QWidget):
                     ("true", QColor(34, 211, 238)),
                     ("false", QColor(245, 158, 11)),
                 ):
-                    source = self._branch_socket_center(idx, branch)
-                    if source is None:
-                        continue
                     for target_idx in self._resolved_branch_target_indices(idx, branch):
-                        target = self._input_socket_center(target_idx)
+                        target_socket_index = self._connection_target_socket_index(idx, branch, target_idx)
+                        source = self._branch_socket_center(idx, branch)
+                        if source is None:
+                            continue
+                        target = self._input_socket_center(target_idx, source.x(), socket_index=target_socket_index)
                         if target is None:
                             continue
                         key = (idx, branch, target_idx)
@@ -2056,20 +2218,40 @@ class FlowDiagramView(QWidget):
                             pen_color = color.lighter(125) if hovered else color
                             line_width = 2.6 if hovered else 1.6
                         painter.setPen(QPen(pen_color, line_width))
-                        segments = self._orthogonal_segments(source, target)
+                        segments = self._connection_segments(idx, branch, target_idx, source, target)
+                        if not segments:
+                            continue
                         for segment in segments:
                             painter.drawLine(segment)
                             self._connection_hit_areas.append((idx, branch, target_idx, segment))
+                        for segment in segments:
+                            if segment.length() < 6.0:
+                                continue
+                            if abs(segment.p1().y() - segment.p2().y()) <= 1.0:
+                                left_x = min(segment.p1().x(), segment.p2().x())
+                                right_x = max(segment.p1().x(), segment.p2().x())
+                                shelf_rect = QRectF(left_x, segment.p1().y() - 8.0, max(1.0, right_x - left_x), 16.0)
+                                self._connection_shelf_hit_areas.append((idx, branch, target_idx, "y", shelf_rect))
+                            elif abs(segment.p1().x() - segment.p2().x()) <= 1.0:
+                                top_y = min(segment.p1().y(), segment.p2().y())
+                                bottom_y = max(segment.p1().y(), segment.p2().y())
+                                shelf_rect = QRectF(segment.p1().x() - 8.0, top_y, 16.0, max(1.0, bottom_y - top_y))
+                                self._connection_shelf_hit_areas.append((idx, branch, target_idx, "x", shelf_rect))
                         connection_midpoints[key] = self._polyline_midpoint(segments)
                         self._draw_connection_arrow(painter, segments[-1], color)
             elif block_type != "end":
-                source = self._branch_socket_center(idx, "next")
-                if source is None:
-                    continue
                 color = QColor(102, 178, 232)
                 for target_idx in self._resolved_branch_target_indices(idx, "next"):
-                    target = self._input_socket_center(target_idx)
+                    target_socket_index = self._connection_target_socket_index(idx, "next", target_idx)
+                    source_socket_index = self._connection_source_socket_index_for_target(idx, "next", target_idx)
+                    source_probe = self._branch_socket_center(idx, "next")
+                    if source_probe is None:
+                        continue
+                    target = self._input_socket_center(target_idx, source_probe.x(), socket_index=target_socket_index)
                     if target is None:
+                        continue
+                    source = self._branch_socket_center(idx, "next", target.x(), socket_index=source_socket_index)
+                    if source is None:
                         continue
                     key = (idx, "next", target_idx)
                     runtime_branch_active = self._runtime_active_branch == (idx, "next")
@@ -2081,10 +2263,25 @@ class FlowDiagramView(QWidget):
                         pen_color = color.lighter(130) if hovered else color
                         line_width = 2.2 if hovered else 1.2
                     painter.setPen(QPen(pen_color, line_width))
-                    segments = self._orthogonal_segments(source, target)
+                    segments = self._connection_segments(idx, "next", target_idx, source, target)
+                    if not segments:
+                        continue
                     for segment in segments:
                         painter.drawLine(segment)
                         self._connection_hit_areas.append((idx, "next", target_idx, segment))
+                    for segment in segments:
+                        if segment.length() < 6.0:
+                            continue
+                        if abs(segment.p1().y() - segment.p2().y()) <= 1.0:
+                            left_x = min(segment.p1().x(), segment.p2().x())
+                            right_x = max(segment.p1().x(), segment.p2().x())
+                            shelf_rect = QRectF(left_x, segment.p1().y() - 8.0, max(1.0, right_x - left_x), 16.0)
+                            self._connection_shelf_hit_areas.append((idx, "next", target_idx, "y", shelf_rect))
+                        elif abs(segment.p1().x() - segment.p2().x()) <= 1.0:
+                            top_y = min(segment.p1().y(), segment.p2().y())
+                            bottom_y = max(segment.p1().y(), segment.p2().y())
+                            shelf_rect = QRectF(segment.p1().x() - 8.0, top_y, 16.0, max(1.0, bottom_y - top_y))
+                            self._connection_shelf_hit_areas.append((idx, "next", target_idx, "x", shelf_rect))
                     connection_midpoints[key] = self._polyline_midpoint(segments)
                     self._draw_connection_arrow(painter, segments[-1], color)
 
@@ -2109,6 +2306,165 @@ class FlowDiagramView(QWidget):
         p1 = QPointF(source.x(), mid_y)
         p2 = QPointF(target.x(), mid_y)
         return [QLineF(source, p1), QLineF(p1, p2), QLineF(p2, target)]
+
+    def _connection_segments(
+        self,
+        source_index: int,
+        branch: str,
+        target_index: int,
+        source: QPointF,
+        target: QPointF,
+    ) -> list[QLineF]:
+        if abs(source.y() - target.y()) <= 1.0 and abs(source.x() - target.x()) <= 1.0:
+            return []
+        if abs(source.y() - target.y()) <= 1.0:
+            return [QLineF(source, target)]
+        x_ratio, y_ratio = self._connection_shelf_values(source_index, branch, target_index)
+        low = min(source.y(), target.y())
+        high = max(source.y(), target.y())
+        low_x = min(source.x(), target.x())
+        high_x = max(source.x(), target.x())
+        span_y = max(1.0, high - low)
+        span_x = max(1.0, high_x - low_x)
+
+        if span_y <= 16.0:
+            bend_y = (source.y() + target.y()) / 2.0
+        else:
+            bend_y = self._clamp(low + (span_y * y_ratio), low + 8.0, high - 8.0)
+
+        if span_x <= 16.0:
+            bend_x = (source.x() + target.x()) / 2.0
+        else:
+            bend_x = self._clamp(low_x + (span_x * x_ratio), low_x + 8.0, high_x - 8.0)
+
+        points = [
+            source,
+            QPointF(source.x(), bend_y),
+            QPointF(bend_x, bend_y),
+            QPointF(bend_x, target.y()),
+            target,
+        ]
+        segments: list[QLineF] = []
+        for idx in range(len(points) - 1):
+            line = QLineF(points[idx], points[idx + 1])
+            if line.length() > 0.5:
+                segments.append(line)
+        return segments
+
+    def _block_id_for_index(self, index: int) -> str:
+        if index < 0 or index >= len(self._blocks):
+            return ""
+        block = self._blocks[index]
+        if not isinstance(block, dict):
+            return ""
+        return str(block.get("_id", "")).strip()
+
+    def _connection_shelf_key(self, branch: str, target_id: str) -> str:
+        return f"{str(branch or '').strip().lower()}:{str(target_id or '').strip()}"
+
+    def _connection_shelf_values(self, source_index: int, branch: str, target_index: int) -> tuple[float, float]:
+        if source_index < 0 or source_index >= len(self._blocks):
+            return 0.5, 0.5
+        source_block = self._blocks[source_index]
+        if not isinstance(source_block, dict):
+            return 0.5, 0.5
+        target_id = self._block_id_for_index(target_index)
+        if not target_id:
+            return 0.5, 0.5
+        raw = source_block.get("ui_edge_bends", {})
+        if not isinstance(raw, dict):
+            return 0.5, 0.5
+        key = self._connection_shelf_key(branch, target_id)
+        value = raw.get(key, 0.5)
+        if isinstance(value, dict):
+            x_ratio = self._clamp(float(value.get("x", 0.5) or 0.5), 0.1, 0.9)
+            y_ratio = self._clamp(float(value.get("y", 0.5) or 0.5), 0.1, 0.9)
+            return x_ratio, y_ratio
+        legacy = self._clamp(float(value or 0.5), 0.1, 0.9)
+        return 0.5, legacy
+
+    def _set_connection_shelf_position(
+        self,
+        source_index: int,
+        branch: str,
+        target_index: int,
+        point: QPointF,
+        axis: str,
+    ) -> bool:
+        source_socket_index = self._connection_source_socket_index_for_target(source_index, branch, target_index)
+        target_socket_index = self._connection_target_socket_index(source_index, branch, target_index)
+        source = self._branch_socket_center(source_index, branch, socket_index=source_socket_index)
+        target = self._input_socket_center(target_index, socket_index=target_socket_index)
+        if source is None or target is None:
+            return False
+        axis_key = "x" if str(axis).strip().lower() == "x" else "y"
+        if axis_key == "x" and abs(source.x() - target.x()) <= 1.0:
+            return False
+        if axis_key == "y" and abs(source.y() - target.y()) <= 1.0:
+            return False
+        if axis_key == "x":
+            low = min(source.x(), target.x())
+            high = max(source.x(), target.x())
+            span = max(1.0, high - low)
+            ratio = self._clamp((float(point.x()) - low) / span, 0.1, 0.9)
+        else:
+            low = min(source.y(), target.y())
+            high = max(source.y(), target.y())
+            span = max(1.0, high - low)
+            ratio = self._clamp((float(point.y()) - low) / span, 0.1, 0.9)
+
+        if source_index < 0 or source_index >= len(self._blocks):
+            return False
+        source_block = self._blocks[source_index]
+        if not isinstance(source_block, dict):
+            return False
+        target_id = self._block_id_for_index(target_index)
+        if not target_id:
+            return False
+        key = self._connection_shelf_key(branch, target_id)
+        bends = source_block.get("ui_edge_bends", {})
+        if not isinstance(bends, dict):
+            bends = {}
+        current_x, current_y = self._connection_shelf_values(source_index, branch, target_index)
+        current = current_x if axis_key == "x" else current_y
+        if abs(current - ratio) <= 1e-4:
+            return False
+        if axis_key == "x":
+            bends[key] = {"x": ratio, "y": current_y}
+        else:
+            bends[key] = {"x": current_x, "y": ratio}
+        source_block["ui_edge_bends"] = bends
+        return True
+
+    def _connection_target_socket_index(self, source_index: int, branch: str, target_index: int) -> int:
+        if source_index < 0 or source_index >= len(self._blocks):
+            return 0
+        source_block = self._blocks[source_index]
+        if not isinstance(source_block, dict):
+            return 0
+        target_id = self._block_id_for_index(target_index)
+        if not target_id:
+            return 0
+        mapping = source_block.get("ui_edge_target_ports", {})
+        if not isinstance(mapping, dict):
+            return 0
+        key = self._connection_shelf_key(branch, target_id)
+        return max(0, int(mapping.get(key, 0) or 0))
+
+    def _connection_source_socket_index_for_target(self, source_index: int, branch: str, target_index: int) -> int:
+        if source_index < 0 or source_index >= len(self._blocks):
+            return 0
+        source_block = self._blocks[source_index]
+        if not isinstance(source_block, dict):
+            return 0
+        target_id = self._block_id_for_index(target_index)
+        if not target_id:
+            return 0
+        mapping = source_block.get("ui_edge_source_ports", {})
+        if not isinstance(mapping, dict):
+            return 0
+        key = self._connection_shelf_key(branch, target_id)
+        return max(0, int(mapping.get(key, 0) or 0))
 
     @staticmethod
     def _polyline_midpoint(segments: list[QLineF]) -> QPointF:
@@ -2415,6 +2771,8 @@ class AutomationTab(QWidget):
         self.selected_block_title.setObjectName("ChartSectionTitle")
         self.selected_block_title.setWordWrap(True)
         right_fields.addWidget(self.selected_block_title)
+        self.io_controls_widget = self._build_io_controls()
+        right_fields.addWidget(self.io_controls_widget)
         right_fields.addWidget(self.block_editor)
 
         right_scroll = QScrollArea()
@@ -2941,15 +3299,68 @@ class AutomationTab(QWidget):
         layout.addWidget(self.empty_editor_hint, 0, Qt.AlignmentFlag.AlignTop)
         return box
 
+    def _build_io_controls(self) -> QWidget:
+        box = QWidget()
+        form = QFormLayout(box)
+        self._io_form = form
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        self.io_input_count = QSpinBox()
+        self.io_input_count.setRange(1, 6)
+        self.io_output_count = QSpinBox()
+        self.io_output_count.setRange(1, 6)
+        form.addRow(tr("Inputs"), self.io_input_count)
+        form.addRow(tr("Outputs"), self.io_output_count)
+        self._expand_fields(self.io_input_count, self.io_output_count)
+        box.setVisible(False)
+        return box
+
+    def _supports_io_counts(self, kind: str) -> tuple[bool, bool]:
+        normalized = str(kind or "").strip().lower()
+        supports_input = normalized != "start"
+        supports_output = normalized not in {"end", "condition", "gate"}
+        return supports_input, supports_output
+
+    def _load_io_controls_for_block(self, block: dict[str, object]) -> None:
+        kind = str(block.get("type", "")).strip().lower()
+        supports_input, supports_output = self._supports_io_counts(kind)
+        show_controls = supports_input or supports_output
+        self.io_controls_widget.setVisible(show_controls)
+        if not show_controls:
+            return
+        self._syncing = True
+        if supports_input:
+            self.io_input_count.setValue(max(1, min(6, int(block.get("input_count", 1) or 1))))
+        if supports_output:
+            self.io_output_count.setValue(max(1, min(6, int(block.get("output_count", 1) or 1))))
+        self._set_form_row_visible(self._io_form, self.io_input_count, supports_input)
+        self._set_form_row_visible(self._io_form, self.io_output_count, supports_output)
+        self._syncing = False
+
+    def _apply_io_controls_to_block(self, block: dict[str, object]) -> None:
+        kind = str(block.get("type", "")).strip().lower()
+        supports_input, supports_output = self._supports_io_counts(kind)
+        if supports_input:
+            block["input_count"] = max(1, min(6, int(self.io_input_count.value())))
+        else:
+            block.pop("input_count", None)
+        if supports_output:
+            block["output_count"] = max(1, min(6, int(self.io_output_count.value())))
+        else:
+            block.pop("output_count", None)
+
     def _build_trigger_editor(self) -> QWidget:
         box = QWidget()
         form = QFormLayout(box)
+        self._trigger_form = form
         form.setContentsMargins(0, 0, 0, 0)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         self.trigger_mode = QComboBox()
         self.trigger_mode.addItem(tr("Measurement"), "measurement")
         self.trigger_mode.addItem(tr("Schedule"), "schedule")
+        self.trigger_mode.addItem(tr("Snapshot update"), "snapshot_update")
         self.trigger_mode.addItem(tr("Manual"), "manual")
         self.trigger_device = QComboBox()
         self.trigger_metric = QComboBox()
@@ -2962,12 +3373,16 @@ class AutomationTab(QWidget):
         self.trigger_schedule = QSpinBox()
         self.trigger_schedule.setRange(1, 1440)
         self.trigger_schedule.setSuffix(" min")
+        self.trigger_snapshot_hint = QLabel(tr("Fires when a new data snapshot is received."))
+        self.trigger_snapshot_hint.setObjectName("SidebarMeta")
+        self.trigger_snapshot_hint.setWordWrap(True)
         form.addRow(tr("Type"), self.trigger_mode)
         form.addRow(tr("Device"), self.trigger_device)
         form.addRow(tr("Metric"), self.trigger_metric)
         form.addRow(tr("Operator"), self.trigger_operator)
         form.addRow(tr("Value"), self.trigger_value)
         form.addRow(tr("Schedule"), self.trigger_schedule)
+        form.addRow(self.trigger_snapshot_hint)
         self._expand_fields(
             self.trigger_mode,
             self.trigger_device,
@@ -2976,6 +3391,7 @@ class AutomationTab(QWidget):
             self.trigger_value,
             self.trigger_schedule,
         )
+        self._update_trigger_editor_mode()
         return box
 
     def _build_condition_editor(self) -> QWidget:
@@ -3105,6 +3521,8 @@ class AutomationTab(QWidget):
             self.action_state,
             self.action_retries,
             self.action_retry_delay,
+            self.io_input_count,
+            self.io_output_count,
         ):
             if isinstance(widget, (QComboBox, QSpinBox, QDoubleSpinBox)):
                 if isinstance(widget, QComboBox):
@@ -3116,6 +3534,7 @@ class AutomationTab(QWidget):
         self.trigger_metric.currentIndexChanged.connect(lambda *_args: self._update_trigger_value_unit_suffix())
         self.condition_metric.currentIndexChanged.connect(lambda *_args: self._update_condition_value_unit_suffix())
         self.action_device.currentIndexChanged.connect(lambda *_args: self._update_action_editor_mode())
+        self.trigger_mode.currentIndexChanged.connect(lambda *_args: self._update_trigger_editor_mode())
 
     def _add_rule(self) -> None:
         rule = AutomationRule(
@@ -3123,7 +3542,12 @@ class AutomationTab(QWidget):
             name=tr("Automation {index}").format(index=len(self._rules) + 1),
             enabled=True,
             active=False,
-            flow_blocks=[{"type": "start"}, {"type": "trigger"}, {"type": "action"}, {"type": "end"}],
+            flow_blocks=[
+                {"type": "start", "output_count": 1},
+                {"type": "trigger", "input_count": 1, "output_count": 1},
+                {"type": "action", "input_count": 1, "output_count": 1},
+                {"type": "end", "input_count": 1},
+            ],
         )
         self._rules.append(rule)
         # Do not rebuild the whole rule list on every autosave - it resets
@@ -3290,19 +3714,19 @@ class AutomationTab(QWidget):
 
         block: dict[str, object]
         if normalized_type == "start":
-            block = {"type": "start"}
+            block = {"type": "start", "output_count": 1}
         elif normalized_type == "trigger":
-            block = {"type": "trigger", "trigger_type": "measurement", "operator": ">=", "value": 0.0}
+            block = {"type": "trigger", "trigger_type": "measurement", "operator": ">=", "value": 0.0, "input_count": 1, "output_count": 1}
         elif normalized_type == "condition":
-            block = {"type": "condition", "operator": ">=", "value": 0.0}
+            block = {"type": "condition", "operator": ">=", "value": 0.0, "input_count": 1}
         elif normalized_type == "gate":
-            block = {"type": "gate", "mode": "and"}
+            block = {"type": "gate", "mode": "and", "input_count": 1}
         elif normalized_type == "delay":
-            block = {"type": "delay", "seconds": 1.0}
+            block = {"type": "delay", "seconds": 1.0, "input_count": 1, "output_count": 1}
         elif normalized_type == "end":
-            block = {"type": "end"}
+            block = {"type": "end", "input_count": 1}
         else:
-            block = {"type": "action", "action_type": "power", "value": True, "retries": 0, "retry_delay_sec": 1.0}
+            block = {"type": "action", "action_type": "power", "value": True, "retries": 0, "retry_delay_sec": 1.0, "input_count": 1, "output_count": 1}
         self._insert_block_after_selection(block)
         self._save_current_rule()
 
@@ -3317,6 +3741,7 @@ class AutomationTab(QWidget):
         return -1
 
     def _insert_block_after_selection(self, block: dict[str, object]) -> None:
+        self._normalize_block_ports(block)
         self._ensure_block_id(block)
         selected_row = self.diagram_view.selected_index()
         if selected_row < 0:
@@ -3393,7 +3818,49 @@ class AutomationTab(QWidget):
             row = self.canvas.currentRow()
         self._remove_block_by_index(row)
 
+    @staticmethod
+    def _normalize_block_ports(block: dict[str, object]) -> None:
+        def _normalize_ratio_array(key: str, count: int) -> None:
+            raw = block.get(key, [])
+            if not isinstance(raw, list):
+                block.pop(key, None)
+                return
+            values = []
+            for item in raw:
+                if isinstance(item, (int, float)):
+                    values.append(max(0.08, min(0.92, float(item))))
+            if not values:
+                block.pop(key, None)
+                return
+            values = sorted(values)[: max(1, count)]
+            block[key] = values
+
+        kind = str(block.get("type", "")).strip().lower()
+        if kind == "start":
+            block.pop("input_count", None)
+            block["output_count"] = max(1, min(6, int(block.get("output_count", 1) or 1)))
+            _normalize_ratio_array("ui_output_xs", int(block["output_count"]))
+            block.pop("ui_input_xs", None)
+            return
+        if kind == "end":
+            block["input_count"] = max(1, min(6, int(block.get("input_count", 1) or 1)))
+            block.pop("output_count", None)
+            _normalize_ratio_array("ui_input_xs", int(block["input_count"]))
+            block.pop("ui_output_xs", None)
+            return
+        if kind in {"condition", "gate"}:
+            block["input_count"] = max(1, min(6, int(block.get("input_count", 1) or 1)))
+            block.pop("output_count", None)
+            _normalize_ratio_array("ui_input_xs", int(block["input_count"]))
+            block.pop("ui_output_xs", None)
+            return
+        block["input_count"] = max(1, min(6, int(block.get("input_count", 1) or 1)))
+        block["output_count"] = max(1, min(6, int(block.get("output_count", 1) or 1)))
+        _normalize_ratio_array("ui_input_xs", int(block["input_count"]))
+        _normalize_ratio_array("ui_output_xs", int(block["output_count"]))
+
     def _append_block_item(self, block: dict[str, object]) -> None:
+        self._normalize_block_ports(block)
         self._ensure_block_id(block)
         label = self._block_label(block)
         item = QListWidgetItem(label)
@@ -3421,6 +3888,8 @@ class AutomationTab(QWidget):
                 return tr("Trigger: Every {minutes} min").format(
                     minutes=int(block.get("schedule_every_minutes", 15) or 15)
                 )
+            if trigger_type == "snapshot_update":
+                return tr("Trigger: Snapshot update")
             if trigger_type == "manual":
                 return tr("Trigger: Manual")
             return tr("Trigger: {metric} {operator} {value}").format(
@@ -3546,9 +4015,12 @@ class AutomationTab(QWidget):
                 continue
             normalized_blocks.append(dict(block))
         if not start_added:
-            normalized_blocks.insert(0, {"type": "start"})
+            normalized_blocks.insert(0, {"type": "start", "output_count": 1})
         elif normalized_blocks and str(normalized_blocks[0].get("type", "")).strip().lower() != "start":
-            start_block = next((item for item in normalized_blocks if str(item.get("type", "")).strip().lower() == "start"), {"type": "start"})
+            start_block = next(
+                (item for item in normalized_blocks if str(item.get("type", "")).strip().lower() == "start"),
+                {"type": "start", "output_count": 1},
+            )
             normalized_blocks = [dict(start_block), *[item for item in normalized_blocks if str(item.get("type", "")).strip().lower() != "start"]]
         end_block = next(
             (dict(item) for item in normalized_blocks if str(item.get("type", "")).strip().lower() == "end"),
@@ -3558,7 +4030,7 @@ class AutomationTab(QWidget):
             normalized_blocks = [item for item in normalized_blocks if str(item.get("type", "")).strip().lower() != "end"]
             normalized_blocks.append(end_block)
         else:
-            normalized_blocks.append({"type": "end"})
+            normalized_blocks.append({"type": "end", "input_count": 1})
         flow_blocks = normalized_blocks
         for block in flow_blocks:
             self._append_block_item(dict(block))
@@ -3646,6 +4118,7 @@ class AutomationTab(QWidget):
         self._selected_nested_condition = None
         if row < 0 or row >= self.canvas.count():
             self.selected_block_title.setText("")
+            self.io_controls_widget.setVisible(False)
             self._set_empty_editor_message(tr("Select a block to edit."))
             self.block_editor.setCurrentIndex(0)
             return
@@ -3653,11 +4126,13 @@ class AutomationTab(QWidget):
         block = item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(block, dict):
             self.selected_block_title.setText("")
+            self.io_controls_widget.setVisible(False)
             self._set_empty_editor_message(tr("Select a block to edit."))
             self.block_editor.setCurrentIndex(0)
             return
         kind = str(block.get("type", "")).strip().lower()
         self.selected_block_title.setText(self._block_title_text(kind))
+        self._load_io_controls_for_block(block)
         self._syncing = True
         if kind == "trigger":
             self.block_editor.setCurrentIndex(1)
@@ -3716,6 +4191,7 @@ class AutomationTab(QWidget):
         self._update_trigger_value_unit_suffix()
         self.trigger_value.setValue(float(block.get("value", 0.0) or 0.0))
         self.trigger_schedule.setValue(max(1, int(block.get("schedule_every_minutes", 15) or 15)))
+        self._update_trigger_editor_mode()
 
     def _load_condition_block(self, block: dict[str, object]) -> None:
         self._set_combo_by_data(self.condition_device, block.get("device_id", ""))
@@ -3975,6 +4451,7 @@ class AutomationTab(QWidget):
                 block.pop("changes", None)
             block["retries"] = int(self.action_retries.value())
             block["retry_delay_sec"] = float(self.action_retry_delay.value())
+        self._apply_io_controls_to_block(block)
         item.setData(Qt.ItemDataRole.UserRole, block)
         item.setText(self._block_label(block))
         self._sync_diagram_from_canvas()
@@ -3996,6 +4473,7 @@ class AutomationTab(QWidget):
                 continue
             block = item.data(Qt.ItemDataRole.UserRole)
             if isinstance(block, dict):
+                self._normalize_block_ports(block)
                 self._ensure_block_id(block)
                 if str(block.get("type", "")).strip().lower() not in {"condition", "gate"}:
                     block.pop("true_target_id", None)
@@ -4313,6 +4791,28 @@ class AutomationTab(QWidget):
                 return str(title).strip() or normalized
         return normalized
 
+    @staticmethod
+    def _set_form_row_visible(form: QFormLayout, field: QWidget, visible: bool) -> None:
+        label = form.labelForField(field)
+        if label is not None:
+            label.setVisible(visible)
+        field.setVisible(visible)
+
+    def _update_trigger_editor_mode(self) -> None:
+        form = getattr(self, "_trigger_form", None)
+        if form is None:
+            return
+        trigger_type = str(self.trigger_mode.currentData() or "measurement").strip().lower()
+        is_measurement = trigger_type == "measurement"
+        is_schedule = trigger_type == "schedule"
+        is_snapshot = trigger_type == "snapshot_update"
+        self._set_form_row_visible(form, self.trigger_device, is_measurement)
+        self._set_form_row_visible(form, self.trigger_metric, is_measurement)
+        self._set_form_row_visible(form, self.trigger_operator, is_measurement)
+        self._set_form_row_visible(form, self.trigger_value, is_measurement)
+        self._set_form_row_visible(form, self.trigger_schedule, is_schedule)
+        self.trigger_snapshot_hint.setVisible(is_snapshot)
+
     def _update_trigger_value_unit_suffix(self) -> None:
         metric_key = str(self.trigger_metric.currentData() or "").strip().lower()
         self.trigger_value.setSuffix(self._metric_value_suffix(metric_key))
@@ -4400,6 +4900,8 @@ class AutomationTab(QWidget):
                 return tr("Every {minutes} min").format(
                     minutes=int(block.get("schedule_every_minutes", 15) or 15)
                 )
+            if trigger_type == "snapshot_update":
+                return tr("Snapshot update")
             if trigger_type == "manual":
                 return tr("Manual")
             metric_key = str(block.get("metric_key", "")).strip()
@@ -4465,6 +4967,7 @@ class AutomationTab(QWidget):
         self.diagram_view.set_selected_index(-1)
         self.diagram_view.set_selected_gate_condition(-1, -1)
         self.selected_block_title.setText("")
+        self.io_controls_widget.setVisible(False)
         self._set_empty_editor_message(tr("Select a block to edit."))
         self.block_editor.setCurrentIndex(0)
         self._apply_runtime_highlight()
@@ -4485,6 +4988,7 @@ class AutomationTab(QWidget):
             self.canvas.setCurrentRow(gate_row)
         self._selected_nested_condition = (gate_row, condition_row)
         self.diagram_view.set_selected_gate_condition(gate_row, condition_row)
+        self.io_controls_widget.setVisible(False)
         self._syncing = True
         child_type = str(child.get("type", "")).strip().lower()
         self.selected_block_title.setText(self._block_title_text(child_type))
@@ -4513,7 +5017,7 @@ class AutomationTab(QWidget):
                 continue
             rest_blocks.append(block)
         if start_block is None:
-            start_block = {"type": "start"}
+            start_block = {"type": "start", "output_count": 1}
         normalized_blocks = [start_block, *rest_blocks]
         if end_block is not None:
             normalized_blocks.append(end_block)
@@ -4521,6 +5025,7 @@ class AutomationTab(QWidget):
         selected_row = self.diagram_view.selected_index()
         self.canvas.clear()
         for block in normalized_blocks:
+            self._normalize_block_ports(block)
             item = QListWidgetItem(self._block_label(block))
             item.setData(Qt.ItemDataRole.UserRole, dict(block))
             self.canvas.addItem(item)
@@ -4537,6 +5042,16 @@ class AutomationTab(QWidget):
         if item is not None:
             block = item.data(Qt.ItemDataRole.UserRole)
             if isinstance(block, dict) and str(block.get("type", "")).strip().lower() == "start":
+                return
+            block_name = self._block_title_text(str(block.get("type", "")).strip().lower()) if isinstance(block, dict) else tr("Block")
+            if not ask_compact_confirmation(
+                self,
+                title=tr("Delete block"),
+                text=tr('Are you sure you want to delete block "{name}"?').format(name=block_name),
+                accept_text=tr("Delete"),
+                reject_text=tr("Cancel"),
+                destructive=True,
+            ):
                 return
         self._selected_nested_condition = None
         self.canvas.takeItem(row)
@@ -4582,8 +5097,15 @@ class AutomationTab(QWidget):
         block[list_key] = deduped
         block[single_key] = deduped[0]
 
-    def _target_has_opposite_conditional_branch(self, target_id: str, branch: str, source_row: int) -> bool:
+    def _target_has_opposite_conditional_branch(
+        self,
+        target_id: str,
+        branch: str,
+        source_row: int,
+        target_socket_index: int,
+    ) -> bool:
         opposite_branch = "false" if branch == "true" else "true"
+        key = f"{opposite_branch}:{target_id}"
         for row in range(self.canvas.count()):
             item = self.canvas.item(row)
             if item is None:
@@ -4596,11 +5118,24 @@ class AutomationTab(QWidget):
                 continue
             if row == source_row:
                 continue
-            if target_id in self._get_branch_targets(block, opposite_branch):
+            if target_id not in self._get_branch_targets(block, opposite_branch):
+                continue
+            target_ports = block.get("ui_edge_target_ports", {})
+            if not isinstance(target_ports, dict):
+                return True
+            other_target_socket_index = max(0, int(target_ports.get(key, 0) or 0))
+            if other_target_socket_index == max(0, int(target_socket_index)):
                 return True
         return False
 
-    def _set_branch_connection_from_diagram(self, source_row: int, branch: str, target_row: int) -> None:
+    def _set_branch_connection_from_diagram(
+        self,
+        source_row: int,
+        branch: str,
+        target_row: int,
+        target_socket_index: int = 0,
+        source_socket_index: int = 0,
+    ) -> None:
         if source_row < 0 or target_row < 0:
             return
         if source_row >= self.canvas.count() or target_row >= self.canvas.count() or source_row == target_row:
@@ -4629,13 +5164,30 @@ class AutomationTab(QWidget):
         if branch in {"true", "false"}:
             opposite_branch = "false" if branch == "true" else "true"
             if target_id in self._get_branch_targets(source_block, opposite_branch):
-                return
-            if self._target_has_opposite_conditional_branch(target_id, branch, source_row):
+                key = f"{opposite_branch}:{target_id}"
+                target_ports = source_block.get("ui_edge_target_ports", {})
+                if not isinstance(target_ports, dict):
+                    return
+                other_target_socket_index = max(0, int(target_ports.get(key, 0) or 0))
+                if other_target_socket_index == max(0, int(target_socket_index)):
+                    return
+            if self._target_has_opposite_conditional_branch(target_id, branch, source_row, target_socket_index):
                 return
         targets = self._get_branch_targets(source_block, branch)
         if target_id not in targets:
             targets.append(target_id)
         self._set_branch_targets(source_block, branch, targets)
+        edge_key = f"{str(branch).strip().lower()}:{target_id}"
+        target_ports = source_block.get("ui_edge_target_ports", {})
+        if not isinstance(target_ports, dict):
+            target_ports = {}
+        target_ports[edge_key] = max(0, int(target_socket_index))
+        source_block["ui_edge_target_ports"] = target_ports
+        source_ports = source_block.get("ui_edge_source_ports", {})
+        if not isinstance(source_ports, dict):
+            source_ports = {}
+        source_ports[edge_key] = max(0, int(source_socket_index))
+        source_block["ui_edge_source_ports"] = source_ports
         source_item.setData(Qt.ItemDataRole.UserRole, source_block)
         target_item.setData(Qt.ItemDataRole.UserRole, target_block)
         source_item.setText(self._block_label(source_block))
@@ -4677,6 +5229,26 @@ class AutomationTab(QWidget):
         else:
             targets = []
         self._set_branch_targets(source_block, branch, targets)
+        edge_target_ports = source_block.get("ui_edge_target_ports", {})
+        if isinstance(edge_target_ports, dict):
+            if target_id:
+                edge_key = f"{str(branch).strip().lower()}:{target_id}"
+                edge_target_ports.pop(edge_key, None)
+            else:
+                keys_to_remove = [key for key in edge_target_ports if str(key).startswith(f"{branch}:")]
+                for key in keys_to_remove:
+                    edge_target_ports.pop(key, None)
+            source_block["ui_edge_target_ports"] = edge_target_ports
+        edge_source_ports = source_block.get("ui_edge_source_ports", {})
+        if isinstance(edge_source_ports, dict):
+            if target_id:
+                edge_key = f"{str(branch).strip().lower()}:{target_id}"
+                edge_source_ports.pop(edge_key, None)
+            else:
+                keys_to_remove = [key for key in edge_source_ports if str(key).startswith(f"{branch}:")]
+                for key in keys_to_remove:
+                    edge_source_ports.pop(key, None)
+            source_block["ui_edge_source_ports"] = edge_source_ports
         source_item.setData(Qt.ItemDataRole.UserRole, source_block)
         source_item.setText(self._block_label(source_block))
         self.canvas.setCurrentRow(source_row)
