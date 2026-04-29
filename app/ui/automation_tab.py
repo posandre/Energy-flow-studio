@@ -289,6 +289,7 @@ class FlowDiagramView(QWidget):
         self._connection_shelf_drag_branch = ""
         self._connection_shelf_drag_axis = "y"
         self._connection_shelf_drag_changed = False
+        self._device_labels: dict[str, str] = {}
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
         self.setMinimumHeight(220)
@@ -301,6 +302,17 @@ class FlowDiagramView(QWidget):
             self._selected_index = len(self._blocks) - 1
         self._content_h = self._content_height()
         self.updateGeometry()
+        self.update()
+
+    def set_device_labels(self, device_labels: dict[str, str]) -> None:
+        normalized: dict[str, str] = {}
+        for key, title in (device_labels or {}).items():
+            device_id = str(key or "").strip()
+            if not device_id:
+                continue
+            label = str(title or "").strip() or device_id
+            normalized[device_id] = label
+        self._device_labels = normalized
         self.update()
 
     def set_selected_index(self, index: int) -> None:
@@ -1868,10 +1880,20 @@ class FlowDiagramView(QWidget):
             painter.drawText(delete_rect_nested, Qt.AlignmentFlag.AlignCenter, "✕")
 
             painter.setPen(QColor(188, 202, 220) if is_dragged_nested else QColor(227, 240, 252))
+            raw_text = self._gate_child_text(condition)
+            if not isinstance(raw_text, str) or not raw_text.strip():
+                raw_text = self._block_label(condition)
+            text_rect = cond_rect.adjusted(10.0, 0.0, -52.0, 0.0)
+            text_width = max(1, int(text_rect.width()))
+            visible_text = QFontMetrics(painter.font()).elidedText(
+                str(raw_text),
+                Qt.TextElideMode.ElideRight,
+                text_width,
+            )
             painter.drawText(
-                cond_rect.adjusted(10.0, 0.0, -52.0, 0.0),
+                text_rect,
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                self._gate_child_text(condition),
+                visible_text,
             )
             row_top += 30.0
             if str(condition.get("type", "")).strip().lower() == "gate":
@@ -1919,8 +1941,7 @@ class FlowDiagramView(QWidget):
             current = child
         return None
 
-    @staticmethod
-    def _gate_child_text(block: dict[str, object]) -> str:
+    def _gate_child_text(self, block: dict[str, object]) -> str:
         block_type = str(block.get("type", "")).strip().lower()
         if block_type == "gate":
             mode = str(block.get("mode", "and")).strip().lower() or "and"
@@ -1936,10 +1957,45 @@ class FlowDiagramView(QWidget):
                     ]
                 )
             return tr("Gate: {mode} ({count})").format(mode=mode_label, count=child_count)
-        metric = str(block.get("metric_key", "")).strip() or "metric"
+        device_id = str(block.get("device_id", "")).strip()
+        device_label = self._device_display_text(device_id) if device_id else ""
+        metric_key = str(block.get("metric_key", "")).strip()
+        metric = self._metric_display_text(
+            metric_key,
+            include_code=bool(device_id),
+        ) or metric_key or "metric"
         operator = str(block.get("operator", ">=")).strip() or ">="
-        value = float(block.get("value", 0.0) or 0.0)
+        raw_value = block.get("value", 0.0)
+        try:
+            value = float(raw_value if raw_value not in {None, ""} else 0.0)
+        except (TypeError, ValueError):
+            try:
+                value = float(str(raw_value).strip().replace(",", "."))
+            except (TypeError, ValueError):
+                value = 0.0
+        if device_label:
+            return tr("Condition: {device}: {metric} {operator} {value}").format(
+                device=device_label,
+                metric=metric,
+                operator=operator,
+                value=f"{value:g}",
+            )
         return tr("Condition: {metric} {operator} {value}").format(metric=metric, operator=operator, value=f"{value:g}")
+
+    def _device_display_text(self, device_id: str) -> str:
+        key = str(device_id or "").strip()
+        if not key:
+            return ""
+        if key == INVERTER_DEVICE_ID:
+            return tr("Inverter")
+        return self._device_labels.get(key, key)
+
+    @staticmethod
+    def _metric_display_text(metric_key: str, *, include_code: bool = False) -> str:
+        key = str(metric_key or "").strip()
+        if not key:
+            return ""
+        return key
 
     def content_height(self) -> int:
         return self._content_h
@@ -3034,6 +3090,7 @@ class AutomationTab(QWidget):
                 if key:
                     options.append((key, item.name or item.device_name or key))
         self._device_options = options
+        self.diagram_view.set_device_labels({key: title for key, title in options})
         for combo in (self.trigger_device, self.condition_device, self.action_device):
             current = combo.currentData()
             combo.blockSignals(True)

@@ -552,6 +552,7 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "skipped": "пропущено",
         "unknown metric": "невідомий параметр",
         '{prefix}: Condition for "{metric}" ({device}) -> {status}. Check: {actual} {operator} {expected}.': '{prefix}: Умова для "{metric}" ({device}) -> {status}. Перевірка: {actual} {operator} {expected}.',
+        "Condition: {device}: {metric} {operator} {value}": "Умова: {device}: {metric} {operator} {value}",
         ", fired={fired}": ", спрацювання={fired}",
         "{prefix}: Trigger -> {status}. Check: {metric}: {actual} {operator} {expected}{fired}.": "{prefix}: Тригер -> {status}. Перевірка: {metric}: {actual} {operator} {expected}{fired}.",
         "{prefix}: Gate evaluation -> {status}. Inputs: {inputs}, true: {true_count}, false: {false_count}.": "{prefix}: Логіка блоку -> {status}. Входів: {inputs}, true: {true_count}, false: {false_count}.",
