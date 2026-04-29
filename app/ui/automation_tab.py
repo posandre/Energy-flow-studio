@@ -1296,7 +1296,7 @@ class FlowDiagramView(QWidget):
                     Qt.TextElideMode.ElideRight,
                     max(1, int(title_rect.width())),
                 )
-                painter.drawText(title_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, title_text)
+                painter.drawText(title_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, title_text)
                 # Keep gate header clean: do not render the condition count in subtitle.
                 painter.setPen(QColor(126, 146, 168) if is_dragged_block else QColor(152, 176, 201))
                 painter.drawText(mode_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "")
@@ -1318,7 +1318,7 @@ class FlowDiagramView(QWidget):
                     Qt.TextElideMode.ElideRight,
                     max(1, int(title_rect.width())),
                 )
-                painter.drawText(title_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, title_text)
+                painter.drawText(title_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, title_text)
                 painter.setPen(QColor(126, 146, 168) if is_dragged_block else QColor(152, 176, 201))
                 subtitle = self._labels[idx] if idx < len(self._labels) else ""
                 subtitle_text = QFontMetrics(painter.font()).elidedText(
