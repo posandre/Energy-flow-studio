@@ -628,19 +628,19 @@ class EnergyFlowCanvas(QGraphicsView):
     ) -> tuple[str, str] | tuple[str, str, QColor, QColor]:
         capability_ah = self._battery_capability_ah
         if capability_ah <= 0.0 or snapshot is None:
-            return (tr("ETA"), "--")
+            return (tr("Charge"), "--")
 
         current = snapshot.battery_current
         soc = snapshot.battery_soc
         if current is None or soc is None:
-            return (tr("ETA"), "--")
+            return (tr("Charge"), "--")
 
         current_a = abs(float(current))
         soc_pct = max(0.0, min(100.0, float(soc)))
         if soc_pct >= 99.9:
-            return (tr("ETA"), tr("Charged"))
+            return (tr("Charge"), tr("Charged"), QColor("#8fb0cb"), QColor("#22c55e"))
         if current_a < 0.05:
-            return (tr("ETA"), tr("Idle"))
+            return (tr("Charge"), tr("Charged"), QColor("#8fb0cb"), QColor("#22c55e"))
 
         # Determine direction from trusted flow model first, then use current only as rate.
         if self._is_battery_charging(snapshot):
@@ -653,7 +653,7 @@ class EnergyFlowCanvas(QGraphicsView):
             eta_hours = remaining_ah / current_a if current_a > 0 else None
             return (tr("To empty"), self._format_duration_hours(eta_hours), QColor("#8fb0cb"), QColor("#ef4444"))
 
-        return (tr("ETA"), tr("Idle"))
+        return (tr("Charge"), tr("Charged"), QColor("#8fb0cb"), QColor("#22c55e"))
 
     def _format_duration_hours(self, value: float | None) -> str:
         if value is None or not math.isfinite(value):

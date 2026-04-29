@@ -2418,6 +2418,22 @@ class MainWindow(QMainWindow):
             inputs = details.get("inputs", "?")
             true_count = details.get("true", "?")
             false_count = details.get("false", "?")
+            internal_inputs = details.get("internal_inputs")
+            internal_true = details.get("internal_true")
+            internal_false = details.get("internal_false")
+            if internal_inputs is not None and internal_true is not None and internal_false is not None:
+                return tr(
+                    "{prefix}: Gate evaluation -> {status}. Inputs: {inputs}, true: {true_count}, false: {false_count}. Internal: {internal_inputs}, true: {internal_true}, false: {internal_false}."
+                ).format(
+                    prefix=prefix,
+                    status=status_text,
+                    inputs=inputs,
+                    true_count=true_count,
+                    false_count=false_count,
+                    internal_inputs=internal_inputs,
+                    internal_true=internal_true,
+                    internal_false=internal_false,
+                )
             return tr(
                 "{prefix}: Gate evaluation -> {status}. Inputs: {inputs}, true: {true_count}, false: {false_count}."
             ).format(

@@ -236,3 +236,89 @@ def test_send_message_action_payload_is_preserved() -> None:
     assert step_payload.get("action_type") == "send_message"
     assert step_payload.get("bot_token") == "token123"
     assert step_payload.get("chat_id") == "777"
+
+
+def test_gate_combines_incoming_and_internal_conditions_with_and() -> None:
+    engine = AutomationEngine()
+    rule = AutomationRule(
+        rule_id="gate_internal_and",
+        name="gate internal and",
+        active=True,
+        enabled=True,
+        flow_graph={
+            "version": 1,
+            "nodes": [
+                {"id": "t1", "type": "trigger", "params": {"trigger_type": "manual"}},
+                {
+                    "id": "g1",
+                    "type": "gate",
+                    "params": {
+                        "mode": "and",
+                        "conditions": [
+                            {"type": "condition", "device_id": "__inverter__", "metric_key": "battery_power", "operator": "==", "value": 0.0},
+                        ],
+                    },
+                },
+                {"id": "a1", "type": "action", "params": {"action_type": "power", "device_id": "dev1", "value": True}},
+            ],
+            "edges": [
+                {"source": "t1", "target": "g1"},
+                {"source": "g1", "target": "a1"},
+            ],
+        },
+    )
+
+    failed_run = engine.run_flow(
+        rule=rule,
+        numeric_measurements={"__inverter__:battery_power": 1182.0},
+        force_start=True,
+    )
+    assert any(item.node_id == "g1" and item.status == "fail" for item in failed_run.node_results)
+    assert not [step for step in failed_run.steps if step.step_type == "action"]
+
+    passed_run = engine.run_flow(
+        rule=rule,
+        numeric_measurements={"__inverter__:battery_power": 0.0},
+        force_start=True,
+    )
+    assert any(item.node_id == "g1" and item.status == "success" for item in passed_run.node_results)
+    assert [step for step in passed_run.steps if step.step_type == "action"]
+
+
+def test_gate_combines_incoming_and_internal_conditions_with_or() -> None:
+    engine = AutomationEngine()
+    rule = AutomationRule(
+        rule_id="gate_internal_or",
+        name="gate internal or",
+        active=True,
+        enabled=True,
+        flow_graph={
+            "version": 1,
+            "nodes": [
+                {"id": "t1", "type": "trigger", "params": {"trigger_type": "manual"}},
+                {
+                    "id": "g1",
+                    "type": "gate",
+                    "params": {
+                        "mode": "or",
+                        "conditions": [
+                            {"type": "condition", "device_id": "__inverter__", "metric_key": "battery_power", "operator": "==", "value": 0.0},
+                        ],
+                    },
+                },
+                {"id": "a1", "type": "action", "params": {"action_type": "power", "device_id": "dev1", "value": True}},
+            ],
+            "edges": [
+                {"source": "t1", "target": "g1"},
+                {"source": "g1", "target": "a1"},
+            ],
+        },
+    )
+
+    run = engine.run_flow(
+        rule=rule,
+        numeric_measurements={"__inverter__:battery_power": 1182.0},
+        force_start=True,
+    )
+    assert any(item.node_id == "g1" and item.status == "success" for item in run.node_results)
+    assert [step for step in run.steps if step.step_type == "action"]

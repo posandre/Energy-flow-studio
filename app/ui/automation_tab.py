@@ -1392,8 +1392,19 @@ class FlowDiagramView(QWidget):
         gap = 40
         top = 14
         bottom = 16
-        heights = [self._block_height(block) for block in self._blocks]
-        return top + sum(heights) + (max(0, len(heights) - 1) * gap) + bottom
+        row_heights: list[int] = []
+        current_row_height = 0
+        for idx, block in enumerate(self._blocks):
+            block_height = self._block_height(block)
+            if idx > 0 and self._blocks_share_row(self._blocks[idx - 1], block):
+                current_row_height = max(current_row_height, block_height)
+            else:
+                if current_row_height > 0:
+                    row_heights.append(current_row_height)
+                current_row_height = block_height
+        if current_row_height > 0:
+            row_heights.append(current_row_height)
+        return top + sum(row_heights) + (max(0, len(row_heights) - 1) * gap) + bottom
 
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
@@ -2707,12 +2718,15 @@ class RuleListRowWidget(QWidget):
         self.name_label.setObjectName("AutomationRuleName")
         self.name_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.name_edit = QLineEdit(name)
-        self.name_edit.setVisible(False)
+        self.name_stack = QStackedWidget()
+        self.name_stack.setContentsMargins(0, 0, 0, 0)
+        self.name_stack.addWidget(self.name_label)
+        self.name_stack.addWidget(self.name_edit)
+        self.name_stack.setCurrentWidget(self.name_label)
         self.name_edit.editingFinished.connect(self._finish_rename)
 
         layout.addWidget(self.enabled_check)
-        layout.addWidget(self.name_label, 1)
-        layout.addWidget(self.name_edit, 1)
+        layout.addWidget(self.name_stack, 1)
 
         self.enabled_check.toggled.connect(lambda checked: self.toggled.emit(self._rule_id, checked))
 
@@ -2738,18 +2752,16 @@ class RuleListRowWidget(QWidget):
 
     def _begin_rename(self) -> None:
         self.name_edit.setText(self.name_label.text())
-        self.name_label.setVisible(False)
-        self.name_edit.setVisible(True)
+        self.name_stack.setCurrentWidget(self.name_edit)
         self.name_edit.setFocus(Qt.FocusReason.MouseFocusReason)
         self.name_edit.selectAll()
 
     def _finish_rename(self) -> None:
-        if not self.name_edit.isVisible():
+        if self.name_stack.currentWidget() is not self.name_edit:
             return
         new_name = str(self.name_edit.text() or "").strip()
         old_name = str(self.name_label.text() or "").strip()
-        self.name_edit.setVisible(False)
-        self.name_label.setVisible(True)
+        self.name_stack.setCurrentWidget(self.name_label)
         if not new_name:
             self.name_edit.setText(old_name)
             return
@@ -4917,9 +4929,7 @@ class AutomationTab(QWidget):
             child_type = str(child.get("type", "")).strip().lower()
             if child_type == "gate":
                 expanded.extend(AutomationTab._expand_gate_children_for_graph(child))
-                gate_only = dict(child)
-                gate_only.pop("conditions", None)
-                expanded.append(gate_only)
+                expanded.append(dict(child))
             elif child_type == "condition":
                 expanded.append(dict(child))
         return expanded
@@ -4935,9 +4945,7 @@ class AutomationTab(QWidget):
                 expanded.append(dict(block))
                 continue
             expanded.extend(AutomationTab._expand_gate_children_for_graph(block))
-            gate_only = dict(block)
-            gate_only.pop("conditions", None)
-            expanded.append(gate_only)
+            expanded.append(dict(block))
         return expanded
 
     @staticmethod

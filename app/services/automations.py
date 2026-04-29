@@ -551,6 +551,13 @@ def evaluate_numeric_condition(value: float, operator: str, expected: float) -> 
     return False
 
 
+def _normalize_logic_mode(raw_mode: object) -> str:
+    mode = str(raw_mode or "").strip().lower()
+    if mode in {"any", "or"}:
+        return "or"
+    return "and"
+
+
 class AutomationEngine:
     """Evaluates and executes automation rules with cooldown/retry protections."""
 
@@ -680,14 +687,13 @@ class AutomationEngine:
                             parent_active = True
                             parent_values.append(parent_result.status == "fail")
                         continue
-                    active, value = _edge_is_active_for_parent(
-                        parent_result=parent_result,
-                        branch=branch,
-                    )
-                    if not active:
-                        continue
-                    parent_active = True
-                    parent_values.append(value)
+                    # For gate inputs, default branch ("any") must include both
+                    # success and fail from upstream nodes as True/False values.
+                    # Otherwise failed conditions are silently dropped and gate
+                    # can incorrectly pass with only successful inputs counted.
+                    if parent_result.status in {"success", "fail"}:
+                        parent_active = True
+                        parent_values.append(parent_result.status == "success")
             else:
                 for parent_id, branch in parent_edges:
                     active, value = _edge_is_active_for_parent(
@@ -732,14 +738,27 @@ class AutomationEngine:
                     status = "skipped"
                     reason = "upstream_blocked"
                 else:
-                    mode = str(params.get("mode", "and")).strip().lower() or "and"
-                    passed = all(parent_values) if mode == "and" else any(parent_values)
+                    mode = _normalize_logic_mode(params.get("mode", "and"))
+                    internal_values = self._evaluate_gate_internal_conditions(params, numeric_measurements)
+                    combined_values = [*parent_values, *internal_values]
+                    passed = all(combined_values) if mode == "and" else any(combined_values)
+                    incoming_passed = all(parent_values) if mode == "and" else any(parent_values)
+                    if internal_values:
+                        internal_passed = all(internal_values) if mode == "and" else any(internal_values)
+                    else:
+                        internal_passed = True if mode == "and" else False
                     status = "success" if passed else "fail"
                     true_count = sum(1 for value in parent_values if value)
                     false_count = len(parent_values) - true_count
+                    internal_true = sum(1 for value in internal_values if value)
+                    internal_false = len(internal_values) - internal_true
                     reason = (
                         f"gate_{mode}_{'passed' if passed else 'failed'}; "
-                        f"inputs={len(parent_values)} true={true_count} false={false_count}"
+                        f"inputs={len(parent_values)} true={true_count} false={false_count} "
+                        f"incoming_passed={incoming_passed} "
+                        f"internal_inputs={len(internal_values)} internal_true={internal_true} internal_false={internal_false} "
+                        f"combined_inputs={len(combined_values)} "
+                        f"internal_passed={internal_passed}"
                     )
             elif not parent_active:
                 status = "skipped"
@@ -1024,6 +1043,41 @@ class AutomationEngine:
         if rule.conditions_logic == "any":
             return any(outcomes)
         return all(outcomes)
+
+    def _evaluate_gate_internal_conditions(
+        self,
+        gate_params: dict[str, object],
+        measurements: dict[str, float],
+    ) -> list[bool]:
+        raw_conditions = gate_params.get("conditions", [])
+        if not isinstance(raw_conditions, list):
+            return []
+        outcomes: list[bool] = []
+        for item in raw_conditions:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("type", "")).strip().lower()
+            if kind == "condition":
+                metric_key = str(item.get("metric_key", "")).strip()
+                operator = str(item.get("operator", ">=")).strip() or ">="
+                expected = _to_float(item.get("value", 0.0))
+                device_id = str(item.get("device_id", "")).strip()
+                value = _lookup_metric(measurements, device_id=device_id, metric_key=metric_key)
+                if value is None:
+                    outcomes.append(False)
+                    continue
+                outcomes.append(evaluate_numeric_condition(value, operator, expected))
+                continue
+            if kind == "gate":
+                nested_mode = _normalize_logic_mode(item.get("mode", "and"))
+                nested_outcomes = self._evaluate_gate_internal_conditions(item, measurements)
+                if not nested_outcomes:
+                    outcomes.append(True if nested_mode == "and" else False)
+                elif nested_mode == "or":
+                    outcomes.append(any(nested_outcomes))
+                else:
+                    outcomes.append(all(nested_outcomes))
+        return outcomes
 
 
 def build_rule_analytics(logs: list[AutomationLogEntry]) -> dict[str, dict[str, int]]:
