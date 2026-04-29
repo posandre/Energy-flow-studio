@@ -431,6 +431,8 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "Rule name": "Назва правила",
         "All conditions": "Усі умови",
         "Any condition": "Будь-яка умова",
+        "AND short": "і",
+        "OR short": "або",
         "No executions yet.": "Виконань ще немає.",
         "Delete rule": "Видалити правило",
         'Are you sure you want to delete rule "{name}"?': 'Ви впевнені, що хочете видалити правило "{name}"?',

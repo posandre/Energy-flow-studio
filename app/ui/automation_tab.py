@@ -1297,19 +1297,14 @@ class FlowDiagramView(QWidget):
                     max(1, int(title_rect.width())),
                 )
                 painter.drawText(title_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, title_text)
+                # Keep gate header clean: do not render the condition count in subtitle.
                 painter.setPen(QColor(126, 146, 168) if is_dragged_block else QColor(152, 176, 201))
-                subtitle = self._labels[idx] if idx < len(self._labels) else ""
-                subtitle_text = QFontMetrics(painter.font()).elidedText(
-                    subtitle,
-                    Qt.TextElideMode.ElideRight,
-                    max(1, int(mode_rect.width())),
-                )
-                painter.drawText(mode_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, subtitle_text)
+                painter.drawText(mode_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "")
                 self._draw_gate_children(
                     painter=painter,
                     root_gate_index=idx,
                     gate_block=block,
-                    row_top=rect.top() + 64.0,
+                    row_top=rect.top() + 58.0,
                     outer_rect=rect,
                     level=0,
                     flat_counter=[0],
@@ -1731,7 +1726,9 @@ class FlowDiagramView(QWidget):
         visible_rows = self._gate_visible_rows(block)
         if visible_rows <= 0:
             return 84
-        return 84 + (visible_rows * 30) + 12
+        # Gate rows use expanded vertical spacing; keep an explicit 5px bottom margin
+        # before True/False outputs so connectors do not overlap the last row.
+        return 84 + (visible_rows * 38) + 5
 
     @staticmethod
     def _gate_children(block: dict[str, object]) -> list[dict[str, object]]:
@@ -1820,13 +1817,17 @@ class FlowDiagramView(QWidget):
         flat_counter: list[int],
     ) -> float:
         children = self._gate_children(gate_block)
-        left_offset = 12.0 + (level * 18.0)
-        right_padding = 24.0 + (level * 8.0)
+        left_offset = 20.0 + (level * 20.0)
+        right_padding = 28.0 + (level * 10.0)
         row_width = max(120.0, outer_rect.width() - left_offset - right_padding)
+        bus_x = outer_rect.left() + left_offset - 8.0
+        prev_center_y: float | None = None
+        mode = str(gate_block.get("mode", "and")).strip().lower() or "and"
+        mode_text = tr("AND short")
         for condition in children:
             condition_index = flat_counter[0]
             flat_counter[0] += 1
-            cond_rect = QRectF(outer_rect.left() + left_offset, row_top, row_width, 24.0)
+            cond_rect = QRectF(outer_rect.left() + left_offset, row_top, row_width, 26.0)
             condition_selected = self._selected_gate_condition == (root_gate_index, condition_index)
             is_dragged_nested = (
                 self._nested_drag_active
@@ -1883,7 +1884,7 @@ class FlowDiagramView(QWidget):
             raw_text = self._gate_child_text(condition)
             if not isinstance(raw_text, str) or not raw_text.strip():
                 raw_text = self._block_label(condition)
-            text_rect = cond_rect.adjusted(10.0, 0.0, -52.0, 0.0)
+            text_rect = cond_rect.adjusted(14.0, 0.0, -52.0, 0.0)
             text_width = max(1, int(text_rect.width()))
             visible_text = QFontMetrics(painter.font()).elidedText(
                 str(raw_text),
@@ -1895,7 +1896,30 @@ class FlowDiagramView(QWidget):
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                 visible_text,
             )
-            row_top += 30.0
+
+            # Draw visual gate links and AND/OR markers between sibling rows.
+            center_y = cond_rect.center().y()
+            link_pen = QPen(QColor(34, 211, 238, 205), 1.2)
+            painter.setPen(link_pen)
+            if prev_center_y is not None:
+                painter.drawLine(QPointF(bus_x, prev_center_y), QPointF(bus_x, center_y))
+                mid_y = (prev_center_y + center_y) / 2.0
+                marker_text = mode_text
+                fm = QFontMetrics(painter.font())
+                marker_w = max(20.0, float(fm.horizontalAdvance(marker_text)) + 10.0)
+                marker_rect = QRectF(bus_x + 8.0, mid_y - 9.0, marker_w, 18.0)
+                painter.setPen(QPen(QColor(34, 211, 238), 1.0))
+                painter.setBrush(QColor(7, 73, 110, 220))
+                painter.drawRoundedRect(marker_rect, 7.0, 7.0)
+                painter.setPen(QColor(220, 246, 255))
+                painter.drawText(marker_rect, Qt.AlignmentFlag.AlignCenter, marker_text)
+                painter.setPen(link_pen)
+            painter.drawLine(QPointF(bus_x, center_y), QPointF(cond_rect.left() + 10.0, center_y))
+            painter.setBrush(QColor(34, 211, 238))
+            painter.drawEllipse(QRectF(bus_x - 1.7, center_y - 1.7, 3.4, 3.4))
+            prev_center_y = center_y
+
+            row_top += 38.0
             if str(condition.get("type", "")).strip().lower() == "gate":
                 row_top = self._draw_gate_children(
                     painter=painter,
@@ -1945,7 +1969,7 @@ class FlowDiagramView(QWidget):
         block_type = str(block.get("type", "")).strip().lower()
         if block_type == "gate":
             mode = str(block.get("mode", "and")).strip().lower() or "and"
-            mode_label = tr("All conditions") if mode == "and" else tr("Any condition")
+            mode_label = tr("AND short") if mode == "and" else tr("OR short")
             child_count = 0
             nested = block.get("conditions", [])
             if isinstance(nested, list):
@@ -3675,8 +3699,8 @@ class AutomationTab(QWidget):
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         self.gate_mode = QComboBox()
-        self.gate_mode.addItem(tr("All conditions"), "and")
-        self.gate_mode.addItem(tr("Any condition"), "or")
+        self.gate_mode.addItem(tr("AND short"), "and")
+        self.gate_mode.addItem(tr("OR short"), "or")
         self.gate_hint = QLabel(tr("Drag condition or logical blocks into the logical container on canvas."))
         self.gate_hint.setObjectName("SidebarMeta")
         self.gate_hint.setWordWrap(True)
@@ -4231,7 +4255,7 @@ class AutomationTab(QWidget):
             )
         if kind == "gate":
             mode = str(block.get("mode", "and")).strip().lower() or "and"
-            mode_label = tr("All conditions") if mode == "and" else tr("Any condition")
+            mode_label = tr("AND short") if mode == "and" else tr("OR short")
             cond_count = len(self._gate_children(block))
             return tr("Gate: {mode} ({count})").format(mode=mode_label, count=cond_count)
         if kind == "delay":
@@ -5325,10 +5349,7 @@ class AutomationTab(QWidget):
             value = float(block.get("value", 0.0) or 0.0)
             return f"{metric} {operator} {value:g}"
         if kind == "gate":
-            mode = str(block.get("mode", "and")).strip().lower() or "and"
-            mode_label = tr("All conditions") if mode == "and" else tr("Any condition")
-            cond_count = len(self._gate_children(block))
-            return f"{mode_label} ({cond_count})"
+            return ""
         if kind == "delay":
             sec = float(block.get("seconds", 0.0) or 0.0)
             return tr("{seconds} sec").format(seconds=f"{sec:g}")
