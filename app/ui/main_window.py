@@ -51,6 +51,7 @@ from app.services.dessmonitor_api import (
     DeviceControlField,
     fetch_device_control_fields,
     fetch_device_control_value,
+    set_device_control_values,
     fetch_device_location,
     humanize_error_text,
     InverterSetting,
@@ -67,11 +68,22 @@ from app.services.app_settings import (
     load_ui_language,
     load_device_profiles,
     load_last_loaded_profile_name,
+    load_profile_automation_logs,
+    load_profile_automations,
     save_device_profiles,
     save_last_loaded_profile_name,
+    save_profile_automation_logs,
+    save_profile_automations,
+)
+from app.services.automations import (
+    AutomationEngine,
+    AutomationRule,
+    deserialize_rules,
+    serialize_rules,
 )
 from app.services.i18n import set_language, tr, tr_fragment, translate_widget_tree
 from app.services.logging_utils import get_logger
+from app.services.secret_store import load_secret
 from app.services.storage import (
     cached_remote_first_data_for_metadata,
     clear_database,
@@ -136,6 +148,7 @@ from app.ui.saved_data_section import SavedDataSection
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.sidebar import SidebarWidget
 from app.ui.design_system import compose_styles
+from app.ui.automation_tab import AutomationTab, analytics_from_logs
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 LOGGER = get_logger(__name__)
@@ -145,6 +158,11 @@ AUTO_SYNC_LOOKBACK_MINUTES = 15
 PROFILE_ACTIVATION_ENERGYFLOW_RETRY_DELAYS_MS = (700,)
 ENERGYFLOW_REQUEST_TIMEOUT_MS = 75000
 TUYA_REFRESH_TIMEOUT_MS = 35000
+TUYA_TRANSIENT_RETRY_DELAY_MS = 4000
+TUYA_TRANSIENT_RETRY_MAX_ATTEMPTS = 1
+AUTOMATION_EVALUATION_INTERVAL_MS = 5000
+AUTOMATION_MAX_ACTIONS_PER_CYCLE = 16
+AUTOMATION_INVERTER_DEVICE_ID = "__inverter__"
 
 
 def _is_profile_activation_retryable_energyflow_error(message: str) -> bool:
@@ -159,6 +177,28 @@ def _is_profile_activation_retryable_energyflow_error(message: str) -> bool:
         "timed out",
     )
     return any(marker in normalized for marker in timeout_markers)
+
+
+def _is_retryable_tuya_transport_error(message: str) -> bool:
+    normalized = message.strip().lower()
+    markers = (
+        "could not reach tuya endpoint",
+        "name resolutionerror",
+        "failed to resolve",
+        "nodename nor servname",
+        "temporary failure in name resolution",
+        "network is unreachable",
+        "connection reset",
+        "connection aborted",
+        "timed out",
+        "ssl",
+        "tls",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _should_auto_retry_tuya_transient_error(message: str, attempts: int, *, max_attempts: int) -> bool:
+    return _is_retryable_tuya_transport_error(message) and attempts < max_attempts
 
 
 class DessMonitorImportWorker(QObject):
@@ -1158,11 +1198,16 @@ class MainWindow(QMainWindow):
     tuya_devices_fetch_finished = Signal(int, object)
     tuya_icon_download_finished = Signal(str, str, object)
     inverter_edit_sync_finished = Signal(str, object, object)
+    automation_log_requested = Signal(str, object, str)
+    automation_save_requested = Signal()
+    automation_runtime_node_requested = Signal(str, str, str)
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(tr("EnergyFlow Studio"))
-        self.resize(1440, 900)
+        self._startup_target_size = QSize(1400, 950)
+        self._startup_geometry_enforced = False
+        self.resize(self._startup_target_size)
         self.setAcceptDrops(True)
 
         self.processed_data: ProcessedData | None = None
@@ -1276,8 +1321,19 @@ class MainWindow(QMainWindow):
         self._tuya_refresh_timeout_timer = QTimer(self)
         self._tuya_refresh_timeout_timer.setSingleShot(True)
         self._tuya_refresh_timeout_timer.timeout.connect(self._handle_tuya_refresh_timeout)
+        self._tuya_transient_retry_timer = QTimer(self)
+        self._tuya_transient_retry_timer.setSingleShot(True)
+        self._tuya_transient_retry_timer.timeout.connect(self._handle_tuya_transient_retry_timeout)
+        self._tuya_transient_retry_attempts = 0
         self._tuya_gate_state_cache: dict[str, str] = {}
         self._tuya_gate_last_change_cache: dict[str, str] = {}
+        self._automation_engine = AutomationEngine()
+        self._automation_rules: list[AutomationRule] = []
+        self._automation_logs: list[str] = []
+        self._automation_inflight_cycle = False
+        self._automation_timer = QTimer(self)
+        self._automation_timer.setInterval(AUTOMATION_EVALUATION_INTERVAL_MS)
+        self._automation_timer.timeout.connect(self._evaluate_automations_cycle)
         self._tuya_poll_timer = QTimer(self)
         self._tuya_poll_timer.timeout.connect(self._handle_tuya_poll_timeout)
         self._tuya_countdown_timer = QTimer(self)
@@ -1287,6 +1343,12 @@ class MainWindow(QMainWindow):
         self.tuya_devices_fetch_finished.connect(self._finish_tuya_devices_refresh, Qt.ConnectionType.QueuedConnection)
         self.tuya_icon_download_finished.connect(self._finish_tuya_icon_download, Qt.ConnectionType.QueuedConnection)
         self.inverter_edit_sync_finished.connect(self._on_inverter_edit_sync_finished, Qt.ConnectionType.QueuedConnection)
+        self.automation_log_requested.connect(self._append_automation_log, Qt.ConnectionType.QueuedConnection)
+        self.automation_save_requested.connect(self._save_profile_automations_from_tab, Qt.ConnectionType.QueuedConnection)
+        self.automation_runtime_node_requested.connect(
+            self._set_runtime_automation_node,
+            Qt.ConnectionType.QueuedConnection,
+        )
         self._last_weather_snapshot: WeatherLiveSnapshot | None = None
         self._weather_live_state = "unknown"
         self._weather_live_error = ""
@@ -1385,6 +1447,7 @@ class MainWindow(QMainWindow):
         self._auto_sync_timer.stop()
         self._tuya_poll_timer.stop()
         self._tuya_countdown_timer.stop()
+        self._automation_timer.stop()
         self._tuya_refresh_timeout_timer.stop()
         self._energyflow_request_timeout_timer.stop()
         self._popup_backdrop_sync_timer.stop()
@@ -1411,6 +1474,21 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         self._resize_popup_backdrop()
         self._resize_embedded_history_overlay()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if self._startup_geometry_enforced:
+            return
+        self._startup_geometry_enforced = True
+        QTimer.singleShot(0, self._enforce_startup_geometry)
+
+    def _enforce_startup_geometry(self) -> None:
+        if self._close_requested:
+            return
+        if self.isFullScreen() or self.isMaximized():
+            self.showNormal()
+        if self.size() != self._startup_target_size:
+            self.resize(self._startup_target_size)
 
     def _request_thread_shutdown(self, attr_name: str) -> None:
         thread = getattr(self, attr_name)
@@ -1644,6 +1722,19 @@ class MainWindow(QMainWindow):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor("#1fb6ff"))
             painter.drawEllipse(19, 19, 6, 6)
+        elif icon_name == "automations":
+            painter.setPen(QPen(QColor("#bfeaff"), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            painter.setBrush(QColor("#10243a"))
+            painter.drawEllipse(9, 9, 9, 9)
+            painter.drawEllipse(27, 9, 9, 9)
+            painter.drawEllipse(18, 27, 9, 9)
+            painter.drawLine(17, 14, 27, 14)
+            painter.drawLine(21, 18, 21, 27)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#1fb6ff"))
+            painter.drawEllipse(12, 12, 3, 3)
+            painter.drawEllipse(30, 12, 3, 3)
+            painter.drawEllipse(21, 30, 3, 3)
         else:
             painter.setPen(QPen(QColor("#bfeaff"), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
             painter.setBrush(QColor("#10243a"))
@@ -1677,6 +1768,8 @@ class MainWindow(QMainWindow):
                 or bool(self._tuya_action_inflight_ids)
             )
         if index == 4:
+            return bool(self._automation_inflight_cycle)
+        if index == 5:
             return bool(self._import_thread is not None or self._auto_sync_inflight)
         return False
 
@@ -1699,6 +1792,7 @@ class MainWindow(QMainWindow):
             self._tuya_poll_timer.stop()
             self._tuya_countdown_timer.stop()
             self._tuya_refresh_timeout_timer.stop()
+            self._cancel_tuya_transient_retry(reset_attempts=True)
             self._tuya_action_inflight_ids.clear()
             self._tuya_devices = []
             self._render_tuya_devices([])
@@ -1723,6 +1817,1014 @@ class MainWindow(QMainWindow):
         if not self._tuya_settings.enabled and self.tabs.currentIndex() == self._tuya_tab_index:
             self.tabs.setCurrentIndex(0)
 
+    def _load_profile_automations_into_tab(self) -> None:
+        profile_name = self.active_device_profile.profile_name if self.active_device_profile is not None else ""
+        rules_payload = load_profile_automations(profile_name)
+        self._automation_rules = deserialize_rules(rules_payload)
+        logs_payload = load_profile_automation_logs(profile_name)
+        self._automation_logs = [str(item) for item in logs_payload if str(item).strip()]
+        if hasattr(self, "automation_tab"):
+            cooldown_sec = (
+                self.active_device_profile.resolved_automation_cooldown_sec()
+                if self.active_device_profile is not None
+                else 60
+            )
+            self.automation_tab.set_global_cooldown_sec(cooldown_sec)
+            self.automation_tab.set_rules(self._automation_rules)
+            self.automation_tab.set_logs(self._automation_logs)
+            self.automation_tab.set_analytics(analytics_from_logs(self._automation_logs))
+            self._sync_automation_catalog_with_tuya_devices()
+
+    def _save_profile_automations_from_tab(self) -> None:
+        if not hasattr(self, "automation_tab"):
+            return
+        profile_name = self.active_device_profile.profile_name if self.active_device_profile is not None else ""
+        self._automation_rules = self.automation_tab.rules()
+        save_profile_automations(profile_name, serialize_rules(self._automation_rules))
+        save_profile_automation_logs(profile_name, self._automation_logs)
+        self.automation_tab.set_analytics(analytics_from_logs(self._automation_logs))
+        self._refresh_tab_badges()
+
+    def _sync_automation_catalog_with_tuya_devices(self) -> None:
+        if not hasattr(self, "automation_tab"):
+            return
+        measurement_keys_by_device: dict[str, set[str]] = {"": set()}
+        device_options: list[tuple[str, str]] = []
+        for device in self._tuya_devices:
+            device_id = device.device_id.strip()
+            if device_id:
+                device_options.append((device_id, device.name or device.device_name or device_id))
+            for label, _value in self._parse_tuya_measurements(device.measurements_text or ""):
+                normalized = label.strip().lower()
+                if normalized:
+                    measurement_keys_by_device.setdefault("", set()).add(normalized)
+                    if device_id:
+                        measurement_keys_by_device.setdefault(device_id, set()).add(normalized)
+            for code, _value in self._parse_tuya_status(device.status_text or ""):
+                normalized_code = code.strip().lower()
+                if normalized_code:
+                    measurement_keys_by_device.setdefault("", set()).add(normalized_code)
+                    if device_id:
+                        measurement_keys_by_device.setdefault(device_id, set()).add(normalized_code)
+
+        inverter_measurements = self._build_inverter_numeric_measurements_map()
+        inverter_key_pool: set[str] = {
+            key.strip().lower()
+            for key in inverter_measurements
+            if key.strip()
+        }
+        if self.active_device_profile is not None:
+            for key in (self.active_device_profile.available_parameter_keys or []):
+                normalized = str(key).strip().lower()
+                if normalized:
+                    inverter_key_pool.add(normalized)
+            for key in (self.active_device_profile.selected_parameter_keys or []):
+                normalized = str(key).strip().lower()
+                if normalized:
+                    inverter_key_pool.add(normalized)
+        processed = self._resolved_active_profile_processed_data()
+        if processed is not None:
+            for key in (processed.numeric_columns or []):
+                normalized = str(key).strip().lower()
+                if normalized:
+                    inverter_key_pool.add(normalized)
+        inverter_keys = sorted(inverter_key_pool)
+        if inverter_keys:
+            device_options.append((AUTOMATION_INVERTER_DEVICE_ID, tr("Inverter")))
+            measurement_keys_by_device.setdefault(AUTOMATION_INVERTER_DEVICE_ID, set()).update(inverter_keys)
+            measurement_keys_by_device.setdefault("", set()).update(inverter_keys)
+
+        normalized_map = {key: sorted(values) for key, values in measurement_keys_by_device.items()}
+        self.automation_tab.set_devices(device_options)
+        self.automation_tab.set_measurements_by_device(normalized_map)
+        self.automation_tab.set_inverter_control_fields(self._automation_inverter_control_fields())
+
+    def _automation_inverter_control_fields(self) -> list[dict[str, object]]:
+        merged: dict[str, dict[str, object]] = {}
+        profile = self.active_device_profile
+        if profile is not None:
+            for field in profile.resolved_inverter_control_fields():
+                field_id = field.field_id.strip()
+                if not field_id:
+                    continue
+                merged[field_id] = {
+                    "field_id": field_id,
+                    "label": field.display_name().strip() or field.name.strip() or field_id,
+                    "unit": field.unit.strip(),
+                    "options": [[str(value).strip(), str(label).strip()] for value, label in (field.options or [])],
+                }
+
+        if self._latest_inverter_settings_key == self._active_profile_key():
+            for setting in self._latest_inverter_settings:
+                field_id = setting.field_id.strip()
+                if not field_id:
+                    continue
+                current = merged.get(field_id, {"field_id": field_id, "label": field_id, "unit": "", "options": []})
+                display_name = setting.display_name.strip() or setting.name.strip() or setting.raw_name.strip() or field_id
+                if display_name:
+                    current["label"] = display_name
+                if setting.unit.strip():
+                    current["unit"] = setting.unit.strip()
+                if setting.options:
+                    current["options"] = [[str(value).strip(), str(label).strip()] for value, label in setting.options]
+                merged[field_id] = current
+
+        return sorted(
+            merged.values(),
+            key=lambda item: str(item.get("label", "")).lower(),
+        )
+
+    def _handle_automation_rules_changed(self) -> None:
+        self._save_profile_automations_from_tab()
+
+    def _handle_manual_automation_run(self, rule_id: str) -> None:
+        rule = next((item for item in self._automation_rules if item.rule_id == rule_id), None)
+        if rule is None:
+            return
+        self._append_automation_log("info", rule, tr("Manual run requested by user."))
+        threading.Thread(
+            target=self._run_automation_rule_actions,
+            args=(rule, True),
+            daemon=True,
+            name=f"automation-manual-{rule_id[:8]}",
+        ).start()
+
+    def _handle_simulate_automation_run(self, rule_id: str) -> None:
+        rule = next((item for item in self._automation_rules if item.rule_id == rule_id), None)
+        if rule is None:
+            return
+        self._queue_runtime_automation_node(rule.rule_id, "")
+        try:
+            self._append_automation_log(
+                "info",
+                rule,
+                tr("══════════ Rule: {name} ({rule_id}) ══════════").format(
+                    name=rule.name,
+                    rule_id=rule.rule_id,
+                ),
+            )
+            measurements = self._build_tuya_numeric_measurements_map()
+            run = self._automation_engine.run_flow(
+                rule=rule,
+                numeric_measurements=measurements,
+                force_start=True,
+            )
+            success_count = sum(1 for item in run.node_results if item.status == "success")
+            failed_count = sum(1 for item in run.node_results if item.status == "fail")
+            status = tr("passed") if failed_count == 0 and success_count > 0 else tr("failed")
+            self._append_automation_log("info", rule, tr("────────────────── Simulation Start ──────────────────"))
+            self._append_automation_log(
+                "info",
+                rule,
+                tr('Rule: "{name}" | Measurements for check: {count}').format(
+                    name=rule.name,
+                    count=len(measurements),
+                ),
+            )
+            self._log_flow_run_node_details(rule, run, highlight_runtime=True)
+            self._append_automation_log(
+                "info",
+                rule,
+                tr("Simulation completed: conditions {status}.").format(status=status),
+            )
+            self._log_flow_run_summary(rule, run, action_steps=0, use_queue=False)
+            self._append_automation_log("info", rule, tr("─────────────────── Simulation End ───────────────────"))
+        finally:
+            self._queue_runtime_automation_node(rule.rule_id, "")
+
+    def _handle_clear_automation_logs(self) -> None:
+        self._automation_logs = []
+        profile_name = self.active_device_profile.profile_name if self.active_device_profile is not None else ""
+        save_profile_automation_logs(profile_name, self._automation_logs)
+        if hasattr(self, "automation_tab"):
+            self.automation_tab.set_logs(self._automation_logs)
+            self.automation_tab.set_analytics(analytics_from_logs(self._automation_logs))
+
+    def _handle_automation_message_test(self, messenger: str, bot_token: str, chat_id: str, template: str) -> None:
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        measurements = self._build_tuya_numeric_measurements_map()
+        message_text = self._render_automation_message_template(
+            template,
+            rule_name="Manual test",
+            rule_id="manual_test",
+            node_id="message_test",
+            timestamp=now_text,
+            chat_id=chat_id,
+            measurements=measurements,
+        )
+        provider = str(messenger or "telegram").strip().lower()
+        if provider == "viber":
+            ok, details = self._execute_automation_viber_action(bot_token=bot_token, chat_id=chat_id, message=message_text)
+        else:
+            ok, details = self._execute_automation_telegram_action(bot_token=bot_token, chat_id=chat_id, message=message_text)
+        if ok:
+            self._show_message(QMessageBox.Icon.Information, tr("Message test"), tr("Test message sent successfully."))
+            return
+        self._show_message(
+            QMessageBox.Icon.Warning,
+            tr("Message test"),
+            tr("Failed to send test message: {details}").format(details=details),
+        )
+
+    def _evaluate_automations_cycle(self) -> None:
+        if self._automation_inflight_cycle or self._close_requested:
+            return
+        if not self._tuya_settings.enabled:
+            return
+        if not self._automation_rules:
+            return
+        self._automation_inflight_cycle = True
+        self._refresh_tab_badges()
+        try:
+            measurements = self._build_tuya_numeric_measurements_map()
+            ready = self._automation_engine.evaluate_ready_rules(
+                rules=self._automation_rules,
+                numeric_measurements=measurements,
+            )
+            if ready:
+                self._append_automation_log(
+                    "info",
+                    ready[0],
+                    tr("Cycle matched {count} rule(s).").format(count=len(ready)),
+                )
+            for index, rule in enumerate(ready):
+                if index >= AUTOMATION_MAX_ACTIONS_PER_CYCLE:
+                    self._append_automation_log(
+                        "error",
+                        rule,
+                        tr("Loop guard stopped this cycle after max action budget."),
+                    )
+                    break
+                threading.Thread(
+                    target=self._run_automation_rule_actions,
+                    args=(rule, True),
+                    daemon=True,
+                    name=f"automation-rule-{rule.rule_id[:8]}",
+                ).start()
+        finally:
+            self._automation_inflight_cycle = False
+            self._refresh_tab_badges()
+
+    def _run_automation_rule_actions(self, rule: AutomationRule, force_start: bool = False) -> None:
+        self._queue_runtime_automation_node(rule.rule_id, "")
+        try:
+            self._queue_automation_log(
+                "info",
+                rule,
+                tr("══════════ Rule: {name} ({rule_id}) ══════════").format(
+                    name=rule.name,
+                    rule_id=rule.rule_id,
+                ),
+            )
+            measurements = self._build_tuya_numeric_measurements_map()
+            run = self._automation_engine.run_flow(
+                rule=rule,
+                numeric_measurements=measurements,
+                force_start=force_start,
+            )
+            self._queue_automation_log("info", rule, tr("──────────────────── Run Start ────────────────────"))
+            self._queue_automation_log(
+                "info",
+                rule,
+                tr('Rule: "{name}" | Measurements for check: {count} | Force start: {force_start}').format(
+                    name=rule.name,
+                    count=len(measurements),
+                    force_start=(tr("yes") if bool(force_start) else tr("no")),
+                ),
+            )
+            self._log_flow_run_node_details(rule, run, use_queue=True, highlight_runtime=True)
+
+            action_steps = [step for step in run.steps if step.step_type == "action"]
+            delay_steps = [step for step in run.steps if step.step_type == "delay"]
+            self._queue_automation_log(
+                "info",
+                rule,
+                tr("Execution plan: total={total} action_steps={actions} delay_steps={delays}").format(
+                    total=len(run.steps),
+                    actions=len(action_steps),
+                    delays=len(delay_steps),
+                ),
+            )
+            if not action_steps and not run.steps and rule.delay_before_actions_sec > 0:
+                time.sleep(rule.delay_before_actions_sec)
+
+            for step in run.steps:
+                try:
+                    self._queue_runtime_automation_node(rule.rule_id, step.node_id)
+                    if step.step_type == "delay":
+                        seconds = max(0.0, float(step.payload.get("seconds", 0.0) or 0.0))
+                        self._queue_automation_log(
+                            "info",
+                            rule,
+                            tr("Delay before next step: {seconds} sec").format(seconds=f"{seconds:.3f}"),
+                        )
+                        if seconds > 0:
+                            time.sleep(seconds)
+                        continue
+                    if step.step_type != "action":
+                        continue
+
+                    action_type = str(step.payload.get("action_type", "power")).strip() or "power"
+                    action_device_id = str(step.payload.get("device_id", "")).strip()
+                    try:
+                        action_retries = max(0, int(float(step.payload.get("retries", 0) or 0)))
+                    except (TypeError, ValueError):
+                        action_retries = 0
+                    try:
+                        action_retry_delay_sec = max(0.0, float(step.payload.get("retry_delay_sec", 1.0) or 1.0))
+                    except (TypeError, ValueError):
+                        action_retry_delay_sec = 1.0
+
+                    attempt = 0
+                    max_attempts = max(1, action_retries + 1)
+                    success = False
+                    action_target_label = self._automation_device_label(action_device_id)
+                    while attempt < max_attempts:
+                        attempt += 1
+                        ok = False
+                        details = "unknown"
+                        success_message = ""
+                        if action_type == "power":
+                            action_value = bool(step.payload.get("value", False))
+                            if not action_device_id:
+                                self._queue_automation_log("error", rule, tr("Action skipped: no device selected."))
+                                break
+                            self._queue_automation_log(
+                                "info",
+                                rule,
+                                "ACTION_SEND "
+                                + f"type=power device_id={action_device_id} "
+                                + f"device={action_target_label} target={'on' if action_value else 'off'} "
+                                + f"attempt={attempt}/{max_attempts} "
+                                + f"endpoint={self._tuya_settings.normalized_endpoint()}",
+                            )
+                            ok, details = self._execute_automation_power_action(action_device_id, action_value)
+                            self._queue_automation_log(
+                                "info",
+                                rule,
+                                "ACTION_RESULT "
+                                + f"type=power device_id={action_device_id} "
+                                + f"attempt={attempt}/{max_attempts} ok={ok} details={details}",
+                            )
+                            device_label = self._automation_device_label(action_device_id)
+                            success_message = tr("Action: {device} - {state} (attempt {attempt}/{max_attempts}).").format(
+                                device=device_label,
+                                state=(tr("On") if action_value else tr("Off")),
+                                attempt=attempt,
+                                max_attempts=max_attempts,
+                            )
+                        elif action_type == "inverter_settings":
+                            changes_raw = step.payload.get("changes", step.payload.get("value", []))
+                            self._queue_automation_log(
+                                "info",
+                                rule,
+                                "ACTION_SEND "
+                                + f"type=inverter_settings changes={len(changes_raw) if isinstance(changes_raw, list) else 0} "
+                                + f"attempt={attempt}/{max_attempts}",
+                            )
+                            ok, details = self._execute_automation_inverter_settings_action(changes_raw)
+                            self._queue_automation_log(
+                                "info",
+                                rule,
+                                "ACTION_RESULT "
+                                + f"type=inverter_settings attempt={attempt}/{max_attempts} ok={ok} details={details}",
+                            )
+                            changes_count = len(changes_raw) if isinstance(changes_raw, list) else 0
+                            success_message = tr(
+                                "Inverter settings updated ({count}) (attempt {attempt}/{max_attempts})."
+                            ).format(
+                                count=changes_count,
+                                attempt=attempt,
+                                max_attempts=max_attempts,
+                            )
+                        elif action_type == "send_message":
+                            bot_token = str(step.payload.get("bot_token", "")).strip()
+                            bot_token_ref = str(step.payload.get("bot_token_ref", "")).strip()
+                            if not bot_token and bot_token_ref:
+                                bot_token = load_secret(bot_token_ref)
+                            chat_id = str(step.payload.get("chat_id", "")).strip()
+                            messenger = str(step.payload.get("messenger", "telegram")).strip().lower() or "telegram"
+                            message_template = str(step.payload.get("message_template", "")).strip() or 'Automation "{rule}" fired at {time}'
+                            now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            self._queue_automation_log(
+                                "info",
+                                rule,
+                                "ACTION_SEND "
+                                + f"type=send_message messenger={messenger} chat_id={chat_id or '<empty>'} "
+                                + f"attempt={attempt}/{max_attempts}",
+                            )
+                            rendered_message = self._render_automation_message_template(
+                                message_template,
+                                rule_name=rule.name,
+                                rule_id=rule.rule_id,
+                                node_id=step.node_id,
+                                timestamp=now_text,
+                                chat_id=chat_id,
+                                measurements=measurements,
+                            )
+                            if messenger == "viber":
+                                ok, details = self._execute_automation_viber_action(
+                                    bot_token=bot_token,
+                                    chat_id=chat_id,
+                                    message=rendered_message,
+                                )
+                            else:
+                                ok, details = self._execute_automation_telegram_action(
+                                    bot_token=bot_token,
+                                    chat_id=chat_id,
+                                    message=rendered_message,
+                                )
+                            self._queue_automation_log(
+                                "info",
+                                rule,
+                                "ACTION_RESULT "
+                                + f"type=send_message messenger={messenger} attempt={attempt}/{max_attempts} ok={ok} details={details}",
+                            )
+                            if messenger == "viber":
+                                success_message = tr(
+                                    "Viber message sent to chat {chat_id} (attempt {attempt}/{max_attempts})."
+                                ).format(
+                                    chat_id=chat_id or "?",
+                                    attempt=attempt,
+                                    max_attempts=max_attempts,
+                                )
+                            else:
+                                success_message = tr(
+                                    "Telegram message sent to chat {chat_id} (attempt {attempt}/{max_attempts})."
+                                ).format(
+                                    chat_id=chat_id or "?",
+                                    attempt=attempt,
+                                    max_attempts=max_attempts,
+                                )
+                        else:
+                            self._queue_automation_log(
+                                "error",
+                                rule,
+                                tr("Unsupported action type: {action_type}").format(action_type=action_type),
+                            )
+                            break
+                        if ok:
+                            self._queue_automation_log(
+                                "ok",
+                                rule,
+                                success_message,
+                            )
+                            success = True
+                            break
+                        self._queue_automation_log(
+                            "error",
+                            rule,
+                            tr("Action failed for {device_id} (attempt {attempt}/{max_attempts}): {details}").format(
+                                device_id=action_target_label,
+                                attempt=attempt,
+                                max_attempts=max_attempts,
+                                details=details,
+                            ),
+                        )
+                        if attempt < max_attempts and action_retry_delay_sec > 0:
+                            time.sleep(action_retry_delay_sec)
+                    if not success:
+                        self._queue_automation_log(
+                            "error",
+                            rule,
+                            tr("Action exhausted retries for {device_id}.").format(
+                                device_id=action_target_label,
+                            ),
+                        )
+                except Exception:
+                    self._queue_automation_log(
+                        "error",
+                        rule,
+                        "ACTION_EXCEPTION "
+                        + f"node_id={getattr(step, 'node_id', '')} type={getattr(step, 'step_type', '')}",
+                    )
+                    self._queue_automation_log(
+                        "error",
+                        rule,
+                        traceback.format_exc().strip(),
+                    )
+
+            if action_steps:
+                self._automation_engine.mark_rule_executed(rule.rule_id)
+            self._queue_automation_save()
+            self._log_flow_run_summary(rule, run, action_steps=len(action_steps), use_queue=True)
+            self._queue_automation_log("info", rule, tr("───────────────────── Run End ─────────────────────"))
+        except Exception:
+            self._queue_automation_log("error", rule, "RUN_EXCEPTION")
+            self._queue_automation_log("error", rule, traceback.format_exc().strip())
+        finally:
+            self._queue_runtime_automation_node(rule.rule_id, "")
+
+    def _log_flow_run_node_details(
+        self,
+        rule: AutomationRule,
+        run,
+        *,
+        use_queue: bool = False,
+        highlight_runtime: bool = False,
+    ) -> None:
+        total_nodes = len(run.node_results)
+        for index, node_result in enumerate(run.node_results, start=1):
+            if highlight_runtime:
+                runtime_branch = self._runtime_branch_for_node_result(node_result.node_type, node_result.status, node_result.reason)
+                self._queue_runtime_automation_node(rule.rule_id, node_result.node_id, runtime_branch)
+            if node_result.status == "success":
+                level = "ok"
+            elif node_result.status == "fail":
+                level = "error"
+            else:
+                level = "info"
+            message = self._format_friendly_node_message(
+                index=index,
+                total=total_nodes,
+                node_type=node_result.node_type,
+                node_status=node_result.status,
+                reason=node_result.reason,
+            )
+            if use_queue:
+                self._queue_automation_log(level, rule, message)
+            else:
+                self._append_automation_log(level, rule, message)
+
+    def _log_flow_run_summary(self, rule: AutomationRule, run, *, action_steps: int, use_queue: bool) -> None:
+        ok_count = sum(1 for item in run.node_results if item.status == "success")
+        fail_count = sum(1 for item in run.node_results if item.status == "fail")
+        skip_count = sum(1 for item in run.node_results if item.status == "skipped")
+        summary = tr(
+            "Run summary: success={ok} fail={fail} skipped={skipped} executed_actions={actions}"
+        ).format(
+            ok=ok_count,
+            fail=fail_count,
+            skipped=skip_count,
+            actions=action_steps,
+        )
+        if use_queue:
+            self._queue_automation_log("info", rule, summary)
+        else:
+            self._append_automation_log("info", rule, summary)
+
+    def _format_friendly_node_message(self, *, index: int, total: int, node_type: str, node_status: str, reason: str) -> str:
+        prefix = tr("[Step {index}/{total}] {node_type}").format(
+            index=index,
+            total=total,
+            node_type=self._friendly_node_type(node_type),
+        )
+        status_text = {
+            "success": tr("done"),
+            "fail": tr("not completed"),
+            "skipped": tr("skipped"),
+        }.get(node_status, node_status)
+        short_reason, details = self._split_reason_details(reason)
+        if short_reason.startswith("condition_"):
+            metric = details.get("metric", tr("unknown metric"))
+            device = details.get("device", "<global>")
+            actual = details.get("actual", "?")
+            operator = details.get("operator", "?")
+            expected = details.get("expected", "?")
+            return tr(
+                '{prefix}: Condition for "{metric}" ({device}) -> {status}. Check: {actual} {operator} {expected}.'
+            ).format(
+                prefix=prefix,
+                metric=metric,
+                device=device,
+                status=status_text,
+                actual=actual,
+                operator=operator,
+                expected=expected,
+            )
+        if short_reason.startswith("trigger_"):
+            metric = details.get("metric", tr("unknown metric"))
+            actual = details.get("actual", "?")
+            operator = details.get("operator", "?")
+            expected = details.get("expected", "?")
+            fired = details.get("fired")
+            fired_text = (
+                tr(", fired={fired}").format(fired=fired)
+                if fired is not None
+                else ""
+            )
+            return tr(
+                "{prefix}: Trigger -> {status}. Check: {metric}: {actual} {operator} {expected}{fired}."
+            ).format(
+                prefix=prefix,
+                status=status_text,
+                metric=metric,
+                actual=actual,
+                operator=operator,
+                expected=expected,
+                fired=fired_text,
+            )
+        if short_reason.startswith("gate_"):
+            inputs = details.get("inputs", "?")
+            true_count = details.get("true", "?")
+            false_count = details.get("false", "?")
+            internal_inputs = details.get("internal_inputs")
+            internal_true = details.get("internal_true")
+            internal_false = details.get("internal_false")
+            if internal_inputs is not None and internal_true is not None and internal_false is not None:
+                return tr(
+                    "{prefix}: Gate evaluation -> {status}. Inputs: {inputs}, true: {true_count}, false: {false_count}. Internal: {internal_inputs}, true: {internal_true}, false: {internal_false}."
+                ).format(
+                    prefix=prefix,
+                    status=status_text,
+                    inputs=inputs,
+                    true_count=true_count,
+                    false_count=false_count,
+                    internal_inputs=internal_inputs,
+                    internal_true=internal_true,
+                    internal_false=internal_false,
+                )
+            return tr(
+                "{prefix}: Gate evaluation -> {status}. Inputs: {inputs}, true: {true_count}, false: {false_count}."
+            ).format(
+                prefix=prefix,
+                status=status_text,
+                inputs=inputs,
+                true_count=true_count,
+                false_count=false_count,
+            )
+        if short_reason == "metric_missing":
+            metric = details.get("metric", tr("unknown metric"))
+            return tr('{prefix}: Metric "{metric}" is missing in current measurements.').format(
+                prefix=prefix,
+                metric=metric,
+            )
+        return tr("{prefix}: {status}. Details: {details}").format(
+            prefix=prefix,
+            status=status_text,
+            details=self._friendly_reason_title(short_reason),
+        )
+
+    @staticmethod
+    def _friendly_node_type(node_type: str) -> str:
+        return {
+            "start": tr("Start"),
+            "trigger": tr("Trigger"),
+            "condition": tr("Condition"),
+            "gate": tr("Gate"),
+            "delay": tr("Delay"),
+            "action": tr("Action"),
+            "end": tr("End"),
+        }.get(str(node_type).strip().lower(), str(node_type).strip().lower())
+
+    @staticmethod
+    def _friendly_reason_title(reason: str) -> str:
+        titles = {
+            "start_ready": tr("start node ready"),
+            "end_reached": tr("end reached"),
+            "action_ready": tr("action is ready"),
+            "action_ready_forced": tr("action is ready (forced run)"),
+            "action_state_unchanged": tr("state has not changed since previous run"),
+            "delay_ready": tr("delay is ready"),
+            "upstream_blocked": tr("blocked by upstream node"),
+            "forced_start=True": tr("forced start"),
+        }
+        return titles.get(reason, reason)
+
+    @staticmethod
+    def _runtime_branch_for_node_result(node_type: str, status: str, reason: str) -> str:
+        kind = str(node_type or "").strip().lower()
+        state = str(status or "").strip().lower()
+        short_reason = str(reason or "").split(";", 1)[0].strip().lower()
+        if kind in {"condition", "gate"}:
+            if short_reason.endswith("_true") or state == "success":
+                return "true"
+            if short_reason.endswith("_false") or state == "fail":
+                return "false"
+            return ""
+        if kind in {"start", "trigger", "delay", "action"} and state == "success":
+            return "next"
+        return ""
+
+    @staticmethod
+    def _split_reason_details(reason: str) -> tuple[str, dict[str, str]]:
+        text = str(reason or "").strip()
+        if not text:
+            return "", {}
+        parts = text.split(";", 1)
+        short_reason = parts[0].strip()
+        details: dict[str, str] = {}
+        if len(parts) > 1:
+            for key, value in re.findall(r"([a-zA-Z_]+)=([^\s]+)", parts[1]):
+                details[key] = value
+        return short_reason, details
+
+    def _queue_automation_log(self, level: str, rule: AutomationRule, message: str) -> None:
+        if QThread.currentThread() is self.thread():
+            self._append_automation_log(level, rule, message)
+            return
+        self.automation_log_requested.emit(level, rule, message)
+
+    def _queue_automation_save(self) -> None:
+        if QThread.currentThread() is self.thread():
+            self._save_profile_automations_from_tab()
+            return
+        self.automation_save_requested.emit()
+
+    def _set_runtime_automation_node(self, rule_id: str, node_id: str, branch: str = "") -> None:
+        if hasattr(self, "automation_tab"):
+            self.automation_tab.set_runtime_active_node(rule_id, node_id, branch)
+
+    def _queue_runtime_automation_node(self, rule_id: str, node_id: str, branch: str = "") -> None:
+        normalized_rule = str(rule_id or "").strip()
+        normalized_node = str(node_id or "").strip()
+        normalized_branch = str(branch or "").strip().lower()
+        if QThread.currentThread() is self.thread():
+            self._set_runtime_automation_node(normalized_rule, normalized_node, normalized_branch)
+            return
+        self.automation_runtime_node_requested.emit(normalized_rule, normalized_node, normalized_branch)
+
+    def _execute_automation_power_action(self, device_id: str, turn_on: bool) -> tuple[bool, str]:
+        normalized_device_id = device_id.strip()
+        if not normalized_device_id:
+            return False, tr("Device id is empty.")
+        try:
+            updated_device = set_device_power(
+                client_id=self._tuya_settings.client_id,
+                client_secret=self._tuya_settings.client_secret,
+                endpoint=self._tuya_settings.normalized_endpoint(),
+                device_id=normalized_device_id,
+                turn_on=turn_on,
+            )
+        except Exception as exc:
+            return False, str(exc)
+        self.tuya_power_change_finished.emit(
+            normalized_device_id,
+            {"ok": True, "device": updated_device, "target": turn_on},
+        )
+        device_name = str(updated_device.name or updated_device.device_name or normalized_device_id).strip()
+        return True, f"confirmed name={device_name} power_on={bool(updated_device.power_on)}"
+
+    def _execute_automation_inverter_settings_action(self, raw_changes: object) -> tuple[bool, str]:
+        if not isinstance(raw_changes, list):
+            return False, tr("No inverter settings were configured for this action.")
+        deduplicated_updates: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for item in raw_changes:
+            if not isinstance(item, dict):
+                continue
+            field_id = str(item.get("field_id", "")).strip()
+            if not field_id:
+                continue
+            value = str(item.get("value", "")).strip()
+            if field_id in seen:
+                continue
+            seen.add(field_id)
+            deduplicated_updates.append((field_id, value))
+        if not deduplicated_updates:
+            return False, tr("No inverter settings were configured for this action.")
+
+        # Skip updates that already match the local cached value to reduce API calls.
+        latest_by_field: dict[str, InverterSetting] = {}
+        if self._latest_inverter_settings_key == self._active_profile_key():
+            latest_by_field = {item.field_id.strip(): item for item in self._latest_inverter_settings if item.field_id.strip()}
+        updates: list[tuple[str, str]] = []
+        for field_id, value in deduplicated_updates:
+            current = latest_by_field.get(field_id)
+            current_value = str(current.raw_value).strip() if current is not None and current.raw_value is not None else None
+            if current_value is not None and current_value == value:
+                continue
+            updates.append((field_id, value))
+        if not updates:
+            return True, tr("All selected inverter settings are already up to date.")
+
+        try:
+            config = self._build_inverter_settings_config()
+            set_device_control_values(config, updates)
+        except Exception as exc:
+            return False, str(exc)
+
+        if self._latest_inverter_settings_key == self._active_profile_key():
+            loaded_at = pd.Timestamp.now().strftime("%d.%m.%Y %H:%M")
+            for field_id, value in updates:
+                for idx, current in enumerate(self._latest_inverter_settings):
+                    if current.field_id.strip() != field_id:
+                        continue
+                    self._latest_inverter_settings[idx] = InverterSetting(
+                        field_id=current.field_id,
+                        name=current.name,
+                        display_name=current.display_name,
+                        raw_value=value,
+                        display_value=self._format_setting_value(value, current.options),
+                        unit=current.unit,
+                        category=current.category,
+                        writable=current.writable,
+                        options=current.options,
+                        hint=current.hint,
+                        raw_name=current.raw_name,
+                    )
+                    break
+            active_key = self._active_profile_key()
+            if active_key is not None:
+                self._inverter_settings_cache[active_key] = (list(self._latest_inverter_settings), loaded_at)
+                if self.active_device_profile is not None:
+                    self._persist_inverter_settings_cache(self.active_device_profile, list(self._latest_inverter_settings), loaded_at)
+        return True, "ok"
+
+    def _execute_automation_telegram_action(self, *, bot_token: str, chat_id: str, message: str) -> tuple[bool, str]:
+        safe_token = str(bot_token or "").strip()
+        safe_chat_id = str(chat_id or "").strip()
+        if not safe_token:
+            return False, tr("Bot token is empty.")
+        if not safe_chat_id:
+            return False, tr("Receiver ID is empty.")
+        url = f"https://api.telegram.org/bot{safe_token}/sendMessage"
+        try:
+            response = requests.post(
+                url,
+                json={"chat_id": safe_chat_id, "text": message},
+                timeout=10,
+            )
+        except Exception as exc:
+            return False, str(exc)
+        if not response.ok:
+            detail = response.text.strip()[:240]
+            return False, f"HTTP {response.status_code}: {detail}"
+        return True, "ok"
+
+    def _execute_automation_viber_action(self, *, bot_token: str, chat_id: str, message: str) -> tuple[bool, str]:
+        safe_token = str(bot_token or "").strip()
+        safe_chat_id = str(chat_id or "").strip()
+        if not safe_token:
+            return False, tr("Bot token is empty.")
+        if not safe_chat_id:
+            return False, tr("Receiver ID is empty.")
+        url = "https://chatapi.viber.com/pa/send_message"
+        payload = {
+            "receiver": safe_chat_id,
+            "min_api_version": 1,
+            "sender": {"name": "EnergyFlow Studio"},
+            "type": "text",
+            "text": message,
+        }
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                headers={
+                    "X-Viber-Auth-Token": safe_token,
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
+            )
+        except Exception as exc:
+            return False, str(exc)
+        if not response.ok:
+            detail = response.text.strip()[:240]
+            return False, f"HTTP {response.status_code}: {detail}"
+        try:
+            data = response.json()
+        except Exception:
+            return False, tr("Viber API returned a non-JSON response.")
+        if int(data.get("status", 1) or 1) != 0:
+            return False, str(data.get("status_message", "viber_error"))
+        return True, "ok"
+
+    @staticmethod
+    def _render_automation_message_template(
+        template: str,
+        *,
+        rule_name: str,
+        rule_id: str,
+        node_id: str,
+        timestamp: str,
+        chat_id: str,
+        measurements: dict[str, float] | None = None,
+    ) -> str:
+        source = str(template or "").strip() or 'Automation "{rule}" fired at {time}'
+        mapping = {
+            "rule": str(rule_name or "").strip(),
+            "rule_id": str(rule_id or "").strip(),
+            "node_id": str(node_id or "").strip(),
+            "time": str(timestamp or "").strip(),
+            "chat_id": str(chat_id or "").strip(),
+        }
+        metrics = measurements or {}
+        for key, value in metrics.items():
+            safe_key = str(key or "").strip()
+            if not safe_key:
+                continue
+            mapping.setdefault(safe_key, f"{float(value):g}")
+        # Explicit measure accessor: {measure:cur_power}
+        rendered = source
+        for key, value in metrics.items():
+            safe_key = str(key or "").strip()
+            if not safe_key:
+                continue
+            rendered = rendered.replace("{measure:" + safe_key + "}", f"{float(value):g}")
+        try:
+            return rendered.format(**mapping)
+        except Exception:
+            return rendered
+
+    def _automation_device_label(self, device_id: str) -> str:
+        normalized = str(device_id or "").strip()
+        if not normalized:
+            return tr("Device")
+        if normalized == AUTOMATION_INVERTER_DEVICE_ID:
+            return tr("Inverter")
+        for item in self._tuya_devices:
+            if str(item.device_id).strip() != normalized:
+                continue
+            title = str(item.name or item.device_name or normalized).strip()
+            return title or normalized
+        return normalized
+
+    def _append_automation_log(self, level: str, rule: AutomationRule, message: str) -> None:
+        label = level.strip().upper() or "INFO"
+        now = datetime.now().strftime("%H:%M:%S")
+        line = f"{now} [{label}] {message}"
+        self._automation_logs.append(line)
+        self._automation_logs = self._automation_logs[-400:]
+        profile_name = self.active_device_profile.profile_name if self.active_device_profile is not None else ""
+        save_profile_automation_logs(profile_name, self._automation_logs)
+        if hasattr(self, "automation_tab"):
+            self.automation_tab.set_logs(self._automation_logs)
+            self.automation_tab.set_analytics(analytics_from_logs(self._automation_logs))
+
+    def _build_tuya_numeric_measurements_map(self) -> dict[str, float]:
+        values: dict[str, float] = {}
+        for device in self._tuya_devices:
+            device_id = device.device_id.strip()
+            for label, raw_value in self._parse_tuya_measurements(device.measurements_text or ""):
+                key = label.strip().lower()
+                parsed = self._parse_numeric_metric_value(raw_value)
+                if parsed is None:
+                    continue
+                values[key] = parsed
+                if device_id:
+                    values[f"{device_id}:{key}"] = parsed
+            for code, raw_value in self._parse_tuya_status(device.status_text or ""):
+                status_key = code.strip().lower()
+                parsed_status = self._parse_numeric_metric_value(raw_value)
+                if parsed_status is None:
+                    continue
+                values[status_key] = parsed_status
+                if device_id:
+                    values[f"{device_id}:{status_key}"] = parsed_status
+
+        inverter_values = self._build_inverter_numeric_measurements_map()
+        for key, value in inverter_values.items():
+            normalized_key = key.strip().lower()
+            values[normalized_key] = value
+            values[f"{AUTOMATION_INVERTER_DEVICE_ID}:{normalized_key}"] = value
+        return values
+
+    def _build_inverter_numeric_measurements_map(self) -> dict[str, float]:
+        values: dict[str, float] = {}
+
+        snapshot = self._last_energyflow_snapshot
+        if snapshot is not None:
+            for field_name in snapshot.__dataclass_fields__.keys():
+                field_value = getattr(snapshot, field_name, None)
+                if isinstance(field_value, bool) or field_value is None:
+                    continue
+                if not isinstance(field_value, (int, float)):
+                    continue
+                values[str(field_name).strip().lower()] = float(field_value)
+
+        processed = self._resolved_active_profile_processed_data()
+        if processed is not None and not processed.dataframe.empty:
+            source_df = processed.dataframe
+            ts_column = processed.timestamp_column
+            try:
+                latest_row = source_df.sort_values(ts_column, ascending=True).iloc[-1]
+            except Exception:
+                latest_row = source_df.iloc[-1]
+            for column_name in processed.numeric_columns:
+                normalized = str(column_name).strip().lower()
+                if not normalized:
+                    continue
+                raw_value = latest_row.get(column_name)
+                parsed = pd.to_numeric(raw_value, errors="coerce")
+                if pd.isna(parsed):
+                    continue
+                values[normalized] = float(parsed)
+        return values
+
+    def _parse_numeric_metric_value(self, raw_value: object) -> float | None:
+        text = str(raw_value or "").strip().lower().replace(",", ".")
+        if not text:
+            return None
+        direct = (
+            text.replace("kw", "")
+            .replace("w", "")
+            .replace("ma", "")
+            .replace("a", "")
+            .replace("v", "")
+            .replace("kwh", "")
+            .strip()
+        )
+        try:
+            value = float(direct)
+        except ValueError:
+            return None
+        if "kw" in text:
+            value *= 1000.0
+        if "ma" in text:
+            value /= 1000.0
+        return value
+
     def _handle_tuya_poll_timeout(self) -> None:
         if not self._tuya_settings.enabled:
             self._tuya_poll_timer.stop()
@@ -1732,9 +2834,11 @@ class MainWindow(QMainWindow):
             return
         self._refresh_tuya_devices()
 
-    def _refresh_tuya_devices(self) -> None:
+    def _refresh_tuya_devices(self, *, auto_retry: bool = False) -> None:
         if not self._tuya_settings.enabled or self._tuya_loading:
             return
+        if not auto_retry:
+            self._cancel_tuya_transient_retry(reset_attempts=True)
         if self._tuya_poll_timer.isActive():
             self._tuya_poll_timer.stop()
             self._tuya_poll_timer.start()
@@ -1760,6 +2864,19 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=worker, daemon=True, name=f"tuya-refresh-{request_id}").start()
 
+    def _handle_tuya_transient_retry_timeout(self) -> None:
+        if not self._tuya_settings.enabled:
+            self._cancel_tuya_transient_retry(reset_attempts=True)
+            return
+        if self._tuya_loading:
+            return
+        self._refresh_tuya_devices(auto_retry=True)
+
+    def _cancel_tuya_transient_retry(self, *, reset_attempts: bool) -> None:
+        self._tuya_transient_retry_timer.stop()
+        if reset_attempts:
+            self._tuya_transient_retry_attempts = 0
+
     def _handle_tuya_refresh_timeout(self) -> None:
         if not self._tuya_loading:
             return
@@ -1776,6 +2893,7 @@ class MainWindow(QMainWindow):
         self._tuya_refresh_timeout_timer.stop()
         try:
             if bool(result.get("ok")):
+                self._cancel_tuya_transient_retry(reset_attempts=True)
                 devices = list(result.get("devices") or [])
                 self._tuya_devices = devices
                 self._render_tuya_devices(self._tuya_devices)
@@ -1785,15 +2903,51 @@ class MainWindow(QMainWindow):
                 self._set_tab_message(self.tuya_status_label, message, error=False)
             else:
                 exc_text = str(result.get("error", "Unknown Tuya error"))
+                friendly_error = self._friendly_tuya_error(exc_text)
+                transient_transport_error = _is_retryable_tuya_transport_error(exc_text)
+                auto_retry_planned = False
+                if _should_auto_retry_tuya_transient_error(
+                    exc_text,
+                    self._tuya_transient_retry_attempts,
+                    max_attempts=TUYA_TRANSIENT_RETRY_MAX_ATTEMPTS,
+                ):
+                    self._tuya_transient_retry_attempts += 1
+                    self._tuya_transient_retry_timer.start(TUYA_TRANSIENT_RETRY_DELAY_MS)
+                    auto_retry_planned = True
+                elif not transient_transport_error:
+                    self._cancel_tuya_transient_retry(reset_attempts=True)
+
                 if self._tuya_devices:
+                    if transient_transport_error:
+                        message = f"Tuya temporarily unavailable: {friendly_error} (showing last known devices)"
+                        if auto_retry_planned:
+                            retry_seconds = TUYA_TRANSIENT_RETRY_DELAY_MS // 1000
+                            message += f". Retrying automatically in {retry_seconds}s."
+                        message = tr_fragment(message)
+                    else:
+                        message = tr_fragment(f"Tuya error: {friendly_error} (showing last known devices)")
                     self._set_tab_message(
                         self.tuya_status_label,
-                        tr_fragment(f"Tuya error: {exc_text} (showing last known devices)"),
-                        error=True,
+                        message,
+                        error=not transient_transport_error,
                     )
                 else:
-                    self._set_tab_message(self.tuya_status_label, tr_fragment(f"Tuya error: {exc_text}"), error=True)
-                    self._render_tuya_devices([])
+                    message = f"Tuya error: {friendly_error}"
+                    show_error = True
+                    if transient_transport_error and auto_retry_planned:
+                        retry_seconds = TUYA_TRANSIENT_RETRY_DELAY_MS // 1000
+                        message = (
+                            f"Tuya temporarily unavailable: {friendly_error}. "
+                            f"Retrying automatically in {retry_seconds}s."
+                        )
+                        show_error = False
+                    self._set_tab_message(
+                        self.tuya_status_label,
+                        tr_fragment(message),
+                        error=show_error,
+                    )
+                    if not transient_transport_error:
+                        self._render_tuya_devices([])
         except Exception as exc:
             self._append_log(f"Tuya refresh UI warning: {exc}")
         finally:
@@ -1808,6 +2962,7 @@ class MainWindow(QMainWindow):
         self._refresh_tuya_filter_button_states()
         self._render_tuya_tiles(self._filtered_tuya_devices(devices))
         self._sync_energyflow_tuya_icons()
+        self._sync_automation_catalog_with_tuya_devices()
 
     def _sync_energyflow_tuya_icons(self) -> None:
         if not hasattr(self, "energyflow_view"):
@@ -1991,12 +3146,12 @@ class MainWindow(QMainWindow):
             return 0.0
         lowered = text.lower()
         unit = "a"
-        if "ma" in lowered:
+        if "ma" in lowered or "ма" in lowered:
             unit = "ma"
-        numeric = text
-        for token in ("mA", "ma", "A", "a"):
-            numeric = numeric.replace(token, "")
-        numeric = numeric.strip().replace(",", ".")
+        match = re.search(r"-?\d+(?:[.,]\d+)?", text)
+        if match is None:
+            return 0.0
+        numeric = match.group(0).strip().replace(",", ".")
         try:
             value = float(numeric)
         except ValueError:
@@ -2011,15 +3166,16 @@ class MainWindow(QMainWindow):
         text = (raw_value or "").strip()
         if not text:
             return 0.0
-        numeric = text
-        for token in ("kW", "kw", "W", "w"):
-            numeric = numeric.replace(token, "")
-        numeric = numeric.strip().replace(",", ".")
+        lowered = text.lower()
+        match = re.search(r"-?\d+(?:[.,]\d+)?", text)
+        if match is None:
+            return 0.0
+        numeric = match.group(0).strip().replace(",", ".")
         try:
             value = float(numeric)
         except ValueError:
             return 0.0
-        if "kw" in text.lower():
+        if "kw" in lowered or "квт" in lowered:
             value *= 1000.0
         return abs(value)
 
@@ -2201,9 +3357,17 @@ class MainWindow(QMainWindow):
         if not clean:
             return tr("Unknown Tuya error")
         first_line = clean.splitlines()[0].strip()
+        if first_line.lower().startswith("could not reach tuya endpoint:"):
+            first_line = first_line.split(":", 1)[1].strip() or first_line
+        if "(caused by" in first_line.lower():
+            first_line = re.split(r"\(caused by", first_line, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        if _is_retryable_tuya_transport_error(clean):
+            if "name resolution" in clean.lower() or "failed to resolve" in clean.lower():
+                return "DNS lookup failed after wake."
+            return "Temporary network error."
         if first_line.lower().startswith("tuya api error"):
             return first_line
-        return first_line
+        return first_line[:180].strip()
 
     def _format_tuya_measurements_column(self, raw_text: str) -> str:
         normalized = (raw_text or "").strip()
@@ -2225,10 +3389,10 @@ class MainWindow(QMainWindow):
         parsed_items = self._parse_tuya_measurements(raw_text)
         raw_map = {label.strip().lower(): value.strip() for label, value in parsed_items}
         ordered_items = [
-            (tr("Energy"), raw_map.get("energy", "—")),
-            (tr("Current"), raw_map.get("current", "—")),
-            (tr("Power"), raw_map.get("power", "—")),
-            (tr("Voltage"), raw_map.get("voltage", "—")),
+            (tr("Energy"), tr_fragment(raw_map.get("energy", "—"))),
+            (tr("Current"), tr_fragment(raw_map.get("current", "—"))),
+            (tr("Power"), tr_fragment(raw_map.get("power", "—"))),
+            (tr("Voltage"), tr_fragment(raw_map.get("voltage", "—"))),
         ]
 
         for idx, (label, value) in enumerate(ordered_items):
@@ -2282,7 +3446,7 @@ class MainWindow(QMainWindow):
             if not sep:
                 continue
             clean_label = label.strip()
-            clean_value = tr_fragment(value.strip())
+            clean_value = value.strip()
             if not clean_label or not clean_value:
                 continue
             pairs.append((clean_label, clean_value))
@@ -2772,6 +3936,8 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.setObjectName("MainTabs")
+        self.tabs.setMinimumSize(0, 0)
+        self.tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         self.tabs.setDocumentMode(True)
         self.tabs.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.tabs.tabBar().setExpanding(False)
@@ -2849,6 +4015,12 @@ class MainWindow(QMainWindow):
 
         self.forecast_tab = ForecastTab()
         self.forecast_tab.refresh_requested.connect(self._handle_forecast_refresh_click)
+        self.automation_tab = AutomationTab()
+        self.automation_tab.rules_changed.connect(self._handle_automation_rules_changed)
+        self.automation_tab.manual_run_requested.connect(self._handle_manual_automation_run)
+        self.automation_tab.simulate_requested.connect(self._handle_simulate_automation_run)
+        self.automation_tab.logs_clear_requested.connect(self._handle_clear_automation_logs)
+        self.automation_tab.message_test_requested.connect(self._handle_automation_message_test)
 
         self.tuya_tab = QWidget()
         tuya_layout = QVBoxLayout(self.tuya_tab)
@@ -2923,13 +4095,25 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.forecast_tab, "")
         self.tabs.addTab(self.inverter_settings_tab, "")
         self.tabs.addTab(self.tuya_tab, "")
+        self.tabs.addTab(self.automation_tab, "")
         self.tabs.addTab(self.saved_data_section, "")
+        for page in (
+            self.energyflow_tab,
+            self.forecast_tab,
+            self.inverter_settings_tab,
+            self.tuya_tab,
+            self.automation_tab,
+            self.saved_data_section,
+        ):
+            page.setMinimumSize(0, 0)
+            page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         energyflow_badge = self._build_tab_badge("energyflow", "EnergyFlow")
         forecast_badge = self._build_tab_badge("charts", "Forecast")
         settings_badge = self._build_tab_badge("settings", "Inverter")
         tuya_badge = self._build_tab_badge("tuya", "Tuya")
+        automation_badge = self._build_tab_badge("automations", "Automations")
         saved_badge = self._build_tab_badge("saved", "Data")
-        self._tab_badges.extend([energyflow_badge, forecast_badge, settings_badge, tuya_badge, saved_badge])
+        self._tab_badges.extend([energyflow_badge, forecast_badge, settings_badge, tuya_badge, automation_badge, saved_badge])
         self.tabs.tabBar().setTabButton(0, self.tabs.tabBar().ButtonPosition.LeftSide, energyflow_badge)
         self.tabs.tabBar().setTabButton(0, self.tabs.tabBar().ButtonPosition.RightSide, QWidget())
         self.tabs.tabBar().setTabButton(1, self.tabs.tabBar().ButtonPosition.LeftSide, forecast_badge)
@@ -2938,15 +4122,20 @@ class MainWindow(QMainWindow):
         self.tabs.tabBar().setTabButton(2, self.tabs.tabBar().ButtonPosition.RightSide, QWidget())
         self.tabs.tabBar().setTabButton(3, self.tabs.tabBar().ButtonPosition.LeftSide, tuya_badge)
         self.tabs.tabBar().setTabButton(3, self.tabs.tabBar().ButtonPosition.RightSide, QWidget())
-        self.tabs.tabBar().setTabButton(4, self.tabs.tabBar().ButtonPosition.LeftSide, saved_badge)
+        self.tabs.tabBar().setTabButton(4, self.tabs.tabBar().ButtonPosition.LeftSide, automation_badge)
         self.tabs.tabBar().setTabButton(4, self.tabs.tabBar().ButtonPosition.RightSide, QWidget())
+        self.tabs.tabBar().setTabButton(5, self.tabs.tabBar().ButtonPosition.LeftSide, saved_badge)
+        self.tabs.tabBar().setTabButton(5, self.tabs.tabBar().ButtonPosition.RightSide, QWidget())
         self.tabs.setTabToolTip(0, "")
         self.tabs.setTabToolTip(1, "")
         self.tabs.setTabToolTip(2, "")
         self.tabs.setTabToolTip(3, "")
         self.tabs.setTabToolTip(4, "")
+        self.tabs.setTabToolTip(5, "")
         self._tuya_tab_index = 3
         self._apply_tuya_settings()
+        self._load_profile_automations_into_tab()
+        self._automation_timer.start()
         self.tabs.currentChanged.connect(self._handle_tab_changed)
         self._refresh_tab_badges()
         right_layout.addWidget(self.tabs)
@@ -3204,6 +4393,176 @@ class MainWindow(QMainWindow):
                 font-size: 12px;
                 background: transparent;
             }
+            QPushButton#AutomationActionButton {
+                min-height: 34px;
+                border-radius: 12px;
+                border: 1px solid #224163;
+                background: rgba(7, 20, 42, 0.92);
+                color: #c6d9ea;
+                font-size: 13px;
+                font-weight: 600;
+                padding: 0 14px;
+            }
+            QPushButton#AutomationActionButton:hover {
+                border-color: #2f6b9a;
+                background: rgba(9, 26, 52, 0.96);
+                color: #e5f3ff;
+            }
+            QPushButton#AutomationActionButton:pressed {
+                border-color: #67e8f9;
+                background: rgba(11, 34, 66, 0.98);
+            }
+            QPushButton#AutomationActionButton:disabled {
+                color: #6e859d;
+                border-color: #20344a;
+                background: rgba(7, 16, 30, 0.85);
+            }
+            QPushButton#AutomationHeaderPlusButton,
+            QPushButton#AutomationHeaderIconButton {
+                min-width: 22px;
+                max-width: 22px;
+                min-height: 22px;
+                max-height: 22px;
+                border: 1px solid #2a4766;
+                border-radius: 7px;
+                background: rgba(7, 20, 42, 0.92);
+                color: #b7cbdf;
+                padding: 0;
+            }
+            QPushButton#AutomationHeaderPlusButton {
+                font-size: 18px;
+                font-weight: 700;
+            }
+            QPushButton#AutomationHeaderIconButton {
+                font-size: 12px;
+                font-weight: 700;
+            }
+            QPushButton#AutomationHeaderPlusButton:hover,
+            QPushButton#AutomationHeaderIconButton:hover {
+                border-color: #22d3ee;
+                color: #e6f9ff;
+                background: rgba(8, 27, 54, 0.98);
+            }
+            QPushButton#AutomationHeaderPlusButton:pressed,
+            QPushButton#AutomationHeaderIconButton:pressed {
+                border-color: #06b6d4;
+                color: #67e8f9;
+            }
+            /*
+             * Legacy override removed: keep plus button in the same style as other header icon buttons.
+             */
+            QPushButton#AutomationHeaderPlusButton_legacy {
+                background: transparent;
+                border: none;
+                color: #22d3ee;
+                font-size: 26px;
+                font-weight: 600;
+                padding: 0;
+            }
+            QListWidget#AutomationList,
+            QTextBrowser#AutomationText {
+                background: rgba(8, 15, 30, 0.82);
+                border: 1px solid #243244;
+                border-radius: 14px;
+                color: #dbeafe;
+                padding: 6px;
+                outline: 0;
+            }
+            QWidget#AutomationDiagram {
+                background: rgba(8, 15, 30, 0.82);
+                border: 1px solid #243244;
+                border-radius: 14px;
+            }
+            QScrollArea#AutomationRightScroll {
+                background: transparent;
+                border: 1px solid #243244;
+                border-radius: 14px;
+            }
+            QWidget#AutomationRightPanel {
+                background: rgba(8, 15, 30, 0.82);
+                border: none;
+            }
+            QListWidget#AutomationList::item {
+                min-height: 34px;
+                padding: 2px 4px;
+                border-radius: 8px;
+            }
+            QListWidget#AutomationList::item:selected {
+                background: transparent;
+                color: #f0f9ff;
+            }
+            QListWidget#AutomationList::item:hover:!selected {
+                background: transparent;
+            }
+            QWidget#AutomationRuleRow {
+                background: transparent;
+                border: 1px solid transparent;
+                border-radius: 10px;
+            }
+            QWidget#AutomationRuleRow[selected="true"] {
+                background: rgba(14, 165, 233, 0.3);
+                border: 2px solid rgba(34, 211, 238, 0.9);
+            }
+            QLabel#AutomationRuleName {
+                color: #dbeafe;
+                font-size: 14px;
+                font-weight: 600;
+                background: transparent;
+            }
+            QWidget#AutomationRuleRow[selected="true"] QLabel#AutomationRuleName {
+                color: #ecfeff;
+                font-weight: 700;
+            }
+            QLabel#AutomationInlineLink {
+                color: #22d3ee;
+                font-size: 12px;
+                font-weight: 700;
+                background: transparent;
+                border: none;
+                padding: 0;
+            }
+            QLabel#AutomationInlineLink:hover {
+                color: #67e8f9;
+                background: transparent;
+            }
+            QLabel#AutomationInlineLink:pressed {
+                color: #06b6d4;
+                background: transparent;
+            }
+            QWidget#AutomationPaletteTiles {
+                background: transparent;
+            }
+            QToolButton#AutomationPaletteTile {
+                min-width: 86px;
+                max-width: 96px;
+                min-height: 58px;
+                border-radius: 12px;
+                border: 1px solid #224163;
+                background: rgba(7, 20, 42, 0.9);
+                color: #dbeafe;
+                font-size: 12px;
+                font-weight: 700;
+                padding: 6px 8px;
+                text-align: center;
+            }
+            QToolButton#AutomationPaletteTile::menu-indicator {
+                image: none;
+                width: 0px;
+            }
+            QToolButton#AutomationPaletteTile:hover {
+                border-color: #22d3ee;
+                background: rgba(8, 27, 54, 0.98);
+                color: #eff6ff;
+            }
+            QToolButton#AutomationPaletteTile:pressed {
+                border-color: #06b6d4;
+                background: rgba(7, 20, 42, 1);
+            }
+            QToolButton#AutomationPaletteTile:disabled {
+                border-color: #1f334c;
+                background: rgba(7, 18, 34, 0.78);
+                color: rgba(148, 163, 184, 0.65);
+            }
             #EnergyFlowStatus {
                 color: #94a3b8;
                 background: rgba(8, 15, 30, 0.72);
@@ -3288,6 +4647,14 @@ class MainWindow(QMainWindow):
             #SidebarTree::item:selected {
                 background: rgba(56, 189, 248, 0.10);
                 color: #f8fafc;
+            }
+            QToolTip {
+                background: rgba(8, 15, 30, 0.98);
+                color: #dbeafe;
+                border: 1px solid #2f6b9a;
+                border-radius: 8px;
+                padding: 3px 5px;
+                font-size: 12px;
             }
             QFrame#DeviceProfileButton {
                 min-height: 88px;
@@ -3389,12 +4756,48 @@ class MainWindow(QMainWindow):
                 left: 12px;
                 padding: 0 4px;
             }
-            QScrollArea, QTextEdit, QComboBox, QDateEdit, QTreeWidget {
+            QScrollArea, QTextEdit, QComboBox, QDateEdit, QTreeWidget, QSpinBox, QDoubleSpinBox, QLineEdit {
                 background: #111827;
                 border: 1px solid #334155;
                 border-radius: 8px;
             }
+            QComboBox,
+            QSpinBox,
+            QDoubleSpinBox,
+            QLineEdit {
+                min-height: 36px;
+                padding: 0 34px 0 12px;
+                font-size: 13px;
+                color: #e2e8f0;
+                background: rgba(8, 15, 30, 0.78);
+                border: 1px solid #243244;
+                border-radius: 12px;
+            }
+            QComboBox:hover,
+            QSpinBox:hover,
+            QDoubleSpinBox:hover,
+            QLineEdit:hover,
+            QComboBox:focus,
+            QSpinBox:focus,
+            QDoubleSpinBox:focus,
+            QLineEdit:focus {
+                border-color: #35506d;
+                background: rgba(10, 19, 36, 0.86);
+            }
             QComboBox { combobox-popup: 0; }
+            QComboBox::drop-down {
+                width: 30px;
+                border: none;
+                background: transparent;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                width: 9px;
+                height: 9px;
+                border-right: 2px solid #e2e8f0;
+                border-bottom: 2px solid #e2e8f0;
+                margin-right: 10px;
+            }
             QComboBox QAbstractItemView {
                 background: #111827;
                 color: #e2e8f0;
@@ -3402,6 +4805,101 @@ class MainWindow(QMainWindow):
                 selection-background-color: #0ea5e9;
                 selection-color: #eff6ff;
                 outline: 0;
+            }
+            QSpinBox::up-button,
+            QSpinBox::down-button,
+            QDoubleSpinBox::up-button,
+            QDoubleSpinBox::down-button {
+                width: 18px;
+                border: 1px solid rgba(34, 211, 238, 0.45);
+                background: rgba(8, 30, 56, 0.88);
+                subcontrol-origin: border;
+                margin-right: 3px;
+            }
+            QSpinBox::up-button,
+            QDoubleSpinBox::up-button {
+                subcontrol-position: top right;
+                border-top-left-radius: 5px;
+                border-top-right-radius: 5px;
+                border-bottom-left-radius: 0px;
+                border-bottom-right-radius: 0px;
+            }
+            QSpinBox::down-button,
+            QDoubleSpinBox::down-button {
+                subcontrol-position: bottom right;
+                border-top-left-radius: 0px;
+                border-top-right-radius: 0px;
+                border-bottom-left-radius: 5px;
+                border-bottom-right-radius: 5px;
+            }
+            QSpinBox::up-arrow,
+            QDoubleSpinBox::up-arrow {
+                image: none;
+                width: 0px;
+                height: 0px;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-bottom: 6px solid #22d3ee;
+                margin-top: 2px;
+            }
+            QSpinBox::down-arrow,
+            QDoubleSpinBox::down-arrow {
+                image: none;
+                width: 0px;
+                height: 0px;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid #22d3ee;
+                margin-bottom: 2px;
+            }
+            QSpinBox::up-button:hover,
+            QSpinBox::down-button:hover,
+            QDoubleSpinBox::up-button:hover,
+            QDoubleSpinBox::down-button:hover {
+                background: rgba(10, 44, 78, 0.95);
+                border-color: #22d3ee;
+            }
+            QSpinBox::up-button:pressed,
+            QSpinBox::down-button:pressed,
+            QDoubleSpinBox::up-button:pressed,
+            QDoubleSpinBox::down-button:pressed {
+                background: rgba(14, 165, 233, 0.3);
+                border-color: #67e8f9;
+            }
+            QCheckBox {
+                color: #dbeafe;
+                spacing: 8px;
+                font-size: 13px;
+            }
+            QCheckBox::indicator,
+            QListView::indicator,
+            QTreeView::indicator,
+            QListWidget::indicator {
+                width: 15px;
+                height: 15px;
+                border-radius: 4px;
+                border: 2px solid #22d3ee;
+                background: rgba(7, 20, 42, 0.96);
+            }
+            QCheckBox::indicator:checked,
+            QListView::indicator:checked,
+            QTreeView::indicator:checked,
+            QListWidget::indicator:checked {
+                border-color: #0ea5e9;
+                background: #0ea5e9;
+            }
+            QCheckBox::indicator:hover,
+            QListView::indicator:hover,
+            QTreeView::indicator:hover,
+            QListWidget::indicator:hover {
+                border-color: #67e8f9;
+            }
+            QCheckBox::indicator:disabled,
+            QListView::indicator:disabled,
+            QTreeView::indicator:disabled,
+            QListWidget::indicator:disabled {
+                border-color: #2b3d52;
+                background: rgba(7, 16, 30, 0.9);
             }
             QComboBox#SavedDataPageSizeCombo,
             QComboBox#SavedDataDatasetCombo {
@@ -3617,6 +5115,7 @@ class MainWindow(QMainWindow):
             refresh_now=tuya_refresh_now,
             refresh_if_empty=tuya_refresh_if_empty,
         )
+        self._load_profile_automations_into_tab()
         if hasattr(self, "inverter_settings_tab"):
             if cached is not None:
                 self.inverter_settings_tab.set_settings(profile, list(cached[0]), cached[1])
@@ -4719,6 +6218,7 @@ class MainWindow(QMainWindow):
             pass
             self._last_energyflow_snapshot = snapshot
             self._last_energyflow_snapshot_key = self._active_profile_key()
+            self._sync_automation_catalog_with_tuya_devices()
             self._last_energyflow_updated_at_text = pd.Timestamp.now().strftime("%H:%M:%S")
             self.energyflow_summary_label.setText(self._build_energyflow_summary(snapshot))
             self._set_tab_message(
@@ -6137,6 +7637,7 @@ class MainWindow(QMainWindow):
         self._apply_auto_sync_interval(updated_profile)
         self._tuya_settings = self._tuya_settings_from_profile(updated_profile)
         self._apply_tuya_settings(refresh_now=True)
+        self._load_profile_automations_into_tab()
         self.inverter_settings_tab.set_profile(updated_profile)
         self.energyflow_view.set_device_meta(
             updated_profile.profile_name or updated_profile.device_label or "Inverter",
@@ -7185,8 +8686,6 @@ class MainWindow(QMainWindow):
         """Toggle shared backdrop and optional background input blocking."""
         if self._popup_backdrop is None:
             return
-        if self._popup_block_target is not None:
-            self._popup_block_target.setEnabled(not visible)
         current_visible = self._popup_backdrop.isVisible()
         if current_visible == visible:
             return

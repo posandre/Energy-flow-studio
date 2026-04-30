@@ -29,6 +29,12 @@ DEFAULT_I18N = "en"
 AUTH_CACHE_TTL_SECONDS = 300
 SETTINGS_CACHE_TTL_SECONDS = 300
 DEFAULT_PARALLEL_DATA_REQUESTS = 4
+DEFAULT_CTRL_WRITE_ACTION_CANDIDATES: tuple[str, ...] = (
+    "setDeviceCtrlValue",
+    "saveDeviceCtrlValue",
+    "updateDeviceCtrlValue",
+    "editDeviceCtrlValue",
+)
 DEFAULT_KEY_PARAMETERS = [
     "PV_OUTPUT_POWER",
     "GRID_ACTIVE_POWER",
@@ -317,6 +323,7 @@ _AUTH_CACHE: dict[tuple[str, str, str, str], CachedAuthTokens] = {}
 _SETTINGS_CACHE_LOCK = Lock()
 _CONTROL_FIELDS_CACHE: dict[tuple[str, str, str, str], tuple[float, list["DeviceControlField"]]] = {}
 _CONTROL_VALUE_CACHE: dict[tuple[str, str, str, str, str], tuple[float, str | int | float | None]] = {}
+_CONTROL_WRITE_ACTION_CACHE: dict[tuple[str, str, str, str], str] = {}
 _LAST_SOC_REQUEST_URL: str | None = None
 _LAST_ENERGYFLOW_REQUEST_URL: str | None = None
 _LAST_ENERGYFLOW_RESPONSE_TEXT: str | None = None
@@ -1073,6 +1080,10 @@ def _control_value_cache_key(config: DessMonitorConfig, field_id: str) -> tuple[
     return (config.pn, config.devcode, config.devaddr, config.sn, field_id)
 
 
+def _control_write_cache_key(config: DessMonitorConfig) -> tuple[str, str, str, str]:
+    return (config.pn, config.devcode, config.devaddr, config.sn)
+
+
 def _history_probe_params(
     config: DessMonitorConfig,
     *,
@@ -1532,6 +1543,109 @@ def fetch_device_control_value(
     with _SETTINGS_CACHE_LOCK:
         _CONTROL_VALUE_CACHE[cache_key] = (time() + SETTINGS_CACHE_TTL_SECONDS, value)
     return value
+
+
+def _is_unknown_action_error(error_text: str) -> bool:
+    lowered = str(error_text or "").strip().lower()
+    if not lowered:
+        return False
+    patterns = (
+        "unknown action",
+        "action not",
+        "unsupported action",
+        "not support",
+        "not supported",
+        "invalid action",
+        "method not",
+    )
+    return any(pattern in lowered for pattern in patterns)
+
+
+def _set_device_control_value_with_action(
+    config: DessMonitorConfig,
+    *,
+    auth: AuthTokens,
+    action: str,
+    field_id: str,
+    value: str,
+) -> None:
+    call_api(
+        action=action,
+        auth=auth,
+        source=config.source,
+        app_client=config.app_client,
+        app_id=config.app_id,
+        app_version=config.app_version,
+        params=_settings_request_params(config, [("id", field_id), ("value", value)]),
+    )
+    cache_key = _control_value_cache_key(config, field_id)
+    with _SETTINGS_CACHE_LOCK:
+        _CONTROL_VALUE_CACHE[cache_key] = (time() + SETTINGS_CACHE_TTL_SECONDS, value)
+
+
+def set_device_control_values(
+    config: DessMonitorConfig,
+    updates: list[tuple[str, str]],
+    *,
+    auth: AuthTokens | None = None,
+) -> None:
+    normalized_updates: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for field_id_raw, value_raw in updates:
+        field_id = str(field_id_raw).strip()
+        if not field_id or field_id in seen:
+            continue
+        seen.add(field_id)
+        normalized_updates.append((field_id, str(value_raw).strip()))
+    if not normalized_updates:
+        return
+
+    if auth is None:
+        auth = authenticate(config)
+
+    cache_key = _control_write_cache_key(config)
+    with _SETTINGS_CACHE_LOCK:
+        cached_action = _CONTROL_WRITE_ACTION_CACHE.get(cache_key)
+
+    if cached_action:
+        try:
+            for field_id, value in normalized_updates:
+                _set_device_control_value_with_action(
+                    config,
+                    auth=auth,
+                    action=cached_action,
+                    field_id=field_id,
+                    value=value,
+                )
+            return
+        except DessMonitorApiError:
+            with _SETTINGS_CACHE_LOCK:
+                _CONTROL_WRITE_ACTION_CACHE.pop(cache_key, None)
+
+    candidate_actions = list(DEFAULT_CTRL_WRITE_ACTION_CANDIDATES)
+    last_error: DessMonitorApiError | None = None
+    for action_name in candidate_actions:
+        try:
+            for field_id, value in normalized_updates:
+                _set_device_control_value_with_action(
+                    config,
+                    auth=auth,
+                    action=action_name,
+                    field_id=field_id,
+                    value=value,
+                )
+            with _SETTINGS_CACHE_LOCK:
+                _CONTROL_WRITE_ACTION_CACHE[cache_key] = action_name
+            return
+        except DessMonitorApiError as exc:
+            last_error = exc
+            if not _is_unknown_action_error(str(exc)):
+                raise
+            continue
+
+    if last_error is not None:
+        raise last_error
+    raise DessMonitorApiError("DessMonitor did not accept any known inverter control write action.")
 
 
 def fetch_inverter_settings(

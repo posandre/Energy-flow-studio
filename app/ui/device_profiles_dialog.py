@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QScrollArea,
     QSizePolicy,
     QStyledItemDelegate,
@@ -573,6 +574,10 @@ class DeviceProfileEditDialog(QDialog):
         auto_sync_layout.setContentsMargins(12, 0, 12, 0)
         auto_sync_layout.setSpacing(8)
         auto_sync_layout.addWidget(self.auto_sync_checkbox, 1, Qt.AlignmentFlag.AlignVCenter)
+        self.automation_cooldown = QSpinBox()
+        self.automation_cooldown.setRange(0, 86400)
+        self.automation_cooldown.setSuffix(f" {tr('sec')}")
+        self.automation_cooldown.setValue(profile.resolved_automation_cooldown_sec())
         self.tuya_enabled_checkbox = QCheckBox(tr("Enable Tuya"))
         self.tuya_enabled_checkbox.setObjectName("AutoSyncCheckbox")
         apply_minimal_checkbox(self.tuya_enabled_checkbox)
@@ -768,6 +773,7 @@ class DeviceProfileEditDialog(QDialog):
         sync_grid.addLayout(sync_stack, 0, 0)
         sync_grid.addLayout(auto_sync_row, 0, 1)
         sync_grid.addLayout(build_field_stack(tr("Tuya polling interval (seconds)"), self.tuya_poll_interval_field), 1, 0)
+        sync_grid.addLayout(build_field_stack(tr("Automation repeat delay (seconds)"), self.automation_cooldown), 1, 1)
 
         sync_body = QVBoxLayout()
         sync_body.setContentsMargins(0, 0, 0, 0)
@@ -1714,6 +1720,7 @@ class DeviceProfileEditDialog(QDialog):
             ui_language=str(self.language_combo.currentData() or DEFAULT_UI_LANGUAGE).strip().lower() or DEFAULT_UI_LANGUAGE,
             day_zone_tariff_uah_per_kwh=self._resolved_day_zone_tariff_uah_per_kwh(),
             night_zone_tariff_uah_per_kwh=self._resolved_night_zone_tariff_uah_per_kwh(),
+            automation_cooldown_sec=int(self.automation_cooldown.value()),
         )
         if self.ok_button is not None:
             self.ok_button.setEnabled(True)
@@ -1854,6 +1861,7 @@ class DeviceProfileEditDialog(QDialog):
             ui_language=str(self.language_combo.currentData() or DEFAULT_UI_LANGUAGE).strip().lower() or DEFAULT_UI_LANGUAGE,
             day_zone_tariff_uah_per_kwh=self._resolved_day_zone_tariff_uah_per_kwh(),
             night_zone_tariff_uah_per_kwh=self._resolved_night_zone_tariff_uah_per_kwh(),
+            automation_cooldown_sec=int(self.automation_cooldown.value()),
         )
 
     @Slot(str)
@@ -1987,6 +1995,7 @@ class DeviceProfileEditDialog(QDialog):
             ui_language=str(self.language_combo.currentData() or DEFAULT_UI_LANGUAGE).strip().lower() or DEFAULT_UI_LANGUAGE,
             day_zone_tariff_uah_per_kwh=self._resolved_day_zone_tariff_uah_per_kwh(),
             night_zone_tariff_uah_per_kwh=self._resolved_night_zone_tariff_uah_per_kwh(),
+            automation_cooldown_sec=int(self.automation_cooldown.value()),
         )
 
     def check_performed_in_session(self) -> bool:

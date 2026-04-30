@@ -16,6 +16,8 @@ REQUEST_TIMEOUT_SECONDS = 20
 POWER_COMMAND_CONFIRMATION_TIMEOUT_SECONDS = 8
 POWER_COMMAND_POLL_DELAY_SECONDS = 0.5
 ACCESS_TOKEN_SAFETY_SECONDS = 60
+REQUEST_MAX_RETRIES = 2
+REQUEST_RETRY_DELAY_SECONDS = 0.45
 
 _ACCESS_TOKEN_CACHE: dict[tuple[str, str], tuple[str, float]] = {}
 DpMetaMap = dict[str, dict[str, object]]
@@ -285,16 +287,24 @@ def _tuya_request(
     if canonical_query:
         full_url = f"{full_url}?{canonical_query}"
 
-    try:
-        response = requests.request(
-            method=method,
-            url=full_url,
-            headers=headers,
-            data=body_text if body_text else None,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-    except requests.RequestException as exc:
-        raise TuyaApiError(f"Could not reach Tuya endpoint: {exc}") from exc
+    response: requests.Response | None = None
+    for attempt in range(REQUEST_MAX_RETRIES + 1):
+        try:
+            response = requests.request(
+                method=method,
+                url=full_url,
+                headers=headers,
+                data=body_text if body_text else None,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+            break
+        except requests.RequestException as exc:
+            if attempt < REQUEST_MAX_RETRIES and _is_retryable_transport_error(exc):
+                time.sleep(REQUEST_RETRY_DELAY_SECONDS * (attempt + 1))
+                continue
+            raise TuyaApiError(f"Could not reach Tuya endpoint: {exc}") from exc
+    if response is None:  # pragma: no cover - defensive fallback
+        raise TuyaApiError("Could not reach Tuya endpoint: unknown transport failure.")
 
     try:
         payload = response.json()
@@ -307,6 +317,31 @@ def _tuya_request(
         raise TuyaApiError(f"Tuya API error ({code}): {message}")
 
     return payload
+
+
+def _is_retryable_transport_error(exc: Exception) -> bool:
+    if isinstance(
+        exc,
+        (
+            requests.exceptions.ConnectTimeout,
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.SSLError,
+        ),
+    ):
+        return True
+    details = str(exc).lower()
+    retry_markers = (
+        "name resolution",
+        "failed to resolve",
+        "temporary failure in name resolution",
+        "nodename nor servname",
+        "network is unreachable",
+        "connection reset",
+        "connection aborted",
+        "timed out",
+    )
+    return any(marker in details for marker in retry_markers)
 
 
 def _canonicalize_query(query: str) -> str:

@@ -18,6 +18,7 @@ MIN_TUYA_POLL_INTERVAL_SEC = 5
 MAX_TUYA_POLL_INTERVAL_SEC = 3600
 DEFAULT_TUYA_ENDPOINT = "https://openapi-weaz.tuyaeu.com"
 DEFAULT_UI_LANGUAGE = "en"
+DEFAULT_AUTOMATION_COOLDOWN_SEC = 60
 UI_LANGUAGE_CHOICES: tuple[tuple[str, str], ...] = (
     ("English", "en"),
     ("Українська", "uk"),
@@ -144,6 +145,7 @@ class DeviceProfile:
     ui_language: str = DEFAULT_UI_LANGUAGE
     day_zone_tariff_uah_per_kwh: float = 0.0
     night_zone_tariff_uah_per_kwh: float = 0.0
+    automation_cooldown_sec: int = DEFAULT_AUTOMATION_COOLDOWN_SEC
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -176,6 +178,7 @@ class DeviceProfile:
             "ui_language": self.resolved_ui_language(),
             "day_zone_tariff_uah_per_kwh": self.resolved_day_zone_tariff_uah_per_kwh(),
             "night_zone_tariff_uah_per_kwh": self.resolved_night_zone_tariff_uah_per_kwh(),
+            "automation_cooldown_sec": self.resolved_automation_cooldown_sec(),
         }
 
     def resolved_parameter_keys(self) -> list[str]:
@@ -243,6 +246,13 @@ class DeviceProfile:
         except (TypeError, ValueError):
             value = 0.0
         return max(0.0, value)
+
+    def resolved_automation_cooldown_sec(self) -> int:
+        try:
+            value = int(self.automation_cooldown_sec)
+        except (TypeError, ValueError):
+            value = DEFAULT_AUTOMATION_COOLDOWN_SEC
+        return max(0, value)
 
 
 def load_ui_language() -> str:
@@ -361,6 +371,9 @@ def load_device_profiles() -> list[DeviceProfile]:
                     ui_language=str(entry.get("ui_language", DEFAULT_UI_LANGUAGE)).strip().lower() or DEFAULT_UI_LANGUAGE,
                     day_zone_tariff_uah_per_kwh=float(entry.get("day_zone_tariff_uah_per_kwh", 0.0) or 0.0),
                     night_zone_tariff_uah_per_kwh=float(entry.get("night_zone_tariff_uah_per_kwh", 0.0) or 0.0),
+                    automation_cooldown_sec=int(
+                        entry.get("automation_cooldown_sec", DEFAULT_AUTOMATION_COOLDOWN_SEC)
+                    ),
                 )
             )
     loaded_profiles = [profile for profile in profiles if profile.profile_name]
@@ -395,4 +408,59 @@ def load_last_loaded_profile_name() -> str:
 def save_last_loaded_profile_name(profile_name: str) -> None:
     settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
     settings.setValue("dessmonitor/last_loaded_profile", profile_name)
+    settings.sync()
+
+
+def load_profile_automations(profile_name: str) -> list[dict[str, object]]:
+    normalized_profile = str(profile_name or "").strip()
+    if not normalized_profile:
+        return []
+    settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    raw = settings.value(f"automations/{normalized_profile}/rules", "[]")
+    try:
+        payload = json.loads(raw if isinstance(raw, str) else "[]")
+    except json.JSONDecodeError:
+        payload = []
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict)]
+
+
+def save_profile_automations(profile_name: str, rules: list[dict[str, object]]) -> None:
+    normalized_profile = str(profile_name or "").strip()
+    if not normalized_profile:
+        return
+    settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    settings.setValue(
+        f"automations/{normalized_profile}/rules",
+        json.dumps([item for item in rules if isinstance(item, dict)], ensure_ascii=False),
+    )
+    settings.sync()
+
+
+def load_profile_automation_logs(profile_name: str) -> list[str]:
+    normalized_profile = str(profile_name or "").strip()
+    if not normalized_profile:
+        return []
+    settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    raw = settings.value(f"automations/{normalized_profile}/logs", "[]")
+    try:
+        payload = json.loads(raw if isinstance(raw, str) else "[]")
+    except json.JSONDecodeError:
+        payload = []
+    if not isinstance(payload, list):
+        return []
+    return [str(item) for item in payload if str(item).strip()]
+
+
+def save_profile_automation_logs(profile_name: str, lines: list[str]) -> None:
+    normalized_profile = str(profile_name or "").strip()
+    if not normalized_profile:
+        return
+    trimmed = [str(item) for item in lines if str(item).strip()][-400:]
+    settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    settings.setValue(
+        f"automations/{normalized_profile}/logs",
+        json.dumps(trimmed, ensure_ascii=False),
+    )
     settings.sync()
