@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import partial
 import json
 import re
 import uuid
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QLayout,
     QPushButton,
     QFileDialog,
     QMessageBox,
@@ -55,6 +57,76 @@ from app.ui.dialogs import ask_compact_confirmation
 
 BLOCK_MIME = "application/x-energyflow-automation-block"
 INVERTER_DEVICE_ID = "__inverter__"
+
+
+class FlowLayout(QLayout):
+    def __init__(self, parent=None, *, margin: int = 0, spacing: int = 8) -> None:
+        super().__init__(parent)
+        self._items = []
+        self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+
+    def addItem(self, item) -> None:  # noqa: N802
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):  # noqa: N802
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index: int):  # noqa: N802
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):  # noqa: N802
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        return self._do_layout(QRectF(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect) -> None:  # noqa: N802
+        super().setGeometry(rect)
+        self._do_layout(QRectF(rect), test_only=False)
+
+    def sizeHint(self):  # noqa: N802
+        return self.minimumSize()
+
+    def minimumSize(self):  # noqa: N802
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+        return size
+
+    def _do_layout(self, rect: QRectF, *, test_only: bool) -> int:
+        margins = self.contentsMargins()
+        effective = rect.adjusted(margins.left(), margins.top(), -margins.right(), -margins.bottom())
+        x = int(effective.x())
+        y = int(effective.y())
+        line_height = 0
+        spacing = self.spacing()
+        right = int(effective.right())
+        for item in self._items:
+            hint = item.sizeHint()
+            next_x = x + hint.width() + spacing
+            if next_x - spacing > right and line_height > 0:
+                x = int(effective.x())
+                y += line_height + spacing
+                next_x = x + hint.width() + spacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRectF(x, y, hint.width(), hint.height()).toRect())
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return y + line_height - int(rect.y()) + margins.bottom()
 
 
 class BlockPalette(QListWidget):
@@ -2876,6 +2948,8 @@ class AutomationTab(QWidget):
         self._global_rule_cooldown_sec = 60
         self._action_editor_action_type = "power"
         self._message_help_tooltip = ""
+        self._message_measurement_buttons_layout: QVBoxLayout | None = None
+        self._collapsed_message_measurement_groups: set[str] = set()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -3126,6 +3200,7 @@ class AutomationTab(QWidget):
             combo.blockSignals(False)
         self._refresh_trigger_metric_options()
         self._refresh_condition_metric_options()
+        self._refresh_message_measurement_buttons()
         self._refresh_message_help_tooltip()
         self._update_action_editor_mode()
 
@@ -3143,6 +3218,8 @@ class AutomationTab(QWidget):
             if index >= 0:
                 combo.setCurrentIndex(index)
             combo.blockSignals(False)
+        self._refresh_message_measurement_buttons()
+        self._refresh_message_help_tooltip()
 
     def set_measurements_by_device(self, keys_by_device: dict[str, Iterable[str]]) -> None:
         normalized: dict[str, list[str]] = {}
@@ -3155,8 +3232,14 @@ class AutomationTab(QWidget):
         normalized.setdefault("", sorted(global_keys))
         self._measurement_keys_by_device = normalized
         self._measurement_keys = normalized.get("", [])
+        self._collapsed_message_measurement_groups = {
+            group_id
+            for group_id, _device_label, _group_items in self._message_measurement_groups()
+        }
         self._refresh_trigger_metric_options()
         self._refresh_condition_metric_options()
+        self._refresh_message_measurement_buttons()
+        self._refresh_message_help_tooltip()
 
     def set_inverter_control_fields(self, fields: list[dict[str, object]]) -> None:
         normalized: list[dict[str, object]] = []
@@ -3207,6 +3290,8 @@ class AutomationTab(QWidget):
             self._action_form.setRowVisible(self.action_chat_id, message_mode)
             self._action_form.setRowVisible(self.action_messenger, message_mode)
             self._action_form.setRowVisible(self.action_message_template, message_mode)
+            if hasattr(self, "action_message_measurements_scroll"):
+                self._action_form.setRowVisible(self.action_message_measurements_scroll, message_mode)
             self._action_form.setRowVisible(self.action_send_test_btn, message_mode)
             self._action_form.setRowVisible(self.action_inverter_editor, inverter_mode and (not message_mode))
         if inverter_mode and not message_mode:
@@ -3773,7 +3858,15 @@ class AutomationTab(QWidget):
         message_label_layout.addWidget(QLabel(tr("Message")))
         message_label_layout.addWidget(self.action_message_help_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         message_label_layout.addStretch(1)
+        self.action_message_measurements_scroll = QWidget()
+        self.action_message_measurements_scroll.setObjectName("AutomationMeasurementLinks")
+        self.action_message_measurements_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        measurement_buttons_layout = QVBoxLayout(self.action_message_measurements_scroll)
+        measurement_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        measurement_buttons_layout.setSpacing(3)
+        self._message_measurement_buttons_layout = measurement_buttons_layout
         form.addRow(message_label, self.action_message_template)
+        form.addRow(self.action_message_measurements_scroll)
         form.addRow(self.action_send_test_btn)
         form.addRow(self.action_inverter_editor)
         form.addRow(tr("Retries"), self.action_retries)
@@ -3866,9 +3959,9 @@ class AutomationTab(QWidget):
             ],
         )
         self._rules.append(rule)
-        # Do not rebuild the whole rule list on every autosave - it resets
-        # canvas selection to the first block ("Start") and steals focus.
-        self._update_rule_row_selection_state()
+        # Explicit new-rule creation must refresh the list and select
+        # the created rule so the "+" button has immediate visible effect.
+        self._refresh_rule_list(select_rule_id=rule.rule_id)
         self.rules_changed.emit()
 
     def _header_action_button(self, symbol: str, tooltip: str, handler) -> QPushButton:
@@ -5388,10 +5481,118 @@ class AutomationTab(QWidget):
         messenger = str(self.action_messenger.currentData() or "telegram").strip().lower() or "telegram"
         self.message_test_requested.emit(messenger, token_value, chat_id, template)
 
+    def _message_measurement_groups(self) -> list[tuple[str, str, list[tuple[str, str, str]]]]:
+        groups: list[tuple[str, str, list[tuple[str, str, str]]]] = []
+        seen: set[tuple[str, str]] = set()
+        for device_id, keys in sorted(self._measurement_keys_by_device.items(), key=lambda item: self._device_display_text(item[0]).lower()):
+            clean_device_id = str(device_id or "").strip()
+            if not clean_device_id:
+                continue
+            device_label = self._device_display_text(clean_device_id)
+            group_items: list[tuple[str, str, str]] = []
+            for key in keys:
+                metric_key = str(key or "").strip().lower()
+                if not metric_key or (clean_device_id, metric_key) in seen:
+                    continue
+                seen.add((clean_device_id, metric_key))
+                metric_label = self._metric_display_text(metric_key, include_code=False) or metric_key
+                placeholder = "{measure:" + clean_device_id + ":" + metric_key + "}"
+                group_items.append((metric_label, metric_key, placeholder))
+            if group_items:
+                groups.append((clean_device_id, device_label, group_items))
+        if not groups:
+            fallback_items: list[tuple[str, str, str]] = []
+            for key in self._measurement_keys:
+                metric_key = str(key or "").strip().lower()
+                if not metric_key:
+                    continue
+                metric_label = self._metric_display_text(metric_key, include_code=False) or metric_key
+                placeholder = "{measure:" + metric_key + "}"
+                fallback_items.append((metric_label, metric_key, placeholder))
+            if fallback_items:
+                groups.append(("", tr("Measurements"), fallback_items))
+        return groups
+
+    def _message_measurement_items(self) -> list[tuple[str, str, str, str]]:
+        items: list[tuple[str, str, str, str]] = []
+        for _group_id, device_label, group_items in self._message_measurement_groups():
+            for metric_label, metric_key, placeholder in group_items:
+                items.append((device_label, metric_label, metric_key, placeholder))
+        return items
+
+    def _refresh_message_measurement_buttons(self) -> None:
+        layout = self._message_measurement_buttons_layout
+        if layout is None:
+            return
+        while layout.count() > 0:
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for group_id, device_label, group_items in self._message_measurement_groups():
+            group_box = QWidget()
+            group_box.setObjectName("AutomationMeasurementGroup")
+            group_layout = QVBoxLayout(group_box)
+            group_layout.setContentsMargins(0, 0, 0, 0)
+            group_layout.setSpacing(2)
+            header = QToolButton()
+            header.setObjectName("AutomationMeasurementGroupHeader")
+            header.setAutoRaise(True)
+            header.setCursor(Qt.CursorShape.PointingHandCursor)
+            collapsed = group_id in self._collapsed_message_measurement_groups
+            header.setText(("▸ " if collapsed else "▾ ") + device_label)
+            header.clicked.connect(partial(self._toggle_message_measurement_group, group_id))
+            group_layout.addWidget(header)
+            if not collapsed:
+                links_row = QWidget()
+                links_row.setObjectName("AutomationMeasurementLinksRow")
+                links_layout = FlowLayout(links_row, spacing=6)
+                for metric_label, metric_key, placeholder in group_items:
+                    button = QToolButton()
+                    button.setObjectName("AutomationMeasurementChip")
+                    button.setAutoRaise(True)
+                    button.setCursor(Qt.CursorShape.PointingHandCursor)
+                    button.setText(metric_label)
+                    button.setToolTip(
+                        tr("Insert measurement: {device}{metric} ({key})").format(
+                            device=f"{device_label} • " if device_label else "",
+                            metric=metric_label,
+                            key=metric_key,
+                        )
+                        + "\n"
+                        + placeholder
+                    )
+                    button.clicked.connect(lambda _checked=False, token=placeholder: self._insert_message_placeholder(token))
+                    links_layout.addWidget(button)
+                group_layout.addWidget(links_row)
+            layout.addWidget(group_box)
+        if layout.count() == 0:
+            label = QLabel(tr("No measurements available"))
+            label.setObjectName("SidebarMeta")
+            layout.addWidget(label)
+
+    def _toggle_message_measurement_group(self, group_id: str, _checked: bool = False) -> None:
+        if group_id in self._collapsed_message_measurement_groups:
+            self._collapsed_message_measurement_groups.remove(group_id)
+        else:
+            self._collapsed_message_measurement_groups.add(group_id)
+        self._refresh_message_measurement_buttons()
+
+    def _insert_message_placeholder(self, placeholder: str) -> None:
+        token = str(placeholder or "").strip()
+        if not token:
+            return
+        cursor = self.action_message_template.textCursor()
+        cursor.insertText(token)
+        self.action_message_template.setTextCursor(cursor)
+        self.action_message_template.setFocus(Qt.FocusReason.MouseFocusReason)
+        self._save_block_editor()
+
     def _refresh_message_help_tooltip(self) -> None:
         metric_lines: list[str] = []
-        for key in sorted({str(item).strip() for item in self._measurement_keys if str(item).strip()}):
-            metric_lines.append(f"- {{{key}}} / {{measure:{key}}}")
+        for device_label, metric_label, metric_key, placeholder in self._message_measurement_items():
+            label = f"{device_label}: {metric_label}" if device_label else metric_label
+            metric_lines.append(f"- {label} ({metric_key}) → {placeholder}")
         if not metric_lines:
             metric_lines.append(f"- {{measure:{tr('metric_key')}}}")
         base = [

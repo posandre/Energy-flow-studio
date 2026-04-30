@@ -1331,6 +1331,7 @@ class MainWindow(QMainWindow):
         self._automation_rules: list[AutomationRule] = []
         self._automation_logs: list[str] = []
         self._automation_inflight_cycle = False
+        self._automation_log_scope = threading.local()
         self._automation_timer = QTimer(self)
         self._automation_timer.setInterval(AUTOMATION_EVALUATION_INTERVAL_MS)
         self._automation_timer.timeout.connect(self._evaluate_automations_cycle)
@@ -2041,23 +2042,12 @@ class MainWindow(QMainWindow):
                 rules=self._automation_rules,
                 numeric_measurements=measurements,
             )
-            if ready:
-                self._append_automation_log(
-                    "info",
-                    ready[0],
-                    tr("Cycle matched {count} rule(s).").format(count=len(ready)),
-                )
             for index, rule in enumerate(ready):
                 if index >= AUTOMATION_MAX_ACTIONS_PER_CYCLE:
-                    self._append_automation_log(
-                        "error",
-                        rule,
-                        tr("Loop guard stopped this cycle after max action budget."),
-                    )
                     break
                 threading.Thread(
                     target=self._run_automation_rule_actions,
-                    args=(rule, True),
+                    args=(rule, True, False),
                     daemon=True,
                     name=f"automation-rule-{rule.rule_id[:8]}",
                 ).start()
@@ -2065,8 +2055,11 @@ class MainWindow(QMainWindow):
             self._automation_inflight_cycle = False
             self._refresh_tab_badges()
 
-    def _run_automation_rule_actions(self, rule: AutomationRule, force_start: bool = False) -> None:
-        self._queue_runtime_automation_node(rule.rule_id, "")
+    def _run_automation_rule_actions(self, rule: AutomationRule, force_start: bool = False, log_enabled: bool = True) -> None:
+        previous_log_enabled = getattr(self._automation_log_scope, "enabled", True)
+        self._automation_log_scope.enabled = bool(log_enabled)
+        if log_enabled:
+            self._queue_runtime_automation_node(rule.rule_id, "")
         try:
             self._queue_automation_log(
                 "info",
@@ -2092,7 +2085,7 @@ class MainWindow(QMainWindow):
                     force_start=(tr("yes") if bool(force_start) else tr("no")),
                 ),
             )
-            self._log_flow_run_node_details(rule, run, use_queue=True, highlight_runtime=True)
+            self._log_flow_run_node_details(rule, run, use_queue=True, highlight_runtime=log_enabled)
 
             action_steps = [step for step in run.steps if step.step_type == "action"]
             delay_steps = [step for step in run.steps if step.step_type == "delay"]
@@ -2110,7 +2103,8 @@ class MainWindow(QMainWindow):
 
             for step in run.steps:
                 try:
-                    self._queue_runtime_automation_node(rule.rule_id, step.node_id)
+                    if log_enabled:
+                        self._queue_runtime_automation_node(rule.rule_id, step.node_id)
                     if step.step_type == "delay":
                         seconds = max(0.0, float(step.payload.get("seconds", 0.0) or 0.0))
                         self._queue_automation_log(
@@ -2313,7 +2307,9 @@ class MainWindow(QMainWindow):
             self._queue_automation_log("error", rule, "RUN_EXCEPTION")
             self._queue_automation_log("error", rule, traceback.format_exc().strip())
         finally:
-            self._queue_runtime_automation_node(rule.rule_id, "")
+            if log_enabled:
+                self._queue_runtime_automation_node(rule.rule_id, "")
+            self._automation_log_scope.enabled = previous_log_enabled
 
     def _log_flow_run_node_details(
         self,
@@ -2510,6 +2506,8 @@ class MainWindow(QMainWindow):
         return short_reason, details
 
     def _queue_automation_log(self, level: str, rule: AutomationRule, message: str) -> None:
+        if getattr(self._automation_log_scope, "enabled", True) is False:
+            return
         if QThread.currentThread() is self.thread():
             self._append_automation_log(level, rule, message)
             return
@@ -2712,6 +2710,13 @@ class MainWindow(QMainWindow):
             if not safe_key:
                 continue
             rendered = rendered.replace("{measure:" + safe_key + "}", f"{float(value):g}")
+            if ":" in safe_key:
+                device_key, metric_key = safe_key.split(":", 1)
+                if device_key.strip() and metric_key.strip():
+                    rendered = rendered.replace(
+                        "{measure:" + device_key.strip() + ":" + metric_key.strip() + "}",
+                        f"{float(value):g}",
+                    )
         try:
             return rendered.format(**mapping)
         except Exception:
@@ -4562,6 +4567,44 @@ class MainWindow(QMainWindow):
                 border-color: #1f334c;
                 background: rgba(7, 18, 34, 0.78);
                 color: rgba(148, 163, 184, 0.65);
+            }
+            QWidget#AutomationMeasurementLinks {
+                background: transparent;
+                border: none;
+            }
+            QToolButton#AutomationMeasurementChip {
+                min-height: 18px;
+                border-radius: 7px;
+                border: 1px solid transparent;
+                background: transparent;
+                color: #22d3ee;
+                font-size: 12px;
+                font-weight: 700;
+                padding: 0px 2px;
+            }
+            QToolButton#AutomationMeasurementChip:hover {
+                border-color: transparent;
+                background: transparent;
+                color: #ecfeff;
+                text-decoration: underline;
+            }
+            QToolButton#AutomationMeasurementChip:pressed {
+                border-color: transparent;
+                background: transparent;
+                color: #67e8f9;
+            }
+            QToolButton#AutomationMeasurementGroupHeader {
+                min-height: 18px;
+                border: none;
+                background: transparent;
+                color: #9bdcff;
+                font-size: 11px;
+                font-weight: 800;
+                padding: 0px 2px 0px 0px;
+            }
+            QToolButton#AutomationMeasurementGroupHeader:hover {
+                color: #ecfeff;
+                text-decoration: underline;
             }
             #EnergyFlowStatus {
                 color: #94a3b8;

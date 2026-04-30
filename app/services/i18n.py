@@ -481,6 +481,8 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         "Available placeholders": "Доступні плейсхолдери",
         "Use placeholders in message template:": "Використовуйте плейсхолдери в шаблоні повідомлення:",
         "Measurements:": "Заміри:",
+        "Insert measurement: {device}{metric} ({key})": "Додати замір: {device}{metric} ({key})",
+        "No measurements available": "Немає доступних замірів",
         "metric_key": "ключ_заміру",
         "Send test message": "Надіслати тестове повідомлення",
         "Message test": "Тест повідомлення",
