@@ -1520,8 +1520,9 @@ class MainWindow(QMainWindow):
     def _force_stop_worker_threads(self) -> None:
         for thread in (self._import_thread, self._settings_thread):
             if thread is not None and thread.isRunning():
-                thread.terminate()
-                thread.wait(300)
+                thread.requestInterruption()
+                thread.quit()
+                thread.wait(1200)
 
     def _finalize_deferred_close(self) -> None:
         if self._prepare_threads_for_close():
@@ -7767,7 +7768,7 @@ class MainWindow(QMainWindow):
         self._pending_import_is_background = background
         self._pending_import_include_weather = include_weather_sync
 
-        thread = QThread()
+        thread = QThread(self)
         worker = DessMonitorImportWorker(config)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)

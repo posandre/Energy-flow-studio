@@ -6,7 +6,7 @@ import unicodedata
 
 import pandas as pd
 from PySide6.QtCore import QObject, QRect, QSize, QThread, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QCloseEvent, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -2001,7 +2001,27 @@ class DeviceProfileEditDialog(QDialog):
     def check_performed_in_session(self) -> bool:
         return self._check_performed_in_session
 
+    def _request_verify_shutdown(self) -> None:
+        thread = self._verify_thread
+        if thread is None:
+            return
+        if thread.isRunning():
+            thread.requestInterruption()
+            thread.quit()
+            thread.wait(800)
+
+    def reject(self) -> None:
+        self._request_verify_shutdown()
+        super().reject()
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        self._request_verify_shutdown()
+        super().closeEvent(event)
+
     def accept(self) -> None:
+        if self._verify_thread is not None:
+            self._show_message(QMessageBox.Warning, "Check in progress", tr("Wait for Check to finish before saving."))
+            return
         if self._verified_profile is None or self._verification_required():
             self._show_message(QMessageBox.Warning, "Verify first", tr("Verify the API connection before saving the profile."))
             return
